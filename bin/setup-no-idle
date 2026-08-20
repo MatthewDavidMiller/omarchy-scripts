@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+#
+# setup-no-idle — stop the screensaver and the idle auto-lock from firing.
+#
+# order: 30
+# description: Never screensaver or auto-lock on idle
+#
+# Omarchy's idle cycle lives in the Quickshell shell, not in hypridle: once you
+# have been idle for `idle.screensaver` seconds it launches the screensaver,
+# and at `idle.lock` seconds it locks the session. Zeroing those numbers in
+# shell.json does NOT switch them off — the service reads 0 as "fire
+# immediately", so it would lock the moment you stopped typing. The supported
+# off switch is the stay-awake state behind the bar's 󰅶 indicator, which gates
+# the whole cycle. This sets that, and also the screensaver-off flag so nothing
+# can start the screensaver by hand either.
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+# --allow-idle puts everything back the way omarchy ships it.
+REVERT=0
+# --keep-screensaver leaves it launchable by hand; only the timeouts go away.
+DISABLE_SCREENSAVER=1
+
+usage() {
+  cat <<'USAGE'
+Usage: setup-no-idle [options]
+
+Disables the idle screensaver and the idle auto-lock, so the machine stays
+awake and unlocked until you lock it yourself.
+
+Options:
+  -n, --dry-run           Show what would change without changing anything.
+  -y, --yes               Do not prompt for confirmation.
+      --keep-screensaver  Leave the screensaver launchable by hand; only stop
+                          the idle timers from starting it.
+      --allow-idle        Reverse: restore the stock screensaver and auto-lock.
+  -h, --help              Show this help.
+
+Environment:
+  DRY_RUN=1               Same as --dry-run.
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--dry-run)         DRY_RUN=1 ;;
+    -y|--yes)             ASSUME_YES=1 ;;
+    --keep-screensaver)   DISABLE_SCREENSAVER=0 ;;
+    --allow-idle)         REVERT=1 ;;
+    -h|--help)            usage; exit 0 ;;
+    *)                    usage >&2; die "Unknown argument: $1" ;;
+  esac
+  shift
+done
+
+require_not_root
+require_cmd omarchy
+
+# run_quiet — like run, but swallows the command's own output. The omarchy
+# toggles echo their new state, which would land mid-log and read as noise.
+run_quiet() {
+  if [[ "$DRY_RUN" == "1" ]]; then
+    run "$@"
+  else
+    "$@" >/dev/null
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 1. The idle cycle itself — screensaver timer and lock timer both hang off it
+# ---------------------------------------------------------------------------
+# `omarchy toggle idle status` reports the stay-awake flag, not the idle timers:
+# "enabled":true means stay-awake is on, i.e. idling is off.
+stay_awake_on() {
+  omarchy toggle idle status 2>/dev/null | grep -q '"enabled":true'
+}
+
+configure_idle() {
+  if [[ "$REVERT" == "1" ]]; then
+    log "Restoring the idle screensaver and auto-lock"
+    if ! stay_awake_on; then
+      skip "idle already allowed"
+      return 0
+    fi
+    run_quiet omarchy toggle idle allow-idle
+    ok "idle screensaver and auto-lock restored"
+    return 0
+  fi
+
+  log "Disabling the idle screensaver and auto-lock"
+  if stay_awake_on; then
+    skip "already staying awake"
+    return 0
+  fi
+  run_quiet omarchy toggle idle stay-awake
+  ok "staying awake — no idle screensaver, no idle lock"
+}
+
+# ---------------------------------------------------------------------------
+# 2. The screensaver on its own, however it is started
+# ---------------------------------------------------------------------------
+# Stay-awake stops the timer that launches it; this flag stops the menu entry
+# and any keybinding too. Separate switch, so --keep-screensaver can leave it.
+configure_screensaver() {
+  local want=on state="disabled"
+  if [[ "$REVERT" == "1" ]]; then
+    want=off state="enabled"
+  elif [[ "$DISABLE_SCREENSAVER" == "0" ]]; then
+    skip "--keep-screensaver: leaving the screensaver launchable by hand"
+    return 0
+  fi
+
+  log "Setting screensaver availability"
+  if [[ "$want" == "on" ]] && omarchy toggle enabled screensaver-off; then
+    skip "screensaver already disabled"
+    return 0
+  fi
+  if [[ "$want" == "off" ]] && ! omarchy toggle enabled screensaver-off; then
+    skip "screensaver already enabled"
+    return 0
+  fi
+
+  # The bare flag name goes to the generic toggle; `omarchy toggle screensaver`
+  # is a different command that flips blindly and cannot be made idempotent.
+  run_quiet omarchy toggle screensaver-off "$want"
+  ok "screensaver $state"
+}
+
+summary() {
+  log "Done"
+  if [[ "$REVERT" == "1" ]]; then
+    cat <<'EOF'
+
+The stock timings from ~/.config/omarchy/shell.json apply again (screensaver at
+idle.screensaver seconds, lock at idle.lock seconds).
+EOF
+  else
+    cat <<'EOF'
+
+The shell picks this up immediately — no restart, no logout. Note that this
+only disables *idle* triggers: locking on suspend and on lid close still
+happens, and Super+Ctrl+L still locks on demand.
+
+Toggle it from the bar any time with the 󰅶 indicator, or reverse it with:
+  ./bin/setup-no-idle --allow-idle
+EOF
+  fi
+
+  local idle_state="enabled (stock timings)" screensaver_state="enabled"
+  stay_awake_on && idle_state="disabled (staying awake)"
+  omarchy toggle enabled screensaver-off && screensaver_state="disabled"
+
+  printf '\n'
+  log "Current state"
+  printf '  idle:        %s\n' "$idle_state"
+  printf '  screensaver: %s\n' "$screensaver_state"
+}
+
+main() {
+  configure_idle
+  configure_screensaver
+  summary
+}
+
+main "$@"

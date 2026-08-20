@@ -3,7 +3,9 @@
 source "$(dirname "${BASH_SOURCE[0]}")/helpers.sh"
 
 repo="$(make_test_repo)"
-rm -f "$repo/bin/setup-ssh-agent"          # keep the fixtures deterministic
+# Drop every real setup script: only the fixtures below should be discovered,
+# so these tests neither run real system commands nor change when bin/ grows.
+find "$repo/bin" -maxdepth 1 -name 'setup-*' ! -name 'setup-all' -delete
 make_setup_script "$repo/bin" setup-beta  50 "beta script"
 make_setup_script "$repo/bin" setup-alpha 10 "alpha script"
 make_setup_script "$repo/bin" setup-omega 90 "omega script"
