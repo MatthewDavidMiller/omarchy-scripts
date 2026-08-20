@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+#
+# lint — shellcheck (and optionally shfmt) for every script in this repo.
+#
+# Runs the linters inside a throwaway container, so the only dependency is the
+# container engine omarchy already ships. Nothing is installed on the host.
+#
+# The image is built here from docker/lint.Dockerfile, on top of alpine — a
+# Docker Official Image pinned by digest — rather than pulled from a third
+# party. Built once, then cached; the tag tracks the Dockerfile's hash, so
+# editing it rebuilds automatically.
+#
+# Not a setup script: deliberately named `lint`, not `setup-lint`, so setup-all
+# does not pick it up as system configuration.
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+DOCKERFILE="$REPO_ROOT/docker/lint.Dockerfile"
+
+USE_CONTAINER=auto
+RUN_FMT=0
+FIX=0
+REBUILD=0
+LINT_IMAGE=""
+
+usage() {
+  cat <<'USAGE'
+Usage: lint [options] [file...]
+
+Runs shellcheck over the repo's shell scripts. With no files given, lints
+everything tracked in bin/, lib/, and githooks/.
+
+Options:
+      --fmt           Also check formatting with shfmt.
+      --fix           Reformat in place with shfmt (implies --fmt).
+      --rebuild       Rebuild the lint image even if it is already cached.
+      --no-container  Use host-installed shellcheck/shfmt instead of a container.
+      --container     Require a container; fail rather than fall back.
+  -h, --help          Show this help.
+
+Exit codes:
+  0  clean   1  problems found   3  no linter available
+
+The image is built from docker/lint.Dockerfile (alpine + shellcheck + shfmt)
+and cached. Set OMARCHY_LINT_IMAGE to use a prebuilt image instead.
+USAGE
+}
+
+FILES=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --fmt)          RUN_FMT=1 ;;
+    --rebuild)      REBUILD=1 ;;
+    --fix)          RUN_FMT=1; FIX=1 ;;
+    --no-container) USE_CONTAINER=no ;;
+    --container)    USE_CONTAINER=yes ;;
+    -h|--help)      usage; exit 0 ;;
+    -*)             usage >&2; die "Unknown argument: $1" ;;
+    *)              FILES+=("$1") ;;
+  esac
+  shift
+done
+
+# --- engine ----------------------------------------------------------------
+
+CONTAINER_ENGINE=""
+detect_engine() {
+  local engine
+  for engine in docker podman; do
+    have "$engine" || continue
+    # An installed client with no reachable daemon is worse than no client at
+    # all: it fails slowly and confusingly. Check before committing to it.
+    if timeout 20 "$engine" info >/dev/null 2>&1; then
+      CONTAINER_ENGINE="$engine"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# --- image -----------------------------------------------------------------
+
+# Tag by the Dockerfile's own hash: change the file and the next run rebuilds,
+# with no version constant to remember to bump.
+image_name() {
+  if [[ -n "${OMARCHY_LINT_IMAGE:-}" ]]; then
+    printf '%s' "$OMARCHY_LINT_IMAGE"
+    return 0
+  fi
+  local hash
+  hash="$(sha256sum "$DOCKERFILE" | cut -c1-12)"
+  printf 'omarchy-scripts/lint:%s' "$hash"
+}
+
+ensure_image() {
+  local image="$1"
+
+  # A caller-supplied image is theirs to manage; never build over it.
+  [[ -n "${OMARCHY_LINT_IMAGE:-}" ]] && return 0
+
+  if [[ "$REBUILD" == "0" ]] && "$CONTAINER_ENGINE" image inspect "$image" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  [[ -f "$DOCKERFILE" ]] || die "Missing $DOCKERFILE"
+  log "Building $image (once; ~5s)"
+  # Build context is docker/ alone — the repo itself is never sent to the daemon.
+  run "$CONTAINER_ENGINE" build --quiet \
+    --tag "$image" \
+    --file "$DOCKERFILE" \
+    "$(dirname "$DOCKERFILE")" >/dev/null \
+    || die "Failed to build $image"
+  ok "built $image"
+
+  # Hash tags accumulate one stale image per Dockerfile edit. Drop the old
+  # ones now that the new image is known good.
+  local stale
+  stale="$("$CONTAINER_ENGINE" images --quiet --filter "reference=omarchy-scripts/lint" \
+    | grep -vx "$("$CONTAINER_ENGINE" images --quiet "$image")" || true)"
+  if [[ -n "$stale" ]]; then
+    # shellcheck disable=SC2086  # deliberate word splitting: one id per line
+    "$CONTAINER_ENGINE" rmi $stale >/dev/null 2>&1 || true
+  fi
+}
+
+# --- file discovery --------------------------------------------------------
+
+discover_files() {
+  local file
+  shopt -s nullglob
+  for file in "$REPO_ROOT"/bin/* "$REPO_ROOT"/lib/*.sh "$REPO_ROOT"/githooks/* \
+              "$REPO_ROOT"/tests/run "$REPO_ROOT"/tests/*.sh; do
+    [[ -f "$file" ]] || continue
+    [[ "$file" == *.bak.* ]] && continue
+    printf '%s\n' "${file#"$REPO_ROOT"/}"
+  done
+  shopt -u nullglob
+}
+
+if [[ ${#FILES[@]} -eq 0 ]]; then
+  mapfile -t FILES < <(discover_files)
+else
+  # Normalise caller-supplied paths to repo-relative, so they resolve the same
+  # on the host and inside the container.
+  normalised=()
+  for f in "${FILES[@]}"; do
+    abs="$(cd "$(dirname "$f")" && pwd)/$(basename "$f")"
+    case "$abs" in
+      "$REPO_ROOT"/*) normalised+=("${abs#"$REPO_ROOT"/}") ;;
+      *) die "Not inside the repo: $f" ;;
+    esac
+  done
+  FILES=("${normalised[@]}")
+fi
+
+[[ ${#FILES[@]} -eq 0 ]] && { skip "No shell scripts to lint."; exit 0; }
+
+# --- runners ---------------------------------------------------------------
+
+# in_container <writable?> <cmd...> — run a tool from the lint image.
+# The mount is read-only unless the tool needs to write, and the network is
+# off: linters read code and nothing more.
+in_container() {
+  local writable="$1"; shift
+  local mount="$REPO_ROOT:/mnt:ro"
+  [[ "$writable" == "rw" ]] && mount="$REPO_ROOT:/mnt"
+
+  run "$CONTAINER_ENGINE" run --rm \
+    --network none \
+    --user "$(id -u):$(id -g)" \
+    --volume "$mount" \
+    --workdir /mnt \
+    "$LINT_IMAGE" "$@"
+}
+
+run_shellcheck_container() {
+  in_container ro shellcheck \
+    --external-sources --severity=style --color=always "${FILES[@]}"
+}
+
+run_shfmt_container() {
+  if [[ "$FIX" == "1" ]]; then
+    in_container rw shfmt --indent 2 --case-indent --binary-next-line --write "${FILES[@]}"
+  else
+    in_container ro shfmt --indent 2 --case-indent --binary-next-line --diff "${FILES[@]}"
+  fi
+}
+
+run_shellcheck_host() {
+  ( cd "$REPO_ROOT" && run shellcheck --external-sources --severity=style "${FILES[@]}" )
+}
+
+run_shfmt_host() {
+  local args=(--diff)
+  [[ "$FIX" == "1" ]] && args=(--write)
+  ( cd "$REPO_ROOT" && run shfmt --indent 2 --case-indent --binary-next-line "${args[@]}" "${FILES[@]}" )
+}
+
+# --- dispatch --------------------------------------------------------------
+
+if [[ "$USE_CONTAINER" != "no" ]] && detect_engine; then
+  MODE=container
+  LINT_IMAGE="$(image_name)"
+  ensure_image "$LINT_IMAGE"
+  log "Linting ${#FILES[@]} file(s) with $LINT_IMAGE via $CONTAINER_ENGINE"
+elif [[ "$USE_CONTAINER" == "yes" ]]; then
+  printf '%s err%s No usable container engine (is the docker daemon running?).\n' "$C_RED" "$C_RESET" >&2
+  exit 3
+elif have shellcheck; then
+  MODE=host
+  warn "No container engine; falling back to host shellcheck $(shellcheck --version | awk '/^version:/{print $2}')"
+else
+  warn "No container engine and no host shellcheck; nothing to lint with."
+  warn "Start the docker service, or install shellcheck and pass --no-container."
+  exit 3
+fi
+
+failures=0
+
+if [[ "$MODE" == "container" ]]; then
+  run_shellcheck_container || failures=$((failures + 1))
+else
+  run_shellcheck_host || failures=$((failures + 1))
+fi
+[[ "$failures" -eq 0 ]] && ok "shellcheck clean"
+
+if [[ "$RUN_FMT" == "1" ]]; then
+  log "Checking formatting with shfmt"
+  if [[ "$MODE" == "container" ]]; then
+    run_shfmt_container || failures=$((failures + 1))
+  else
+    have shfmt || die "shfmt not installed; drop --no-container to use the container."
+    run_shfmt_host || failures=$((failures + 1))
+  fi
+  if [[ "$failures" -eq 0 ]]; then
+    ok "formatting clean"
+  elif [[ "$FIX" == "1" ]]; then
+    ok "reformatted"
+  fi
+fi
+
+[[ "$failures" -gt 0 ]] && die "Lint failed."
+ok "All checks passed."

@@ -1,0 +1,104 @@
+# Conventions
+
+Rules every script in `bin/` follows. They exist so a script can be re-run on a
+half-configured machine without fear.
+
+## Shape
+
+- Named `bin/setup-<thing>` — that prefix is what `setup-all` discovers.
+- `#!/usr/bin/env bash` and `set -euo pipefail`.
+- Source `lib/common.sh` for logging, `run`, and `write_file`.
+- Executable, no `.sh` extension — these are commands, not libraries.
+- One script per task. If two tasks are useful separately, they are two scripts.
+- A header block declaring its slot in the run:
+
+  ```bash
+  #!/usr/bin/env bash
+  #
+  # setup-foo — one-line summary.
+  #
+  # order: 20
+  # description: Shown by setup-all --list
+  ```
+
+  `order` defaults to 50. See [setup-all.md](setup-all.md) for the ranges.
+  Keep `description` short and comma-free — it is a menu label, and `setup-all`
+  rewrites commas to `·` so they cannot corrupt gum's selection list.
+
+## Behaviour
+
+- **Idempotent.** This is the load-bearing rule: `setup-all` is meant to be run
+  on an already-configured machine, so a second run must change nothing and say
+  so (`skip ...`). In practice that means checking before acting — is the unit
+  already enabled, is the marker block already in the file, does the key already
+  match — rather than blindly re-applying. `write_file` handles the common case.
+- **`--dry-run`.** Prints every action it would take, changes nothing. Wrap
+  side effects in `run` so this is free.
+- **`--help`.** Usage text listing every flag.
+- **Backs up before editing.** `write_file` copies the old file to
+  `<file>.bak.<timestamp>` first.
+- **Never runs as root.** Call `require_not_root`. Use `sudo` for the single
+  command that needs it, never for the whole script.
+- **Confirms destructive steps.** Use `confirm`, which `--yes` bypasses.
+- **Accepts `-n`/`--dry-run` and `-y`/`--yes`.** `setup-all` passes both through
+  to every script, so a script that rejects them breaks the whole run.
+- **Exits non-zero on failure**, so `setup-all` can report it. Exit 0 when the
+  work was already done — that is a skip, not a failure.
+
+## Helpers in `lib/common.sh`
+
+| Helper | Purpose |
+| --- | --- |
+| `log`, `ok`, `skip`, `warn`, `die` | Consistent, colourised output |
+| `run cmd...` | Execute, or echo under `DRY_RUN=1` |
+| `have cmd` | Is a command on `$PATH`? |
+| `require_cmd cmd...` | Die unless all commands exist |
+| `require_not_root` | Refuse to run as root |
+| `confirm "prompt"` | Ask, unless `ASSUME_YES=1` |
+| `write_file path <<<content` | Idempotent write with backup |
+
+`lib/tui.sh` adds the menu layer used by `setup-all` — `tui_menu`,
+`tui_multiselect`, `tui_confirm`, `tui_title`, `tui_banner`. Each prefers `gum`
+and falls back to plain bash prompts, so gum is never a hard dependency.
+Individual scripts do not need it; they just print.
+
+## Testing
+
+Every script gets tests in `tests/`. A new `bin/setup-*` should at minimum pin
+down that it is idempotent — a second run changes nothing — because that is the
+property everything else depends on and the easiest one to break later. See
+[testing.md](testing.md).
+
+## CI/CD
+
+`bin/install-hooks` points `core.hooksPath` at `githooks/`. On commit the hook:
+
+1. Runs `bash -n` over staged scripts — no dependencies, always available.
+2. Runs `bin/lint`, which shellchecks them inside a pinned container.
+3. Runs `tests/run`, the whole suite.
+4. Refuses commits that drop the executable bit on anything in `bin/`.
+
+Nothing runs on push. See [ci.md](ci.md) for why, and for how the hook degrades
+rather than blocks when docker is not running.
+
+`bin/lint` needs no host tooling: it uses the docker omarchy already ships. If
+neither a container engine nor a host `shellcheck` is available it exits 3 and
+the hook lets the commit through with a warning, rather than blocking work on a
+stopped daemon.
+
+## Container images
+
+Two rules, applied to anything this repo runs in a container:
+
+- **Reputable sources only.** Prefer a Docker Official Image as the base and
+  install tools from the distro's signed repositories, over pulling a
+  third-party prebuilt image — even the tool author's. Fewer parties to trust,
+  and the ones that remain are the most scrutinised.
+- **Pin by digest, not tag.** A tag can be repointed at new content; a digest
+  cannot.
+- **Small and cached.** Lint runs happen on every commit, so image size and
+  startup are a tax on the edit loop. Build once, tag by the Dockerfile's hash,
+  prune what it supersedes.
+
+There is no hosted CI by design — everything runs locally. See
+[lint.md](lint.md) for the images, fallbacks, and how to suppress a finding.

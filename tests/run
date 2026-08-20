@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+#
+# run — the test suite.
+#
+# Plain bash on purpose: tests exercise scripts that talk to systemd, docker,
+# and the real filesystem, so they run on the host rather than in a container,
+# and pull in no test framework. Every test works in a throwaway HOME with
+# stubbed commands; nothing touches the real system.
+#
+set -uo pipefail
+
+TESTS_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$TESTS_DIR/.." && pwd)"
+# shellcheck source=../lib/common.sh
+source "$REPO_ROOT/lib/common.sh"
+
+FILTER=""
+
+usage() {
+  cat <<'USAGE'
+Usage: run [options]
+
+Runs every tests/test-*.sh.
+
+Options:
+  -f, --filter PATTERN   Only run test files matching PATTERN.
+  -h, --help             Show this help.
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -f|--filter) FILTER="${2:?--filter needs a value}"; shift ;;
+    -h|--help)   usage; exit 0 ;;
+    *)           usage >&2; die "Unknown argument: $1" ;;
+  esac
+  shift
+done
+
+files=()
+shopt -s nullglob
+for f in "$TESTS_DIR"/test-*.sh; do
+  [[ -n "$FILTER" && "$(basename "$f")" != *"$FILTER"* ]] && continue
+  files+=("$f")
+done
+shopt -u nullglob
+
+[[ ${#files[@]} -eq 0 ]] && die "No test files matched."
+
+total=0
+failed=0
+failed_files=()
+started=$SECONDS
+
+for f in "${files[@]}"; do
+  name="$(basename "$f" .sh)"
+  printf '\n%s%s%s\n' "$C_BLUE" "$name" "$C_RESET"
+
+  # Each file runs in its own process; results come back on fd 9 so they are
+  # not tangled up with the test's own output.
+  result="$(TEST_RESULT_FD=9 bash "$f" 9>&1 1>&2)" || true
+
+  if [[ "$result" =~ ^RESULT\ ([0-9]+)\ ([0-9]+)$ ]]; then
+    total=$((total + BASH_REMATCH[1]))
+    if [[ "${BASH_REMATCH[2]}" -gt 0 ]]; then
+      failed=$((failed + BASH_REMATCH[2]))
+      failed_files+=("$name")
+    fi
+  else
+    warn "$name did not report results (crashed?)"
+    failed=$((failed + 1))
+    failed_files+=("$name")
+  fi
+done
+
+printf '\n'
+if [[ "$failed" -eq 0 ]]; then
+  ok "$total test(s) passed in $((SECONDS - started))s"
+  exit 0
+fi
+
+printf '%s err%s %s of %s test(s) failed: %s\n' \
+  "$C_RED" "$C_RESET" "$failed" "$total" "${failed_files[*]}" >&2
+exit 1

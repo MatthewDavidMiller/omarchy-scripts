@@ -1,0 +1,32 @@
+# Backups written by lib/common.sh's write_file and by bin/setup-ssh-agent.
+# These are timestamped copies of files being edited — never source.
+*.bak
+*.bak.*
+
+# Secrets. Nothing in this repo should ever hold a key, so treat any that
+# appear as an accident and keep them out of history, where they cannot be
+# taken back.
+*.pem
+*.key
+*.p12
+id_rsa*
+id_ecdsa*
+id_ed25519*
+*_key
+!*_key.pub.example
+.env
+.envrc
+.env.*
+secrets/
+
+# Local, machine-specific overrides that should not follow the repo around.
+*.local
+local/
+
+# Editor and OS noise.
+*~
+*.swp
+*.swo
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,274 @@
+#!/usr/bin/env bash
+#
+# setup-ssh-agent — persistent, socket-activated ssh-agent for omarchy.
+#
+# order: 20
+# description: Persistent socket-activated ssh-agent
+#
+# Enables the systemd user ssh-agent.socket that ships with OpenSSH, exports
+# SSH_AUTH_SOCK to the whole user session via environment.d, and configures
+# ~/.ssh/config so keys are added to the agent on first use and stay loaded
+# for the life of the login session.
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+SSH_DIR="$HOME/.ssh"
+SSH_CONFIG="$SSH_DIR/config"
+ENV_D_FILE="$HOME/.config/environment.d/10-ssh-agent.conf"
+# Written verbatim into environment.d; systemd expands it, not us.
+# shellcheck disable=SC2016
+AGENT_SOCK='${XDG_RUNTIME_DIR}/ssh-agent.socket'
+
+# How long a key stays loaded once added. Empty means "forever" (until logout).
+KEY_LIFETIME="${KEY_LIFETIME:-}"
+ADD_KEYS=1
+
+usage() {
+  cat <<'USAGE'
+Usage: setup-ssh-agent [options]
+
+Sets up a persistent ssh-agent as a systemd user service, so keys are unlocked
+once per login instead of once per terminal.
+
+Options:
+  -n, --dry-run       Show what would change without changing anything.
+  -y, --yes           Do not prompt for confirmation.
+      --no-add-keys   Configure the agent but do not run ssh-add.
+      --lifetime T    Expire loaded keys after T (e.g. 8h). Default: never.
+  -h, --help          Show this help.
+
+Environment:
+  DRY_RUN=1           Same as --dry-run.
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--dry-run)   DRY_RUN=1 ;;
+    -y|--yes)       ASSUME_YES=1 ;;
+    --no-add-keys)  ADD_KEYS=0 ;;
+    --lifetime)     KEY_LIFETIME="${2:?--lifetime needs a value}"; shift ;;
+    -h|--help)      usage; exit 0 ;;
+    *)              usage >&2; die "Unknown argument: $1" ;;
+  esac
+  shift
+done
+
+require_not_root
+require_cmd ssh-agent ssh-add systemctl
+
+# ---------------------------------------------------------------------------
+# 1. Stand down agents that would compete for SSH_AUTH_SOCK
+# ---------------------------------------------------------------------------
+disable_conflicting_agents() {
+  log "Checking for conflicting agents"
+  local unit state
+  for unit in gcr-ssh-agent.socket gcr-ssh-agent.service gpg-agent-ssh.socket; do
+    state="$(systemctl --user is-enabled "$unit" 2>/dev/null || true)"
+
+    case "$state" in
+      enabled|enabled-runtime)
+        warn "$unit is enabled and will fight over SSH_AUTH_SOCK"
+        if confirm "Disable $unit?"; then
+          run systemctl --user disable --now "$unit"
+        else
+          skip "left $unit enabled — expect the wrong agent to win"
+        fi
+        ;;
+      static)
+        # Static units cannot be disabled; masking is the only way to stop
+        # them being pulled in by another unit's dependencies.
+        if systemctl --user is-active --quiet "$unit" 2>/dev/null; then
+          warn "$unit is static but running, and will fight over SSH_AUTH_SOCK"
+          if confirm "Mask and stop $unit?"; then
+            run systemctl --user mask --now "$unit"
+          else
+            skip "left $unit running — expect the wrong agent to win"
+          fi
+        else
+          skip "$unit static but not running"
+        fi
+        ;;
+      *)
+        skip "$unit not enabled"
+        ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------------------
+# 2. Export SSH_AUTH_SOCK for every process in the session
+# ---------------------------------------------------------------------------
+configure_environment() {
+  log "Exporting SSH_AUTH_SOCK via environment.d"
+  write_file "$ENV_D_FILE" <<EOF
+# Managed by omarchy-scripts (bin/setup-ssh-agent).
+# Read by systemd --user at login; inherited by Hyprland and everything it spawns.
+SSH_AUTH_SOCK=$AGENT_SOCK
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# 3. Enable the socket-activated agent
+# ---------------------------------------------------------------------------
+enable_agent() {
+  log "Enabling ssh-agent.socket"
+
+  # ssh-agent.socket and .service both carry ConditionEnvironment=!SSH_AGENT_PID,
+  # so they refuse to start if a stray agent leaked that variable into the
+  # systemd user manager's environment.
+  if systemctl --user show-environment 2>/dev/null | grep -q '^SSH_AGENT_PID='; then
+    warn "SSH_AGENT_PID is set in the systemd user environment; the unit will not start"
+    if confirm "Unset it from the user manager?"; then
+      run systemctl --user unset-environment SSH_AGENT_PID SSH_AUTH_SOCK
+    fi
+  fi
+
+  run systemctl --user enable --now ssh-agent.socket
+
+  if [[ "$DRY_RUN" != "1" ]]; then
+    systemctl --user is-active --quiet ssh-agent.socket \
+      || die "ssh-agent.socket failed to start: systemctl --user status ssh-agent.socket"
+  fi
+  ok "ssh-agent.socket enabled"
+}
+
+# ---------------------------------------------------------------------------
+# 4. Teach ssh(1) to hand keys to the agent automatically
+# ---------------------------------------------------------------------------
+configure_ssh_config() {
+  log "Configuring $SSH_CONFIG"
+  run mkdir -p "$SSH_DIR"
+  run chmod 700 "$SSH_DIR"
+
+  local marker='# >>> omarchy-scripts: ssh-agent >>>'
+  if [[ -f "$SSH_CONFIG" ]] && grep -qF "$marker" "$SSH_CONFIG"; then
+    skip "ssh-agent block already present in $SSH_CONFIG"
+    return 0
+  fi
+
+  local block
+  block="$marker
+Host *
+    AddKeysToAgent yes
+# <<< omarchy-scripts: ssh-agent <<<
+"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    printf '%s  dry%s would append ssh-agent block to %s\n' "$C_DIM" "$C_RESET" "$SSH_CONFIG"
+    return 0
+  fi
+
+  # Host * must come last in ssh_config (first match wins per keyword), but a
+  # bare AddKeysToAgent/IdentitiesOnly pair is safe to append at the end.
+  touch "$SSH_CONFIG"
+  cp -a "$SSH_CONFIG" "$SSH_CONFIG.bak.$(date +%Y%m%d%H%M%S)"
+  printf '\n%s' "$block" >> "$SSH_CONFIG"
+  chmod 600 "$SSH_CONFIG"
+  ok "appended ssh-agent block to $SSH_CONFIG"
+}
+
+# ---------------------------------------------------------------------------
+# 5. Load keys now so the current session benefits immediately
+# ---------------------------------------------------------------------------
+discover_keys() {
+  local key
+  shopt -s nullglob
+  for key in "$SSH_DIR"/*; do
+    [[ -f "$key" ]] || continue
+    case "$(basename "$key")" in
+      *.pub|*.bak.*|config|known_hosts*|authorized_keys) continue ;;
+    esac
+    grep -qs 'PRIVATE KEY' "$key" || continue
+    printf '%s\n' "$key"
+  done
+  shopt -u nullglob
+}
+
+# key_loaded <sock> <keyfile> — true if the agent already holds this key.
+key_loaded() {
+  local sock="$1" key="$2" fp
+  fp="$(ssh-keygen -lf "$key" 2>/dev/null | awk '{print $2}')" || return 1
+  [[ -n "$fp" ]] || return 1
+  SSH_AUTH_SOCK="$sock" ssh-add -l 2>/dev/null | awk '{print $2}' | grep -qxF "$fp"
+}
+
+add_keys() {
+  log "Adding keys to the agent"
+
+  local sock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/ssh-agent.socket"
+  if [[ ! -S "$sock" ]]; then
+    warn "agent socket $sock not present yet — skipping ssh-add"
+    return 0
+  fi
+
+  local keys=()
+  mapfile -t keys < <(discover_keys)
+  if [[ ${#keys[@]} -eq 0 ]]; then
+    warn "no private keys found in $SSH_DIR — generate one with ssh-keygen -t ed25519"
+    return 0
+  fi
+
+  local add_args=(ssh-add)
+  [[ -n "$KEY_LIFETIME" ]] && add_args+=(-t "$KEY_LIFETIME")
+
+  local key added
+  for key in "${keys[@]}"; do
+    if key_loaded "$sock" "$key"; then
+      skip "$(basename "$key") already loaded"
+      continue
+    fi
+    if [[ "$DRY_RUN" == "1" ]]; then
+      printf '%s  dry%s ssh-add %s\n' "$C_DIM" "$C_RESET" "$key"
+      continue
+    fi
+    # Read the passphrase from the terminal even when our own stdin is a pipe
+    # (setup-all, a heredoc), but fall back to inherited stdin when there is no
+    # controlling terminal at all, rather than failing outright.
+    if [[ -e /dev/tty ]] && : >/dev/tty 2>/dev/null; then
+      SSH_AUTH_SOCK="$sock" "${add_args[@]}" "$key" </dev/tty && added=1 || added=0
+    else
+      SSH_AUTH_SOCK="$sock" "${add_args[@]}" "$key" && added=1 || added=0
+    fi
+
+    if [[ "$added" == "1" ]]; then
+      ok "added $(basename "$key")"
+    else
+      warn "could not add $(basename "$key")"
+    fi
+  done
+}
+
+summary() {
+  local want="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/ssh-agent.socket"
+  if [[ -n "${SSH_AGENT_PID:-}" ]] || [[ "${SSH_AUTH_SOCK:-}" != "$want" ]]; then
+    warn "this shell still points at another agent (SSH_AUTH_SOCK=${SSH_AUTH_SOCK:-unset});"
+    warn "that agent is replaced at your next login."
+  fi
+
+  log "Done"
+  cat <<EOF
+
+Log out and back in (or run: systemctl --user import-environment) so every
+process picks up SSH_AUTH_SOCK.
+
+Verify with:
+  systemctl --user status ssh-agent.socket
+  echo \$SSH_AUTH_SOCK      # ${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/ssh-agent.socket
+  ssh-add -l
+EOF
+}
+
+main() {
+  disable_conflicting_agents
+  configure_environment
+  enable_agent
+  configure_ssh_config
+  [[ "$ADD_KEYS" == "1" ]] && add_keys
+  summary
+}
+
+main "$@"

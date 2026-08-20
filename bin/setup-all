@@ -1,0 +1,308 @@
+#!/usr/bin/env bash
+#
+# setup-all — run every setup script in bin/, in order.
+#
+# The single command to bring a machine's config up to date. Discovers
+# bin/setup-* automatically, so a new script joins just by existing. Each
+# script declares its position with an `# order: NN` header comment
+# (default 50); ties break alphabetically.
+#
+# Every script is idempotent, so this is safe to re-run any time.
+#
+# Run with no arguments in a terminal it opens a TUI; pass any flag (or pipe
+# it) and it behaves as a plain non-interactive runner.
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+# shellcheck source=../lib/tui.sh
+source "$SCRIPT_DIR/../lib/tui.sh"
+
+SELF="$(basename -- "${BASH_SOURCE[0]}")"
+FAIL_FAST=0
+LIST_ONLY=0
+USE_TUI=auto
+ONLY=()
+SKIP=()
+CHILD_ARGS=()
+
+usage() {
+  cat <<'USAGE'
+Usage: setup-all [options]
+
+Runs every bin/setup-* script in order. Safe to re-run: each script is
+idempotent and reports what it skipped.
+
+With no arguments in a terminal, opens an interactive menu. Any flag below
+selects the non-interactive runner instead.
+
+Options:
+  -t, --tui           Force the interactive menu.
+      --no-tui        Force the plain runner, even with no arguments.
+  -n, --dry-run       Preview everything; passed through to each script.
+  -y, --yes           Answer yes to prompts; passed through to each script.
+  -l, --list          List the scripts that would run, in order, then exit.
+      --only NAME     Run only NAME (repeatable, or comma-separated).
+      --skip NAME     Skip NAME (repeatable, or comma-separated).
+      --fail-fast     Stop at the first failure. Default: run all, then report.
+  -h, --help          Show this help.
+
+NAME matches with or without the leading "setup-": both "ssh-agent" and
+"setup-ssh-agent" select bin/setup-ssh-agent.
+USAGE
+}
+
+# Accepts repeated flags and comma-separated lists.
+split_into() {
+  local -n _target="$1"
+  local IFS=','
+  read -r -a _parts <<< "$2"
+  local p
+  for p in "${_parts[@]}"; do
+    [[ -n "$p" ]] && _target+=("${p#setup-}")
+  done
+}
+
+ARG_COUNT=$#
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -t|--tui)      USE_TUI=yes ;;
+    --no-tui)      USE_TUI=no ;;
+    -n|--dry-run)  DRY_RUN=1;    CHILD_ARGS+=(--dry-run) ;;
+    -y|--yes)      ASSUME_YES=1; CHILD_ARGS+=(--yes) ;;
+    -l|--list)     LIST_ONLY=1 ;;
+    --only)        split_into ONLY "${2:?--only needs a value}"; shift ;;
+    --skip)        split_into SKIP "${2:?--skip needs a value}"; shift ;;
+    --fail-fast)   FAIL_FAST=1 ;;
+    -h|--help)     usage; exit 0 ;;
+    *)             usage >&2; die "Unknown argument: $1" ;;
+  esac
+  shift
+done
+
+require_not_root
+
+# --- discovery -------------------------------------------------------------
+
+# Reads `# key: value` from a script's header block.
+meta() {
+  local file="$1" key="$2" fallback="$3" value
+  value="$(sed -n "1,25s/^# *$key: *//p" "$file" | head -n1)"
+  value="${value:-$fallback}"
+  # Commas would corrupt gum choose --selected, which is a comma-separated list.
+  printf '%s' "${value//,/ ·}"
+}
+
+selected() {
+  local name="$1" entry
+  for entry in "${SKIP[@]+"${SKIP[@]}"}"; do
+    [[ "$entry" == "$name" ]] && return 1
+  done
+  [[ ${#ONLY[@]} -eq 0 ]] && return 0
+  for entry in "${ONLY[@]}"; do
+    [[ "$entry" == "$name" ]] && return 0
+  done
+  return 1
+}
+
+discover() {
+  local file base
+  shopt -s nullglob
+  for file in "$SCRIPT_DIR"/setup-*; do
+    base="$(basename -- "$file")"
+    [[ "$base" == "$SELF" ]] && continue
+    [[ -f "$file" ]] || continue
+    if [[ ! -x "$file" ]]; then
+      warn "$base is not executable — skipping"
+      continue
+    fi
+    selected "${base#setup-}" || continue
+    printf '%s\t%s\t%s\n' "$(meta "$file" order 50)" "$base" "$(meta "$file" description '')"
+  done
+  shopt -u nullglob
+}
+
+mapfile -t ENTRIES < <(discover | sort -t$'\t' -k1,1n -k2,2)
+
+# Fail loudly on an --only/--skip name that matches nothing, rather than
+# silently doing less than asked.
+for want in "${ONLY[@]+"${ONLY[@]}"}"; do
+  [[ -x "$SCRIPT_DIR/setup-$want" ]] || die "No such script: bin/setup-$want"
+done
+for want in "${SKIP[@]+"${SKIP[@]}"}"; do
+  [[ -x "$SCRIPT_DIR/setup-$want" ]] || warn "--skip $want matches no script"
+done
+
+[[ ${#ENTRIES[@]} -eq 0 ]] && die "No setup scripts to run."
+
+# --- listing ---------------------------------------------------------------
+
+list_entries() {
+  log "Scripts that would run, in order"
+  local entry order name desc
+  for entry in "$@"; do
+    IFS=$'\t' read -r order name desc <<< "$entry"
+    printf '  %s%3s%s  %-24s %s%s%s\n' "$C_DIM" "$order" "$C_RESET" "$name" "$C_DIM" "$desc" "$C_RESET"
+  done
+}
+
+if [[ "$LIST_ONLY" == "1" ]]; then
+  list_entries "${ENTRIES[@]}"
+  exit 0
+fi
+
+# --- run -------------------------------------------------------------------
+
+# run_scripts <entry>... — runs each, prints a summary, returns the failure count.
+run_scripts() {
+  local -a results=()
+  local failures=0 started=$SECONDS
+  local entry _order name desc status result
+
+  for entry in "$@"; do
+    IFS=$'\t' read -r _order name desc <<< "$entry"
+
+    tui_banner "$name${desc:+ — $desc}"
+
+    # Children handle their own dry-run, so invoke them for real either way and
+    # let the passed-through --dry-run keep them harmless.
+    if "$SCRIPT_DIR/$name" "${CHILD_ARGS[@]+"${CHILD_ARGS[@]}"}"; then
+      results+=("ok"$'\t'"$name")
+    else
+      status=$?
+      results+=("failed (exit $status)"$'\t'"$name")
+      failures=$((failures + 1))
+      warn "$name failed with exit $status"
+      if [[ "$FAIL_FAST" == "1" ]]; then
+        warn "--fail-fast: stopping"
+        break
+      fi
+    fi
+  done
+
+  printf '\n'
+  log "Summary ($((SECONDS - started))s)"
+  for result in "${results[@]}"; do
+    IFS=$'\t' read -r status name <<< "$result"
+    if [[ "$status" == "ok" ]]; then
+      ok "$name"
+    else
+      printf '%s err%s %s — %s\n' "$C_RED" "$C_RESET" "$name" "$status"
+    fi
+  done
+
+  if [[ "$failures" -gt 0 ]]; then
+    printf '%s err%s %s script(s) failed.\n' "$C_RED" "$C_RESET" "$failures" >&2
+  else
+    ok "All ${#results[@]} script(s) completed."
+  fi
+  return "$failures"
+}
+
+# --- interactive menu ------------------------------------------------------
+
+# Menu labels are "name — description"; entries are looked up back by name.
+entry_label() {
+  local _order name desc
+  IFS=$'\t' read -r _order name desc <<< "$1"
+  printf '%s%s' "${name#setup-}" "${desc:+ — $desc}"
+}
+
+entries_for_labels() {
+  local label entry
+  while IFS= read -r label; do
+    [[ -n "$label" ]] || continue
+    for entry in "${ENTRIES[@]}"; do
+      [[ "$(entry_label "$entry")" == "$label" ]] && printf '%s\n' "$entry"
+    done
+  done
+}
+
+tui_run() {
+  local -a chosen=()
+  mapfile -t chosen < <(printf '%s\n' "$@")
+  [[ ${#chosen[@]} -eq 0 ]] && { warn "Nothing selected."; return 0; }
+
+  local mode="apply"
+  [[ "$DRY_RUN" == "1" ]] && mode="dry run"
+  if ! tui_confirm "Run ${#chosen[@]} script(s) — $mode?"; then
+    skip "Cancelled."
+    return 0
+  fi
+
+  run_scripts "${chosen[@]}" || true
+}
+
+tui_main() {
+  local -a labels=()
+  local entry choice
+  for entry in "${ENTRIES[@]}"; do labels+=("$(entry_label "$entry")"); done
+
+  while true; do
+    local dry_state="off"
+    [[ "$DRY_RUN" == "1" ]] && dry_state="on"
+
+    tui_title "omarchy setup" "${#ENTRIES[@]} script(s) available · dry-run $dry_state"
+
+    choice="$(tui_menu "What would you like to do?" \
+      "Run everything" \
+      "Choose scripts…" \
+      "List scripts" \
+      "Toggle dry-run (currently $dry_state)" \
+      "Quit")" || return 0
+
+    case "$choice" in
+      "Run everything")
+        tui_run "${ENTRIES[@]}"
+        tui_pause
+        ;;
+      "Choose scripts…")
+        local -a picked=()
+        mapfile -t picked < <(tui_multiselect "Select scripts (space to toggle, enter to confirm)" "${labels[@]}" | entries_for_labels)
+        if [[ ${#picked[@]} -gt 0 ]]; then
+          tui_run "${picked[@]}"
+          tui_pause
+        fi
+        ;;
+      "List scripts")
+        list_entries "${ENTRIES[@]}"
+        tui_pause
+        ;;
+      Toggle*)
+        if [[ "$DRY_RUN" == "1" ]]; then
+          DRY_RUN=0
+          CHILD_ARGS=("${CHILD_ARGS[@]/--dry-run/}")
+          # Drop the emptied slot rather than passing "" to children.
+          local -a cleaned=()
+          local arg
+          for arg in "${CHILD_ARGS[@]+"${CHILD_ARGS[@]}"}"; do
+            [[ -n "$arg" ]] && cleaned+=("$arg")
+          done
+          CHILD_ARGS=("${cleaned[@]+"${cleaned[@]}"}")
+        else
+          DRY_RUN=1
+          CHILD_ARGS+=(--dry-run)
+        fi
+        ;;
+      "Quit"|"") return 0 ;;
+    esac
+  done
+}
+
+# --- dispatch --------------------------------------------------------------
+
+# Bare invocation on a terminal gets the menu; anything else runs plainly, so
+# scripts and pipelines are unaffected.
+if [[ "$USE_TUI" == "yes" ]] || { [[ "$USE_TUI" == "auto" ]] && [[ "$ARG_COUNT" -eq 0 ]] && tui_interactive; }; then
+  if ! tui_interactive; then
+    die "--tui needs an interactive terminal."
+  fi
+  tui_main
+  exit 0
+fi
+
+run_scripts "${ENTRIES[@]}"
+exit $(( $? > 0 ? 1 : 0 ))

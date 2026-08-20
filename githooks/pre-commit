@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# The whole CI/CD pipeline: syntax, lint, tests, permissions — all on commit.
+# Installed via bin/install-hooks.
+#
+# There is deliberately no pre-push hook. Everything is already verified by the
+# time a commit exists, so pushing stays instant.
+#
+# Syntax checking always runs (bash is already here). Deeper linting goes
+# through bin/lint, which uses a container so nothing has to be installed on
+# the host; if neither a container engine nor a host shellcheck is available,
+# it says so and lets the commit through rather than blocking work.
+set -uo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root" || exit 1
+
+fail=0
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+[[ -z "$staged" ]] && exit 0
+
+# Anything under bin/, lib/, or githooks/, plus anything with a shell shebang.
+scripts=()
+while IFS= read -r f; do
+  [[ -f "$f" ]] || continue
+  case "$f" in
+    bin/*|lib/*|githooks/*|*.sh|*.bash) scripts+=("$f"); continue ;;
+  esac
+  head -n1 "$f" | grep -qE '^#!.*(bash|sh)\b' && scripts+=("$f")
+done <<< "$staged"
+
+[[ ${#scripts[@]} -eq 0 ]] && exit 0
+
+for f in "${scripts[@]}"; do
+  if ! bash -n "$f"; then
+    echo "pre-commit: syntax error in $f" >&2
+    fail=1
+  fi
+done
+
+./bin/lint "${scripts[@]}"
+case "$?" in
+  0) ;;
+  3) echo "pre-commit: no linter available, syntax check only" >&2 ;;
+  *) fail=1 ;;
+esac
+
+# The suite is fast and hermetic (throwaway HOME, stubbed commands), so it runs
+# on every commit rather than being deferred to push.
+if [[ -x ./tests/run ]]; then
+  if ! ./tests/run; then
+    echo "pre-commit: tests failed" >&2
+    fail=1
+  fi
+fi
+
+# Executables in bin/ must stay executable.
+for f in "${scripts[@]}"; do
+  case "$f" in
+    bin/*)
+      if [[ "$(git ls-files --stage "$f" | cut -d' ' -f1)" != "100755" ]]; then
+        echo "pre-commit: $f is not executable (git update-index --chmod=+x $f)" >&2
+        fail=1
+      fi
+      ;;
+  esac
+done
+
+exit "$fail"

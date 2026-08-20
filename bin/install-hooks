@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Point this repo's git hooks at githooks/. Run once after cloning.
+#
+# Commit-time only: pre-commit runs lint and the test suite. Nothing runs on
+# push, so pushes stay instant.
+set -euo pipefail
+
+repo_root="$(git -C "$(dirname -- "${BASH_SOURCE[0]}")" rev-parse --show-toplevel)"
+cd "$repo_root"
+
+chmod +x githooks/*
+git config core.hooksPath githooks
+
+# A pre-push hook left over from an older layout would still fire from
+# .git/hooks even with core.hooksPath set elsewhere, so say so plainly.
+if [[ -e .git/hooks/pre-push ]]; then
+  echo "warn: .git/hooks/pre-push exists and would slow pushes down; remove it" >&2
+fi
+
+echo "==> git hooks enabled (core.hooksPath=githooks)"
+echo "    on commit: syntax → lint → tests → permissions"
+echo "    on push:   nothing, by design"
+# Linting runs in a container, so no host tooling is required — but warn if
+# there is no engine either, since the hook then degrades to syntax + tests.
+if ! command -v docker >/dev/null 2>&1 && ! command -v podman >/dev/null 2>&1; then
+  command -v shellcheck >/dev/null 2>&1 \
+    || echo "warn: no container engine and no host shellcheck; commits will skip linting" >&2
+fi

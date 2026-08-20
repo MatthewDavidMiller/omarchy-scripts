@@ -1,0 +1,6 @@
+# Follow `source`d files so helpers in lib/ are analysed too.
+external-sources=true
+
+# `source=../lib/common.sh` directives are written relative to the script that
+# contains them, not to the directory shellcheck happens to run from.
+source-path=SCRIPTDIR
