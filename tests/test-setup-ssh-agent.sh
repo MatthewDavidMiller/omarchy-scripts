@@ -77,6 +77,14 @@ else
   pass
 fi
 
+# Without an IdentityFile line, ssh only ever tries the six default id_* names,
+# so a key called work_key_2026 is never offered and never reaches the agent.
+it "names the discovered key with IdentityFile so ssh will actually offer it"
+assert_file_contains "$SSH_CONFIG" "IdentityFile ~/.ssh/work_key_2026"
+
+it "does not back up a config file it created itself"
+assert_eq "0" "$(find "$FAKE_HOME/.ssh" -name 'config.bak.*' | wc -l)" "backup count"
+
 it "tightens ssh config permissions"
 assert_eq "600" "$(stat -c '%a' "$SSH_CONFIG")" "config mode"
 
@@ -104,11 +112,45 @@ assert_contains "$out2" "already up to date"
 it "a second run does not duplicate the ssh config block"
 assert_eq "1" "$(grep -c 'omarchy-scripts: ssh-agent >>>' "$SSH_CONFIG")" "marker count"
 
-it "a second run says the ssh config block is already present"
-assert_contains "$out2" "already present"
+it "a second run says the ssh config block is already up to date"
+assert_contains "$out2" "block in $SSH_CONFIG already up to date"
 
-it "a second run creates no further backups"
+it "a second run creates no backups, because nothing changed"
+assert_eq "0" "$(find "$FAKE_HOME/.ssh" -name 'config.bak.*' | wc -l)" "backup count"
+
+# --- the key list tracks ~/.ssh, so a key added later is picked up ---
+
+ssh-keygen -q -t ed25519 -N '' -C test2 -f "$FAKE_HOME/.ssh/homelab_key_2023" </dev/null
+printf 'Host special\n    Port 2222\n' | cat - "$SSH_CONFIG" > "$SSH_CONFIG.new"
+mv "$SSH_CONFIG.new" "$SSH_CONFIG"
+out3="$(ssh_agent_setup --yes)"
+
+it "rewrites the block when a new key appears in ~/.ssh"
+assert_file_contains "$SSH_CONFIG" "IdentityFile ~/.ssh/homelab_key_2023"
+
+it "keeps the key that was already there"
+assert_file_contains "$SSH_CONFIG" "IdentityFile ~/.ssh/work_key_2026"
+
+it "rewriting the block does not duplicate it"
+assert_eq "1" "$(grep -c 'omarchy-scripts: ssh-agent >>>' "$SSH_CONFIG")" "marker count"
+
+it "preserves user settings written above the managed block"
+assert_file_contains "$SSH_CONFIG" "Port 2222"
+
+it "reports the rewrite"
+assert_contains "$out3" "updated ssh-agent block"
+
+it "backs up a config that already existed before rewriting it"
 assert_eq "1" "$(find "$FAKE_HOME/.ssh" -name 'config.bak.*' | wc -l)" "backup count"
+
+it "keeps the backup unreadable to other users"
+assert_eq "600" "$(stat -c '%a' "$(find "$FAKE_HOME/.ssh" -name 'config.bak.*' | head -1)")" "backup mode"
+
+it "leaves the rewritten config at mode 600"
+assert_eq "600" "$(stat -c '%a' "$SSH_CONFIG")" "config mode"
+
+it "a run after the rewrite reports the block as up to date"
+assert_contains "$(ssh_agent_setup --yes)" "already up to date"
 
 # --- conflicting agents ---
 

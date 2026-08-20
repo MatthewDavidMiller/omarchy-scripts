@@ -30,13 +30,23 @@ rather than from a shell — editors, GUI git clients — get no agent at all.
 3. **Enables `ssh-agent.socket`**, the socket-activated user unit shipped with
    OpenSSH. The agent starts on first connection to the socket and lives until
    logout. Nothing to clean up.
-4. **Appends to `~/.ssh/config`** (backing up the old file first):
+4. **Writes a managed block in `~/.ssh/config`** (backing up any existing file
+   first), naming every private key it found:
    ```
    Host *
        AddKeysToAgent yes
+       IdentityFile ~/.ssh/github_key_2026
+       IdentityFile ~/.ssh/homelab_key_2023
    ```
-   The first `ssh` that uses a key hands it to the agent; later connections
-   reuse it.
+   The `IdentityFile` lines are load-bearing. On its own `ssh` only ever tries
+   the six default `id_*` filenames, so a key called `github_key_2026` is never
+   offered, `AddKeysToAgent` never fires for it, and the agent stays empty after
+   every login. With the key named, the first `ssh` that uses it prompts once,
+   hands it to the agent, and later connections reuse it.
+
+   The block is regenerated on every run, so a key added to `~/.ssh` later is
+   picked up the next time you run the script. Anything above the block is left
+   alone.
 5. **Runs `ssh-add`** for every private key it finds in `~/.ssh`, skipping keys
    the agent already holds (compared by fingerprint, not filename).
 
@@ -58,18 +68,22 @@ in, then check:
 ```bash
 systemctl --user status ssh-agent.socket
 echo $SSH_AUTH_SOCK      # /run/user/1000/ssh-agent.socket
-ssh-add -l               # your keys
-ssh -T git@github.com
+ssh-add -l               # empty until the first ssh, then your keys
+ssh -T git@github.com    # prompts once, then the key is in the agent
 ```
 
 ## Notes and gotchas
 
-- **`IdentitiesOnly` is deliberately not set.** Under `Host *` it would
-  restrict ssh to default `id_*` filenames, so keys named anything else
-  (`github_key_2026`) would stop being offered.
+- **Every listed key is offered to every host.** `Host *` is a fallback, so a
+  server you connect to sees the public half of each key before one of them
+  authenticates. With a handful of keys that is fine; past six or so you can
+  hit the server's `MaxAuthTries` and get refused before the right key is
+  reached. Give those hosts their own block (below).
+- **`IdentitiesOnly` is deliberately not set.** Under `Host *` it would confine
+  every host to exactly this key list, overriding per-host `IdentityFile`
+  entries that ssh should still be free to use.
 - **Per-host keys** still belong in `~/.ssh/config` above the managed block —
-  `Host *` is a fallback, and for each keyword ssh takes the first value it
-  sees:
+  for each keyword ssh takes the first value it sees, so an entry above wins:
   ```
   Host github.com
       IdentityFile ~/.ssh/github_key_2026
@@ -84,7 +98,12 @@ ssh -T git@github.com
   The script detects this and offers to clear it. A shell that already has an
   old `SSH_AUTH_SOCK` keeps using the old agent until you log out — the script
   warns when it sees that.
-- **Re-running is safe.** Already-configured steps report `skip`.
+- **Re-running is safe.** Unchanged steps report `skip`; the `~/.ssh/config`
+  block is rewritten only when the key list actually changed, and the old file
+  is backed up (at mode 600) when it is.
+- **Keys do not survive a reboot.** The agent lives for the login session. What
+  makes that painless is step 4: after a reboot the first `ssh` re-adds the key
+  with one passphrase prompt, and every later connection that session is free.
 
 ## Undo
 

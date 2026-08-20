@@ -6,9 +6,10 @@
 # description: Persistent socket-activated ssh-agent
 #
 # Enables the systemd user ssh-agent.socket that ships with OpenSSH, exports
-# SSH_AUTH_SOCK to the whole user session via environment.d, and configures
-# ~/.ssh/config so keys are added to the agent on first use and stay loaded
-# for the life of the login session.
+# SSH_AUTH_SOCK to the whole user session via environment.d, and writes a
+# managed block in ~/.ssh/config that names every private key in ~/.ssh and
+# turns on AddKeysToAgent, so each key is unlocked once per login and stays
+# loaded for the life of the session.
 #
 set -euo pipefail
 
@@ -138,44 +139,11 @@ enable_agent() {
 }
 
 # ---------------------------------------------------------------------------
-# 4. Teach ssh(1) to hand keys to the agent automatically
-# ---------------------------------------------------------------------------
-configure_ssh_config() {
-  log "Configuring $SSH_CONFIG"
-  run mkdir -p "$SSH_DIR"
-  run chmod 700 "$SSH_DIR"
-
-  local marker='# >>> omarchy-scripts: ssh-agent >>>'
-  if [[ -f "$SSH_CONFIG" ]] && grep -qF "$marker" "$SSH_CONFIG"; then
-    skip "ssh-agent block already present in $SSH_CONFIG"
-    return 0
-  fi
-
-  local block
-  block="$marker
-Host *
-    AddKeysToAgent yes
-# <<< omarchy-scripts: ssh-agent <<<
-"
-  if [[ "$DRY_RUN" == "1" ]]; then
-    printf '%s  dry%s would append ssh-agent block to %s\n' "$C_DIM" "$C_RESET" "$SSH_CONFIG"
-    return 0
-  fi
-
-  # Host * must come last in ssh_config (first match wins per keyword), but a
-  # bare AddKeysToAgent/IdentitiesOnly pair is safe to append at the end.
-  touch "$SSH_CONFIG"
-  cp -a "$SSH_CONFIG" "$SSH_CONFIG.bak.$(date +%Y%m%d%H%M%S)"
-  printf '\n%s' "$block" >> "$SSH_CONFIG"
-  chmod 600 "$SSH_CONFIG"
-  ok "appended ssh-agent block to $SSH_CONFIG"
-}
-
-# ---------------------------------------------------------------------------
-# 5. Load keys now so the current session benefits immediately
+# 4. Find the private keys we are managing
 # ---------------------------------------------------------------------------
 discover_keys() {
-  local key
+  local key nullglob_was_set=0
+  shopt -q nullglob && nullglob_was_set=1
   shopt -s nullglob
   for key in "$SSH_DIR"/*; do
     [[ -f "$key" ]] || continue
@@ -185,9 +153,113 @@ discover_keys() {
     grep -qs 'PRIVATE KEY' "$key" || continue
     printf '%s\n' "$key"
   done
-  shopt -u nullglob
+  [[ "$nullglob_was_set" == "1" ]] || shopt -u nullglob
 }
 
+# ---------------------------------------------------------------------------
+# 5. Teach ssh(1) which keys to use, and to hand them to the agent
+# ---------------------------------------------------------------------------
+MARK_BEGIN='# >>> omarchy-scripts: ssh-agent >>>'
+MARK_END='# <<< omarchy-scripts: ssh-agent <<<'
+
+# build_ssh_block — the managed block, markers included, as it should look now.
+#
+# The IdentityFile lines are the point. ssh only ever tries the six default
+# id_* filenames on its own, so a key named github_key_2026 is never offered
+# and AddKeysToAgent never fires for it — the agent stays empty after every
+# login. Naming the keys here is what makes the whole setup survive a reboot.
+build_ssh_block() {
+  local key
+  printf '%s\n' "$MARK_BEGIN"
+  printf '%s\n' "# Managed by omarchy-scripts (bin/setup-ssh-agent); regenerated on each run."
+  printf '%s\n' "# Put per-host settings ABOVE this block: ssh takes the first value it sees."
+  printf '%s\n' "Host *"
+  printf '%s\n' "    AddKeysToAgent yes"
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    # ssh_config takes a double-quoted path when it contains whitespace.
+    if [[ "$key" == *[[:space:]]* ]]; then
+      printf '    IdentityFile "~/.ssh/%s"\n' "$(basename "$key")"
+    else
+      printf '    IdentityFile ~/.ssh/%s\n' "$(basename "$key")"
+    fi
+  done < <(discover_keys)
+  printf '%s\n' "$MARK_END"
+}
+
+# extract_ssh_block <file> — the managed block as it currently exists on disk.
+extract_ssh_block() {
+  awk -v b="$MARK_BEGIN" -v e="$MARK_END" '
+    $0 == b { inblock = 1 }
+    inblock { print }
+    $0 == e { inblock = 0 }
+  ' "$1"
+}
+
+# strip_ssh_block <file> — the file with the managed block removed.
+strip_ssh_block() {
+  awk -v b="$MARK_BEGIN" -v e="$MARK_END" '
+    $0 == b { inblock = 1; next }
+    $0 == e { inblock = 0; next }
+    !inblock { print }
+  ' "$1"
+}
+
+configure_ssh_config() {
+  log "Configuring $SSH_CONFIG"
+  run mkdir -p "$SSH_DIR"
+  run chmod 700 "$SSH_DIR"
+
+  local desired existed=0 action="append"
+  desired="$(build_ssh_block)"
+  [[ -f "$SSH_CONFIG" ]] && existed=1
+
+  if [[ "$existed" == "1" ]] && grep -qF "$MARK_BEGIN" "$SSH_CONFIG"; then
+    if [[ "$(extract_ssh_block "$SSH_CONFIG")" == "$desired" ]]; then
+      skip "ssh-agent block in $SSH_CONFIG already up to date"
+      return 0
+    fi
+    action="update"
+  fi
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    printf '%s  dry%s would %s ssh-agent block in %s\n' \
+      "$C_DIM" "$C_RESET" "$action" "$SSH_CONFIG"
+    return 0
+  fi
+
+  # Only back up something that was already there; a backup of a file we just
+  # created is noise. Copies of an ssh config get 600 whatever the original
+  # was, so a permissive config does not leave a permissive copy behind.
+  if [[ "$existed" == "1" ]]; then
+    local backup
+    backup="$SSH_CONFIG.bak.$(date +%Y%m%d%H%M%S)"
+    cp -a "$SSH_CONFIG" "$backup"
+    chmod 600 "$backup"
+  fi
+
+  if [[ "$action" == "update" ]]; then
+    # Rewrite in place so user content above the block is preserved and the
+    # key list tracks whatever is in ~/.ssh today.
+    local tmp
+    tmp="$(mktemp "$SSH_CONFIG.tmp.XXXXXX")"
+    { strip_ssh_block "$SSH_CONFIG"; printf '%s\n' "$desired"; } > "$tmp"
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$SSH_CONFIG"
+    ok "updated ssh-agent block in $SSH_CONFIG"
+  else
+    touch "$SSH_CONFIG"
+    chmod 600 "$SSH_CONFIG"
+    # Host * must come last in ssh_config, so appending is the correct place.
+    printf '\n%s\n' "$desired" >> "$SSH_CONFIG"
+    ok "appended ssh-agent block to $SSH_CONFIG"
+  fi
+  chmod 600 "$SSH_CONFIG"
+}
+
+# ---------------------------------------------------------------------------
+# 6. Load keys now so the current session benefits immediately
+# ---------------------------------------------------------------------------
 # key_loaded <sock> <keyfile> — true if the agent already holds this key.
 key_loaded() {
   local sock="$1" key="$2" fp
