@@ -44,6 +44,7 @@ touching the system.
 | `bin/setup-all` | Menu + runner for every script below, in order | [docs/setup-all.md](docs/setup-all.md) |
 | `bin/setup-ssh-agent` | Persistent socket-activated ssh-agent, unlocked once per login | [docs/setup-ssh-agent.md](docs/setup-ssh-agent.md) |
 | `bin/setup-no-idle` | Stop the screensaver and idle auto-lock from firing | [docs/setup-no-idle.md](docs/setup-no-idle.md) |
+| `bin/setup-no-localsend` | Remove LocalSend and the ufw rules that expose it | [docs/setup-no-localsend.md](docs/setup-no-localsend.md) |
 | `bin/lint` | shellcheck in a container — no host tooling to install | [docs/lint.md](docs/lint.md) |
 
 Container images follow two rules: **reputable sources only** — Docker Official
@@ -58,7 +59,7 @@ just by existing.
 ```bash
 ./bin/install-hooks   # once per clone — installs the CI/CD pipeline
 ./bin/lint            # shellcheck, in a container
-./tests/run           # 152 tests, ~4s
+./tests/run           # 188 tests, ~5s
 ```
 
 **CI/CD runs on commit and nowhere else.** `git commit` gates on syntax → lint

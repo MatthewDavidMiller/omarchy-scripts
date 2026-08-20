@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+#
+# setup-no-localsend — close the LocalSend port and remove the app behind it.
+#
+# order: 80
+# description: Remove LocalSend and the ufw rules that expose it
+#
+# Omarchy's installer opens 53317/tcp and 53317/udp to the whole network so
+# LocalSend can be discovered by peers (install/config/firewall.sh):
+#
+#   ufw allow 53317/udp
+#   ufw allow 53317/tcp
+#
+# Each of those is two rules once ufw expands it for IPv6, and they are the
+# only inbound holes on a stock install apart from the docker DNS pair. On a
+# machine that never uses LocalSend they are an open listener for nothing, so
+# this deletes them and uninstalls the app that justified them.
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+PORT=53317
+PROTOS=(udp tcp)
+# The repo package omarchy ships, plus the AUR build someone may have instead.
+PKGS=(localsend localsend-bin)
+FLATPAK_APP="org.localsend.localsend_app"
+# Overridable so the tests can point at a fixture instead of the real /etc.
+UFW_RULES_DIR="${UFW_RULES_DIR:-/etc/ufw}"
+
+# --allow-localsend puts everything back the way omarchy ships it.
+REVERT=0
+# --keep-package removes the firewall rules only.
+REMOVE_PACKAGE=1
+
+usage() {
+  cat <<'USAGE'
+Usage: setup-no-localsend [options]
+
+Deletes the ufw rules omarchy adds for LocalSend (53317/tcp and 53317/udp,
+IPv4 and IPv6) and uninstalls LocalSend itself.
+
+Options:
+  -n, --dry-run           Show what would change without changing anything.
+  -y, --yes               Do not prompt for confirmation.
+      --keep-package      Only close the firewall; leave LocalSend installed.
+      --allow-localsend   Reverse: restore the rules and reinstall the package.
+  -h, --help              Show this help.
+
+Environment:
+  DRY_RUN=1               Same as --dry-run.
+  UFW_RULES_DIR           Where ufw keeps user.rules. Default: /etc/ufw.
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--dry-run)        DRY_RUN=1 ;;
+    -y|--yes)            ASSUME_YES=1 ;;
+    --keep-package)      REMOVE_PACKAGE=0 ;;
+    --allow-localsend)   REVERT=1 ;;
+    -h|--help)           usage; exit 0 ;;
+    *)                   usage >&2; die "Unknown argument: $1" ;;
+  esac
+  shift
+done
+
+require_not_root
+require_cmd pacman sudo
+
+# run_quiet — like run, but swallows the command's own output. ufw echoes a
+# line per rule it touches, which just repeats what we are about to log.
+run_quiet() {
+  if [[ "$DRY_RUN" == "1" ]]; then
+    run "$@"
+  else
+    "$@" >/dev/null
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 1. The firewall rules
+# ---------------------------------------------------------------------------
+# `ufw show added` needs root, but the file it is generated from is
+# world-readable on a stock install. Preferring the file keeps --dry-run and
+# the already-done second run free of a sudo password prompt — which matters,
+# because setup-all re-runs this on every configured machine.
+RULES_CACHE=""
+
+ufw_rules() {
+  local file
+  if [[ -z "$RULES_CACHE" ]]; then
+    if [[ -r "$UFW_RULES_DIR/user.rules" ]]; then
+      for file in "$UFW_RULES_DIR/user.rules" "$UFW_RULES_DIR/user6.rules"; do
+        if [[ -r "$file" ]]; then
+          RULES_CACHE+="$(cat "$file")"$'\n'
+        fi
+      done
+    else
+      RULES_CACHE="$(sudo ufw show added 2>/dev/null || true)"$'\n'
+    fi
+  fi
+  printf '%s' "$RULES_CACHE"
+}
+
+# Matches both forms the rule can be read in: the `### tuple ### allow udp
+# 53317 ...` line in user.rules, and the `ufw allow 53317/udp` that
+# `ufw show added` prints. Anchored on the port so the docker DNS rules on
+# port 53 cannot match.
+rule_present() {
+  local proto="$1"
+  ufw_rules | grep -Eq "allow +($proto +$PORT|$PORT/$proto)( |\$)"
+}
+
+configure_firewall() {
+  if ! have ufw; then
+    skip "ufw is not installed — no firewall rules to change"
+    return 0
+  fi
+
+  local proto want_present verb=deleted
+  if [[ "$REVERT" == "1" ]]; then
+    log "Restoring omarchy's LocalSend firewall rules"
+    want_present=1
+    verb=added
+  else
+    log "Closing the LocalSend port ($PORT)"
+    want_present=0
+  fi
+
+  for proto in "${PROTOS[@]}"; do
+    if rule_present "$proto"; then
+      if [[ "$want_present" == "1" ]]; then
+        skip "$PORT/$proto already allowed"
+        continue
+      fi
+      # One `ufw delete` covers the IPv4 and IPv6 halves of the rule.
+      run_quiet sudo ufw delete allow "$PORT/$proto"
+    else
+      if [[ "$want_present" == "0" ]]; then
+        skip "$PORT/$proto already closed"
+        continue
+      fi
+      run_quiet sudo ufw allow "$PORT/$proto"
+    fi
+    ok "$PORT/$proto $verb"
+  done
+
+  # The rules changed underneath the cached copy.
+  RULES_CACHE=""
+}
+
+# ---------------------------------------------------------------------------
+# 2. The package
+# ---------------------------------------------------------------------------
+installed_pkg() {
+  local pkg
+  for pkg in "${PKGS[@]}"; do
+    if pacman -Qq "$pkg" >/dev/null 2>&1; then
+      printf '%s' "$pkg"
+      return 0
+    fi
+  done
+  return 1
+}
+
+remove_package() {
+  local pkg
+  if ! pkg="$(installed_pkg)"; then
+    skip "localsend is not installed"
+    return 0
+  fi
+
+  # -Rs also collects the dependencies nothing else needs any more. --print
+  # asks pacman for that list without root and without changing anything, so
+  # the confirmation below says exactly what is about to go.
+  local -a targets=()
+  mapfile -t targets < <(pacman -Rs --print "$pkg" 2>/dev/null || printf '%s\n' "$pkg")
+
+  local target
+  for target in "${targets[@]}"; do
+    printf '  %s-%s %s\n' "$C_DIM" "$C_RESET" "$target"
+  done
+
+  if ! confirm "Remove ${#targets[@]} package(s)?"; then
+    skip "left $pkg installed"
+    return 0
+  fi
+
+  run sudo pacman -Rs --noconfirm "$pkg"
+  ok "$pkg removed"
+}
+
+restore_package() {
+  local pkg
+  if pkg="$(installed_pkg)"; then
+    skip "$pkg already installed"
+    return 0
+  fi
+  run sudo pacman -S --needed --noconfirm "${PKGS[0]}"
+  ok "${PKGS[0]} installed"
+}
+
+configure_package() {
+  if [[ "$REMOVE_PACKAGE" == "0" ]]; then
+    skip "--keep-package: leaving LocalSend installed"
+    return 0
+  fi
+
+  if [[ "$REVERT" == "1" ]]; then
+    log "Reinstalling LocalSend"
+    restore_package
+    return 0
+  fi
+
+  log "Uninstalling LocalSend"
+  remove_package
+}
+
+# Omarchy's nautilus "Send via LocalSend" action falls back to a flatpak, so a
+# machine can have the app without the pacman package. Nothing to restore on
+# --allow-localsend: omarchy installs the repo package, not this.
+configure_flatpak() {
+  [[ "$REVERT" == "1" || "$REMOVE_PACKAGE" == "0" ]] && return 0
+  have flatpak || return 0
+  flatpak info "$FLATPAK_APP" >/dev/null 2>&1 || return 0
+
+  log "Uninstalling the LocalSend flatpak"
+  if ! confirm "Remove the $FLATPAK_APP flatpak?"; then
+    skip "left $FLATPAK_APP installed"
+    return 0
+  fi
+  run_quiet flatpak uninstall -y "$FLATPAK_APP"
+  ok "$FLATPAK_APP removed"
+}
+
+# ---------------------------------------------------------------------------
+summary() {
+  log "Done"
+  if [[ "$REVERT" == "1" ]]; then
+    cat <<EOF
+
+LocalSend is back the way omarchy ships it: port $PORT open inbound, app
+installed. Its tray icon returns the next time you launch it.
+EOF
+  else
+    cat <<EOF
+
+Nothing listens on $PORT any more and nothing inbound is allowed to it. Two
+omarchy entry points now do nothing, since both shell out to the app: the
+menu's Share → Receive, and the nautilus "Send via LocalSend" action. Omarchy
+owns those files, so this leaves them alone rather than editing /usr.
+
+Reverse it with:
+  ./bin/setup-no-localsend --allow-localsend
+EOF
+  fi
+
+  local proto open=() pkg_state="not installed" pkg
+  if have ufw; then
+    for proto in "${PROTOS[@]}"; do
+      if rule_present "$proto"; then open+=("$PORT/$proto"); fi
+    done
+  fi
+  if pkg="$(installed_pkg)"; then pkg_state="$pkg"; fi
+
+  printf '\n'
+  log "Current state"
+  printf '  firewall: %s\n' "${open[*]:-no LocalSend rules}"
+  printf '  package:  %s\n' "$pkg_state"
+}
+
+main() {
+  configure_firewall
+  configure_package
+  configure_flatpak
+  summary
+}
+
+main "$@"

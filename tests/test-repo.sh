@@ -21,7 +21,8 @@ done
 
 for path in \
   README.md LICENSE .gitignore .shellcheckrc .editorconfig \
-  bin/setup-all bin/setup-ssh-agent bin/setup-no-idle bin/lint bin/install-hooks \
+  bin/setup-all bin/setup-ssh-agent bin/setup-no-idle bin/setup-no-localsend \
+  bin/lint bin/install-hooks \
   lib/common.sh lib/tui.sh \
   githooks/pre-commit docker/lint.Dockerfile \
   tests/run tests/helpers.sh tests/test-repo.sh \

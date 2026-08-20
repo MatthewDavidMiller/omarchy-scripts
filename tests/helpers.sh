@@ -78,7 +78,7 @@ assert_file_contains() {
   local file="$1" needle="$2"
   if [[ ! -f "$file" ]]; then
     fail "expected file to exist: $file"
-  elif grep -qF "$needle" "$file"; then
+  elif grep -qF -- "$needle" "$file"; then
     pass
   else
     fail "expected $file to contain: $needle" "got: $(head -c 300 "$file")"
