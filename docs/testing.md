@@ -5,7 +5,7 @@
 ./tests/run --filter ssh-agent # one file
 ```
 
-188 tests, ~5 seconds. They run automatically on every commit.
+215 tests, ~5 seconds. They run automatically on every commit.
 
 ## Why plain bash
 

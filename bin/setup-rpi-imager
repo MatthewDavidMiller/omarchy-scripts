@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+#
+# setup-rpi-imager — install Raspberry Pi Imager from Arch's official repos.
+#
+# order: 60
+# description: Install Raspberry Pi Imager from Arch Extra
+#
+# Raspberry Pi publishes an AppImage for generic Linux distributions, but
+# Arch packages rpi-imager in the signed Extra repository. Installing that
+# package through Omarchy gives us native dependencies, desktop and polkit
+# integration, and updates with the rest of the system without involving AUR.
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+PACKAGE="rpi-imager"
+
+usage() {
+  cat <<'USAGE'
+Usage: setup-rpi-imager [options]
+
+Installs Raspberry Pi Imager from Arch's signed official Extra repository
+through Omarchy's package helper. It does not use AUR or download an AppImage.
+
+Options:
+  -n, --dry-run   Show what would change without changing anything.
+  -y, --yes       Accepted for setup-all compatibility.
+  -h, --help      Show this help.
+
+Environment:
+  DRY_RUN=1       Same as --dry-run.
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--dry-run) DRY_RUN=1 ;;
+    -y|--yes)     ASSUME_YES=1 ;;
+    -h|--help)    usage; exit 0 ;;
+    *)            usage >&2; die "Unknown argument: $1" ;;
+  esac
+  shift
+done
+
+require_not_root
+require_cmd omarchy
+
+if omarchy pkg present "$PACKAGE"; then
+  skip "Raspberry Pi Imager already installed"
+  exit 0
+fi
+
+log "Installing Raspberry Pi Imager from Arch Extra"
+run omarchy pkg add "$PACKAGE"
+
+if [[ "$DRY_RUN" == "1" ]]; then
+  exit 0
+fi
+
+omarchy pkg present "$PACKAGE" \
+  || die "Raspberry Pi Imager was not registered as installed"
+
+ok "Raspberry Pi Imager installed"
