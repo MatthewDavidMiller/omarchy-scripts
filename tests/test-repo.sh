@@ -20,7 +20,7 @@ done
 # --- must NOT be ignored ---------------------------------------------------
 
 for path in \
-  README.md LICENSE .gitignore .shellcheckrc .editorconfig \
+  README.md LICENSE AGENTS.md CLAUDE.md .gitignore .shellcheckrc .editorconfig \
   bin/setup-all bin/setup-ssh-agent bin/setup-no-idle bin/setup-rpi-imager \
   bin/setup-no-localsend \
   bin/lint bin/install-hooks \
@@ -38,5 +38,11 @@ done
 it "no tracked file is covered by .gitignore"
 conflicts="$(git -C "$REPO_ROOT" ls-files | git -C "$REPO_ROOT" check-ignore --stdin 2>/dev/null || true)"
 assert_eq "" "$conflicts" "tracked-but-ignored files"
+
+it "setup scripts do not invoke AUR installers"
+aur_calls="$(grep -REn \
+  '(^|[[:space:]])(yay|paru|omarchy +pkg +aur +add|omarchy-pkg-aur-add)([[:space:]]|$)' \
+  "$REPO_ROOT"/bin/setup-* || true)"
+assert_eq "" "$aur_calls" "AUR installer references"
 
 finish
