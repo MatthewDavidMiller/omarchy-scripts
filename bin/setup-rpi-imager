@@ -16,14 +16,15 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/common.sh
 source "$SCRIPT_DIR/../lib/common.sh"
 
-PACKAGE="rpi-imager"
+PACKAGES=(rpi-imager xorg-xhost)
 
 usage() {
   cat <<'USAGE'
 Usage: setup-rpi-imager [options]
 
-Installs Raspberry Pi Imager from Arch's signed official Extra repository
-through Omarchy's package helper. It does not use AUR or download an AppImage.
+Installs Raspberry Pi Imager and its Xwayland authorization helper from Arch's
+signed official Extra repository through Omarchy's package helper. It does not
+use AUR or download an AppImage.
 
 Options:
   -n, --dry-run   Show what would change without changing anything.
@@ -48,19 +49,28 @@ done
 require_not_root
 require_cmd omarchy
 
-if omarchy pkg present "$PACKAGE"; then
-  skip "Raspberry Pi Imager already installed"
+missing=()
+for package in "${PACKAGES[@]}"; do
+  if ! omarchy pkg present "$package"; then
+    missing+=("$package")
+  fi
+done
+
+if [[ ${#missing[@]} -eq 0 ]]; then
+  skip "Raspberry Pi Imager and Xwayland authorization helper already installed"
   exit 0
 fi
 
-log "Installing Raspberry Pi Imager from Arch Extra"
-run omarchy pkg add "$PACKAGE"
+log "Installing Raspberry Pi Imager with Omarchy-compatible GUI authorization"
+run omarchy pkg add "${missing[@]}"
 
 if [[ "$DRY_RUN" == "1" ]]; then
   exit 0
 fi
 
-omarchy pkg present "$PACKAGE" \
-  || die "Raspberry Pi Imager was not registered as installed"
+for package in "${PACKAGES[@]}"; do
+  omarchy pkg present "$package" \
+    || die "$package was not registered as installed"
+done
 
-ok "Raspberry Pi Imager installed"
+ok "Raspberry Pi Imager installed with Xwayland authorization support"

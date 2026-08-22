@@ -7,12 +7,17 @@ STUBS="$TEST_TMP/stubs"
 
 # shellcheck disable=SC2016
 stub_bin "$STUBS" omarchy '
-state="$HOME/.rpi-imager-installed"
+state_for() { printf '%s/.%s-installed' "$HOME" "$1"; }
 case "$*" in
-  "pkg present rpi-imager") [[ -f "$state" ]] ;;
-  "pkg add rpi-imager")
+  "pkg present rpi-imager"|"pkg present xorg-xhost")
+    [[ -f "$(state_for "$3")" ]]
+    ;;
+  "pkg add rpi-imager xorg-xhost"|"pkg add rpi-imager"|"pkg add xorg-xhost")
     [[ "${OMARCHY_ADD_FAIL:-0}" != 1 ]] || exit 42
-    [[ "${OMARCHY_ADD_NOOP:-0}" == 1 ]] || touch "$state"
+    if [[ "${OMARCHY_ADD_NOOP:-0}" != 1 ]]; then
+      shift 2
+      for package in "$@"; do touch "$(state_for "$package")"; done
+    fi
     ;;
   *) echo "unexpected: $*" >&2; exit 1 ;;
 esac'
@@ -28,9 +33,10 @@ out="$(rpi_setup --dry-run --yes)"
 
 it "--dry-run does not install the package"
 assert_no_file "$FAKE_HOME/.rpi-imager-installed"
+assert_no_file "$FAKE_HOME/.xorg-xhost-installed"
 
 it "--dry-run says which official package it would install"
-assert_contains "$out" "omarchy pkg add rpi-imager"
+assert_contains "$out" "omarchy pkg add rpi-imager xorg-xhost"
 
 it "--dry-run never invokes the package add command"
 assert_eq "0" "$(grep -c '^pkg add rpi-imager$' "$STUBS/omarchy.log" || true)" "add calls"
@@ -40,7 +46,14 @@ assert_eq "0" "$(grep -c '^pkg add rpi-imager$' "$STUBS/omarchy.log" || true)" "
 out="$(rpi_setup --yes)"
 
 it "installs rpi-imager through Omarchy"
-assert_file_contains "$STUBS/omarchy.log" "pkg add rpi-imager"
+assert_file_contains "$STUBS/omarchy.log" "pkg add rpi-imager xorg-xhost"
+
+it "installs the Xwayland authorization helper"
+if [[ -f "$FAKE_HOME/.xorg-xhost-installed" ]]; then
+  pass
+else
+  fail "xorg-xhost was not installed"
+fi
 
 it "verifies and reports a successful install"
 assert_contains "$out" "Raspberry Pi Imager installed"
@@ -54,6 +67,19 @@ assert_contains "$out2" "already installed"
 
 it "a second run does not call the installer"
 assert_eq "$before_adds" "$after_adds" "add calls"
+
+# --- repair an existing installation -------------------------------------
+
+REPAIR_HOME="$(make_fake_home)"
+touch "$REPAIR_HOME/.rpi-imager-installed"
+repair_out="$(env HOME="$REPAIR_HOME" PATH="$STUBS:$PATH" \
+  "$REPO_ROOT/bin/setup-rpi-imager" --yes 2>&1)"
+
+it "adds xorg-xhost to an existing rpi-imager installation"
+assert_file_contains "$STUBS/omarchy.log" "pkg add xorg-xhost"
+
+it "repairs the existing installation successfully"
+assert_contains "$repair_out" "Xwayland authorization support"
 
 # --- failures --------------------------------------------------------------
 
