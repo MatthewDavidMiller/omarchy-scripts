@@ -8,6 +8,7 @@ re-do on every fresh machine, kept in one place so they run the same way twice.
 ```
 bin/          Executable scripts, one per task
 lib/          Shared bash helpers (logging, dry-run, safe file writes, TUI)
+packages/     Vetted local package recipes built from first-party releases
 tests/        Test suite, plain bash, no framework
 docker/       Dockerfile for the containerised lint toolchain
 githooks/     Local git hooks — the entire CI/CD pipeline
@@ -44,6 +45,7 @@ touching the system.
 | `bin/setup-all` | Menu + runner for every script below, in order | [docs/setup-all.md](docs/setup-all.md) |
 | `bin/setup-ssh-agent` | Persistent socket-activated ssh-agent, unlocked once per login | [docs/setup-ssh-agent.md](docs/setup-ssh-agent.md) |
 | `bin/setup-no-idle` | Stop the screensaver and idle auto-lock from firing | [docs/setup-no-idle.md](docs/setup-no-idle.md) |
+| `bin/setup-brave` | Build vetted Brave package and make it the default browser | [docs/setup-brave.md](docs/setup-brave.md) |
 | `bin/setup-rpi-imager` | Install Raspberry Pi Imager from Arch Extra | [docs/setup-rpi-imager.md](docs/setup-rpi-imager.md) |
 | `bin/setup-no-chromium-extensions` | Remove Omarchy's bundled Chromium extensions | [docs/setup-no-chromium-extensions.md](docs/setup-no-chromium-extensions.md) |
 | `bin/setup-no-localsend` | Remove LocalSend and the ufw rules that expose it | [docs/setup-no-localsend.md](docs/setup-no-localsend.md) |
@@ -61,7 +63,7 @@ just by existing.
 ```bash
 ./bin/install-hooks   # once per clone — installs the CI/CD pipeline
 ./bin/lint            # shellcheck, in a container
-./tests/run           # 215 tests, ~5s
+./tests/run           # 261 tests, ~7s
 ```
 
 **CI/CD runs on commit and nowhere else.** `git commit` gates on syntax → lint

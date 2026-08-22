@@ -11,6 +11,8 @@ for path in \
   .env .env.production secrets/token \
   config.bak.20260101120000 notes.bak \
   settings.local local/scratch \
+  packages/brave/src/file packages/brave/pkg/file \
+  packages/brave/brave.rpm packages/brave/brave.pkg.tar.zst \
   .DS_Store editor~ file.swp
 do
   it "ignores $path"
@@ -21,9 +23,11 @@ done
 
 for path in \
   README.md LICENSE AGENTS.md CLAUDE.md .gitignore .shellcheckrc .editorconfig \
-  bin/setup-all bin/setup-ssh-agent bin/setup-no-idle bin/setup-rpi-imager \
+  bin/setup-all bin/setup-ssh-agent bin/setup-no-idle bin/setup-brave bin/setup-rpi-imager \
   bin/setup-no-localsend \
   bin/lint bin/install-hooks \
+  packages/brave/PKGBUILD.template packages/brave/brave-launcher \
+  packages/brave/prepare-latest \
   lib/common.sh lib/tui.sh \
   githooks/pre-commit docker/lint.Dockerfile \
   tests/run tests/helpers.sh tests/test-repo.sh \

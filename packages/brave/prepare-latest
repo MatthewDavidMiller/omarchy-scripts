@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Resolve and authenticate Brave's current public stable RPM, then render the
+# repository-owned PKGBUILD.template into an output directory.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+OUTPUT_DIR="${1:?Usage: prepare-latest OUTPUT_DIR}"
+VERSION_URL="https://versions.brave.com/latest/release-linux-x64.version"
+KEY_URL="https://brave-browser-downloads.s3.brave.com/keys/github-checksums-release.asc"
+KEY_SHA256="5b22f304063ba95e1fd3a7923abd2ac2df9cda7d213e6ff2e42128aa1296aa0e"
+ALLOWED_SIGNERS=(
+  "10A714FCA3C829A605E686A5C479D18E038EAF42"
+  "7FE68A2E3754FA350A45F0AB68E5C22615F0E249"
+  "B840107020F8BED83CF7696DEDC0814C91A8144D"
+)
+
+for command in curl gpg gpgv sha256sum sed; do
+  command -v "$command" >/dev/null 2>&1 \
+    || { printf 'Required command not found: %s\n' "$command" >&2; exit 1; }
+done
+[[ -f "$SCRIPT_DIR/PKGBUILD.template" ]] \
+  || { printf 'Missing PKGBUILD.template\n' >&2; exit 1; }
+
+mkdir -p "$OUTPUT_DIR"
+metadata_dir="$(mktemp -d "${TMPDIR:-/tmp}/brave-metadata.XXXXXX")"
+trap 'rm -rf "$metadata_dir"' EXIT
+
+version="$(curl -fsSL "$VERSION_URL")"
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+  || { printf 'Invalid Brave stable version: %s\n' "$version" >&2; exit 1; }
+
+rpm="brave-browser-${version}-1.x86_64.rpm"
+release_url="https://github.com/brave/brave-browser/releases/download/v${version}"
+checksum_file="$metadata_dir/$rpm.sha256"
+signature_file="$checksum_file.asc"
+key_file="$metadata_dir/github-checksums-release.asc"
+keyring="$metadata_dir/github-checksums-release.gpg"
+gpg_home="$metadata_dir/gpg-home"
+
+curl -fsSL --output "$checksum_file" "$release_url/$rpm.sha256"
+curl -fsSL --output "$signature_file" "$release_url/$rpm.sha256.asc"
+curl -fsSL --output "$key_file" "$KEY_URL"
+
+printf '%s  %s\n' "$KEY_SHA256" "$key_file" | sha256sum --check --status \
+  || { printf 'Brave checksum signing key did not match its pinned digest\n' >&2; exit 1; }
+mkdir -m 0700 "$gpg_home"
+GNUPGHOME="$gpg_home" gpg --batch --yes --no-options --dearmor \
+  --output "$keyring" "$key_file"
+
+signature_status="$(gpgv --status-fd 1 --keyring "$keyring" \
+  "$signature_file" "$checksum_file" 2>/dev/null)" \
+  || { printf 'Brave release checksum signature was invalid\n' >&2; exit 1; }
+signer="$(awk '$2 == "VALIDSIG" { print $3; exit }' <<< "$signature_status")"
+
+signer_allowed=0
+for allowed_signer in "${ALLOWED_SIGNERS[@]}"; do
+  [[ "$signer" == "$allowed_signer" ]] && signer_allowed=1
+done
+[[ "$signer_allowed" == "1" ]] \
+  || { printf 'Brave checksum used an unapproved signer: %s\n' "$signer" >&2; exit 1; }
+
+read -r rpm_sha256 checksum_path < "$checksum_file"
+[[ "$rpm_sha256" =~ ^[0-9a-f]{64}$ && "${checksum_path##*/}" == "$rpm" ]] \
+  || { printf 'Signed checksum did not describe %s\n' "$rpm" >&2; exit 1; }
+
+sed -e "s/@BRAVE_VERSION@/$version/g" \
+    -e "s/@BRAVE_RPM_SHA256@/$rpm_sha256/g" \
+    "$SCRIPT_DIR/PKGBUILD.template" > "$OUTPUT_DIR/PKGBUILD"
+
+printf '%s\n' "$version"

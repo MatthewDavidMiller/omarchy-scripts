@@ -1,0 +1,58 @@
+# Maintained in this repository; deliberately not sourced from the AUR.
+# prepare-latest replaces the two placeholders only after verifying Brave's
+# signed checksum for the current public stable release.
+pkgname=brave-browser-local
+pkgver=@BRAVE_VERSION@
+pkgrel=1
+pkgdesc='Brave browser repackaged from the signed first-party stable RPM'
+arch=('x86_64')
+url='https://brave.com/'
+license=('MPL-2.0')
+depends=(
+  'alsa-lib' 'at-spi2-core' 'cairo' 'dbus' 'desktop-file-utils' 'expat'
+  'fontconfig' 'glib2' 'glibc' 'gtk3' 'hicolor-icon-theme' 'libcups'
+  'libgcc' 'libx11' 'libxcb' 'libxcomposite' 'libxdamage' 'libxext'
+  'libxfixes' 'libxkbcommon' 'libxrandr' 'mesa' 'nspr' 'nss' 'pango'
+  'systemd-libs' 'xdg-utils'
+)
+provides=('brave' 'brave-browser' 'brave-bin')
+conflicts=('brave-bin' 'brave-browser')
+options=('!debug' '!strip')
+
+_rpm="brave-browser-${pkgver}-1.x86_64.rpm"
+source=(
+  "${_rpm}::https://github.com/brave/brave-browser/releases/download/v${pkgver}/${_rpm}"
+  'brave-launcher'
+)
+noextract=("${_rpm}")
+sha256sums=(
+  '@BRAVE_RPM_SHA256@'
+  'ad5e381b871f704c7718dfa10c7f4e5ff7274e10565d92f91c93551d1ef10e27'
+)
+
+package() {
+  bsdtar --no-same-owner -xf "$srcdir/${_rpm}" -C "$pkgdir"
+
+  # The vendor cron job manages an RPM repository. This package is updated by
+  # resolving Brave's signed current-stable metadata on each setup run instead.
+  rm -rf "$pkgdir/etc/cron.daily"
+
+  # Replace the RPM symlink with our reviewed launcher so Omarchy's per-user
+  # brave-flags.conf is honored.
+  rm "$pkgdir/usr/bin/brave-browser-stable"
+  install -Dm755 "$srcdir/brave-launcher" \
+    "$pkgdir/usr/bin/brave-browser-stable"
+  ln -s brave-browser-stable "$pkgdir/usr/bin/brave"
+  ln -s brave-browser-stable "$pkgdir/usr/bin/brave-browser"
+
+  # bsdtar intentionally clears setuid while extracting as the build user.
+  # Chromium's sandbox must be installed with the mode shipped by Brave.
+  chmod 4755 "$pkgdir/opt/brave.com/brave/chrome-sandbox"
+
+  local size
+  for size in 16 24 32 48 64 128 256; do
+    install -Dm644 \
+      "$pkgdir/opt/brave.com/brave/product_logo_${size}.png" \
+      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/brave-browser.png"
+  done
+}

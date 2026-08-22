@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+flags_file="${XDG_CONFIG_HOME:-$HOME/.config}/brave-flags.conf"
+flags=()
+
+if [[ -r "$flags_file" ]]; then
+  while IFS= read -r flag || [[ -n "$flag" ]]; do
+    [[ "$flag" =~ ^[[:space:]]*(#|$) ]] || flags+=("$flag")
+  done < "$flags_file"
+fi
+
+exec /opt/brave.com/brave/brave-browser "${flags[@]}" "$@"

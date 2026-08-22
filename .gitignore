@@ -30,3 +30,9 @@ local/
 .DS_Store
 .idea/
 .vscode/
+
+# Local makepkg output. Package recipes and launchers remain tracked.
+packages/*/src/
+packages/*/pkg/
+packages/*/*.pkg.tar.*
+packages/*/*.rpm

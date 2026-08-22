@@ -100,5 +100,17 @@ Two rules, applied to anything this repo runs in a container:
   startup are a tax on the edit loop. Build once, tag by the Dockerfile's hash,
   prune what it supersedes.
 
+## Package sources
+
+AUR packages and helpers are not allowed. Prefer official Arch or Omarchy
+repository packages installed with `omarchy pkg add`.
+
+When no approved repository package exists, a recipe maintained in this
+repository may repackage a first-party upstream release. The recipe must be
+complete and reviewable here, avoid importing an AUR recipe, and install through
+pacman so every system file remains tracked. Pin the version and checksum, or
+authenticate dynamic release metadata with a pinned upstream signing key and
+verify the resolved artifact checksum.
+
 There is no hosted CI by design — everything runs locally. See
 [lint.md](lint.md) for the images, fallbacks, and how to suppress a finding.
