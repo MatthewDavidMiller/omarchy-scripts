@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+#
+# setup-no-chromium-extensions — stop loading Omarchy's bundled browser extensions.
+#
+# order: 75
+# description: Remove Omarchy's bundled Chromium extensions
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+FLAGS_DIR="${CHROMIUM_FLAGS_DIR:-$HOME/.config}"
+BROWSERS=(
+  chromium chrome google-chrome
+  brave brave-beta brave-nightly brave-origin brave-origin-beta
+  microsoft-edge-stable
+)
+EXTENSIONS=(copy-url yt-dlp whatsapp-slim)
+
+usage() {
+  cat <<'USAGE'
+Usage: setup-no-chromium-extensions [options]
+
+Removes Omarchy's Copy URL, Download Video, and WhatsApp Slim entries from
+Chromium-family --load-extension flags. Other extensions and flags are kept.
+
+Close affected browsers before running so they restart without the extensions.
+
+Options:
+  -n, --dry-run   Show what would change without changing anything.
+  -y, --yes       Do not prompt for confirmation.
+  -h, --help      Show this help.
+
+Environment:
+  DRY_RUN=1                 Same as --dry-run.
+  CHROMIUM_FLAGS_DIR        Flags directory. Default: ~/.config.
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--dry-run) DRY_RUN=1 ;;
+    -y|--yes) ASSUME_YES=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; die "Unknown argument: $1" ;;
+  esac
+  shift
+done
+
+require_not_root
+
+is_omarchy_extension() {
+  local path="$1" extension
+  for extension in "${EXTENSIONS[@]}"; do
+    [[ "$path" == */omarchy/default/chromium/extensions/"$extension" ]] && return 0
+  done
+  return 1
+}
+
+clean_flags() {
+  local file="$1" line value item joined output="" changed=0
+  local -a items kept
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" == --load-extension=* ]]; then
+      value="${line#--load-extension=}"
+      IFS=',' read -r -a items <<< "$value"
+      kept=()
+      for item in "${items[@]}"; do
+        if is_omarchy_extension "$item"; then
+          changed=1
+        else
+          kept+=("$item")
+        fi
+      done
+      if [[ ${#kept[@]} -gt 0 ]]; then
+        joined="$(IFS=,; printf '%s' "${kept[*]}")"
+        output+="--load-extension=$joined"$'\n'
+      fi
+    else
+      output+="$line"$'\n'
+    fi
+  done < "$file"
+
+  [[ "$changed" == "1" ]] || return 1
+  write_file "$file" <<< "${output%$'\n'}"
+}
+
+files=()
+for browser in "${BROWSERS[@]}"; do
+  file="$FLAGS_DIR/$browser-flags.conf"
+  [[ -f "$file" ]] || continue
+  if grep -Eq '/omarchy/default/chromium/extensions/(copy-url|yt-dlp|whatsapp-slim)(,|$)' "$file"; then
+    files+=("$file")
+  fi
+done
+
+if [[ ${#files[@]} -eq 0 ]]; then
+  skip "Omarchy's bundled Chromium extensions are already disabled"
+  exit 0
+fi
+
+log "Removing Copy URL, Download Video, and WhatsApp Slim"
+printf '  %s\n' "${files[@]}"
+if ! confirm "Update ${#files[@]} browser flags file(s)?"; then
+  skip "left browser flags unchanged"
+  exit 0
+fi
+
+for file in "${files[@]}"; do
+  clean_flags "$file" || skip "$file already clean"
+done
+
+ok "bundled extensions disabled; restart affected browsers to apply"
