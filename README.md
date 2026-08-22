@@ -63,7 +63,7 @@ just by existing.
 ```bash
 ./bin/install-hooks   # once per clone — installs the CI/CD pipeline
 ./bin/lint            # shellcheck, in a container
-./tests/run           # 261 tests, ~7s
+./tests/run           # 264 tests, ~7s
 ```
 
 **CI/CD runs on commit and nowhere else.** `git commit` gates on syntax → lint

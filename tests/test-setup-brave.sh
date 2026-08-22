@@ -7,6 +7,9 @@ OMARCHY_FIXTURE="$TEST_TMP/omarchy"
 mkdir -p "$OMARCHY_FIXTURE/config"
 printf '%s\n' '--ozone-platform=wayland' '--password-store=gnome-libsecret' \
   > "$OMARCHY_FIXTURE/config/chromium-flags.conf"
+printf '%s\n' \
+  '--load-extension=/usr/share/omarchy/default/chromium/extensions/copy-url,/opt/kept,/usr/share/omarchy/default/chromium/extensions/yt-dlp,/usr/share/omarchy/default/chromium/extensions/whatsapp-slim' \
+  >> "$OMARCHY_FIXTURE/config/chromium-flags.conf"
 
 # shellcheck disable=SC2016
 stub_bin "$STUBS" pacman '
@@ -39,21 +42,12 @@ printf "1.93.138\n"'
 # shellcheck disable=SC2016
 stub_bin "$STUBS" omarchy '
 browser_state="$HOME/.default-browser"
-manifest_dir="$HOME/.config/BraveSoftware/Brave-Browser/NativeMessagingHosts"
 case "$*" in
   "default browser")
     if [[ -f "$browser_state" ]]; then cat "$browser_state"; else printf "chromium\n"; fi
     ;;
   "default browser brave")
     [[ "${OMARCHY_DEFAULT_NOOP:-0}" == 1 ]] || printf "brave\n" > "$browser_state"
-    ;;
-  "install chromium copy url")
-    mkdir -p "$manifest_dir"
-    touch "$manifest_dir/com.omarchy.copy_url.json"
-    ;;
-  "install chromium ytdlp")
-    mkdir -p "$manifest_dir"
-    touch "$manifest_dir/com.omarchy.ytdlp.json"
     ;;
   "theme set browser")
     touch "${BRAVE_POLICY_DIR:?}/color.json"
@@ -108,10 +102,21 @@ assert_eq "1.93.138-1" "$(cat "$DB_ONE")" "package version"
 it "writes Omarchy's Brave flags"
 assert_file_contains "$HOME_ONE/.config/brave-flags.conf" "--ozone-platform=wayland"
 
-it "installs both Omarchy native messaging integrations"
-assert_file_contains "$STUBS/omarchy.log" "install chromium copy url"
-it "installs Omarchy's video-download integration"
-assert_file_contains "$STUBS/omarchy.log" "install chromium ytdlp"
+it "keeps user-provided Chromium extensions"
+assert_file_contains "$HOME_ONE/.config/brave-flags.conf" "--load-extension=/opt/kept"
+
+flags="$(cat "$HOME_ONE/.config/brave-flags.conf")"
+it "does not enable Omarchy's Copy URL extension"
+assert_not_contains "$flags" "/extensions/copy-url"
+
+it "does not enable Omarchy's Download Video extension"
+assert_not_contains "$flags" "/extensions/yt-dlp"
+
+it "does not enable Omarchy's WhatsApp Slim extension"
+assert_not_contains "$flags" "/extensions/whatsapp-slim"
+
+it "does not install unwanted native messaging integrations"
+assert_not_contains "$(cat "$STUBS/omarchy.log")" "install chromium"
 
 it "creates and applies the Brave theme policy"
 if [[ -f "$POLICY_ONE/color.json" ]]; then pass; else fail "theme policy missing"; fi

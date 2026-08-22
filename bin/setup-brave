@@ -19,13 +19,12 @@ source "$REPO_ROOT/lib/common.sh"
 PACKAGE_DIR="$REPO_ROOT/packages/brave"
 PACKAGE_NAME="brave-browser-local"
 PREPARE_LATEST="${BRAVE_PREPARE_LATEST:-$PACKAGE_DIR/prepare-latest}"
+EXTENSION_FILTER="${BRAVE_EXTENSION_FILTER:-$REPO_ROOT/bin/setup-no-chromium-extensions}"
 OMARCHY_ROOT="${OMARCHY_ROOT:-/usr/share/omarchy}"
 POLICY_DIR="${BRAVE_POLICY_DIR:-/etc/brave/policies/managed}"
 CURRENT_USER="$(id -un)"
 CURRENT_GROUP="$(id -gn)"
 FLAGS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/brave-flags.conf"
-COPY_URL_MANIFEST="$HOME/.config/BraveSoftware/Brave-Browser/NativeMessagingHosts/com.omarchy.copy_url.json"
-YTDLP_MANIFEST="$HOME/.config/BraveSoftware/Brave-Browser/NativeMessagingHosts/com.omarchy.ytdlp.json"
 
 usage() {
   cat <<'USAGE'
@@ -63,6 +62,8 @@ require_cmd omarchy pacman makepkg sudo
 [[ -f "$PACKAGE_DIR/PKGBUILD.template" && -f "$PACKAGE_DIR/brave-launcher" \
    && -x "$PREPARE_LATEST" ]] \
   || die "Brave package recipe is incomplete: $PACKAGE_DIR"
+[[ -x "$EXTENSION_FILTER" ]] \
+  || die "Chromium extension filter is missing: $EXTENSION_FILTER"
 [[ -f "$OMARCHY_ROOT/config/chromium-flags.conf" ]] \
   || die "Omarchy Chromium flags were not found"
 
@@ -95,27 +96,17 @@ else
   skip "Latest stable Brave $package_version is already installed"
 fi
 
-write_file "$FLAGS_FILE" < "$OMARCHY_ROOT/config/chromium-flags.conf"
+# Reuse the repository's Chromium-extension policy so running this script by
+# itself cannot restore integrations setup-no-chromium-extensions removes.
+cp "$OMARCHY_ROOT/config/chromium-flags.conf" "$build_dir/brave-flags.conf"
+CHROMIUM_FLAGS_DIR="$build_dir" "$EXTENSION_FILTER" --yes >/dev/null
+write_file "$FLAGS_FILE" < "$build_dir/brave-flags.conf"
 
 if [[ ! -d "$POLICY_DIR" || ! -w "$POLICY_DIR" ]]; then
   log "Creating Brave's managed-policy directory"
   run sudo install -d -m 0755 -o "$CURRENT_USER" -g "$CURRENT_GROUP" "$POLICY_DIR"
 else
   skip "Brave policy directory is ready"
-fi
-
-if [[ ! -f "$COPY_URL_MANIFEST" ]]; then
-  log "Installing Omarchy's Copy URL integration for Brave"
-  run omarchy install chromium copy url
-else
-  skip "Brave Copy URL integration is already installed"
-fi
-
-if [[ ! -f "$YTDLP_MANIFEST" ]]; then
-  log "Installing Omarchy's video-download integration for Brave"
-  run omarchy install chromium ytdlp
-else
-  skip "Brave video-download integration is already installed"
 fi
 
 if [[ ! -f "$POLICY_DIR/color.json" ]]; then
@@ -140,8 +131,7 @@ fi
   || die "$PACKAGE_NAME $package_version was not registered as installed"
 [[ "$(omarchy default browser)" == "brave" ]] \
   || die "Brave was not registered as the default browser"
-[[ -f "$FLAGS_FILE" && -f "$COPY_URL_MANIFEST" && -f "$YTDLP_MANIFEST" ]] \
-  || die "Brave's Omarchy integration is incomplete"
+[[ -f "$FLAGS_FILE" ]] || die "Brave's Omarchy flags are missing"
 [[ -f "$POLICY_DIR/color.json" ]] \
   || die "Brave's Omarchy theme policy is missing"
 

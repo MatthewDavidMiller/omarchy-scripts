@@ -30,11 +30,16 @@ updates are discovered and authenticated on each setup run instead.
 
 After package installation, the script:
 
-1. Installs Omarchy's Chromium flags for native Wayland and bundled extensions.
-2. Installs the Copy URL and video-download native messaging manifests.
-3. Creates Brave's managed-policy directory and applies the current theme.
-4. Selects Brave through `omarchy default browser brave`, which updates XDG URL
+1. Installs Omarchy's Chromium flags for native Wayland, filtered through
+   `setup-no-chromium-extensions` so Copy URL, Download Video, and WhatsApp Slim
+   remain disabled.
+2. Creates Brave's managed-policy directory and applies the current theme.
+3. Selects Brave through `omarchy default browser brave`, which updates XDG URL
    handlers.
+
+It deliberately does not install the Copy URL or video-download native
+messaging integrations. This keeps standalone Brave setup consistent with the
+repository's Chromium-extension removal script.
 
 Each state is checked independently, making the script safe to rerun or use to
 repair a partial setup.
