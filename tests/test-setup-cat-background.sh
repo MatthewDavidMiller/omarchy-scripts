@@ -13,7 +13,7 @@ it "the approved generated wallpaper source is present"
 if [[ -s "$SOURCE_IMAGE" ]]; then pass; else fail "expected $SOURCE_IMAGE"; fi
 
 it "the approved generated wallpaper source has not changed"
-assert_eq "fa1f6d43d81ea3c7a1e0f3426ce1d3b8d2795fe6d2342a6b8eb0010cc0dd0ce6" \
+assert_eq "ddbde9c08aef37a7b4191e5e6ea6075c8be99f77b8be59f4d4faca9a309e5e4f" \
   "$(sha256sum "$SOURCE_IMAGE" | awk '{print $1}')" "source image checksum"
 
 it "the renderer uses the approved generated wallpaper source"
@@ -25,6 +25,7 @@ FAKE_HOME="$(make_fake_home)"
 STUBS="$TEST_TMP/stubs"
 mkdir -p "$FAKE_HOME/.local/state/omarchy/current"
 printf 'tokyo-night' > "$FAKE_HOME/.local/state/omarchy/current/theme.name"
+export PLYMOUTH_INSTALLED_LOGO="$FAKE_HOME/installed-plymouth-logo.png"
 
 # shellcheck disable=SC2016
 stub_bin "$STUBS" omarchy '
@@ -35,6 +36,7 @@ case "$*" in
   "theme bg cache")          ;;
   "shell background setInstant "*) [[ "${SHELL_FAIL:-0}" != 1 ]] ;;
   "shell background set "*)        ;;
+  "plymouth set "*)                cp "$5" "$PLYMOUTH_INSTALLED_LOGO" ;;
   *) echo "unexpected: $*" >&2; exit 1 ;;
 esac'
 
@@ -52,6 +54,7 @@ cat_bg() {
 
 TARGET="$FAKE_HOME/.config/omarchy/backgrounds/tokyo-night/pixel-cat.png"
 RELOAD_TARGET="$FAKE_HOME/.cache/omarchy/pixel-cat-reload.png"
+UNLOCK_TARGET="$FAKE_HOME/.config/omarchy/plymouth/tokyo-night/pixel-cat-unlock.png"
 
 # --- dry run ---------------------------------------------------------------
 
@@ -60,11 +63,17 @@ out="$(cat_bg --dry-run --yes)"
 it "--dry-run writes no wallpaper"
 assert_no_file "$TARGET"
 
+it "--dry-run writes no unlock image"
+assert_no_file "$UNLOCK_TARGET"
+
 it "--dry-run names the file it would render"
 assert_contains "$out" "pixel-cat.png"
 
 it "--dry-run does not set the background"
 assert_eq "0" "$(grep -c '^theme bg set' "$STUBS/omarchy.log" || true)" "bg set calls"
+
+it "--dry-run does not set Plymouth"
+assert_eq "0" "$(grep -c '^plymouth set' "$STUBS/omarchy.log" || true)" "Plymouth set calls"
 
 # --- first real run --------------------------------------------------------
 
@@ -72,6 +81,9 @@ out="$(cat_bg --yes)"
 
 it "renders the wallpaper into the theme's user background directory"
 if [[ -f "$TARGET" ]]; then pass; else fail "expected $TARGET"; fi
+
+it "renders a smaller image for the disk-encryption screen"
+if [[ -f "$UNLOCK_TARGET" ]]; then pass; else fail "expected $UNLOCK_TARGET"; fi
 
 it "does not query theme colours"
 assert_eq "0" "$(grep -c '^theme color ' "$STUBS/omarchy.log" || true)" "theme color calls"
@@ -88,9 +100,13 @@ assert_file_contains "$STUBS/omarchy.log" "shell background set $TARGET"
 it "caches the switcher thumbnail"
 assert_file_contains "$STUBS/omarchy.log" "theme bg cache"
 
+it "sets the corrected cat as the Plymouth disk-encryption image"
+assert_file_contains "$STUBS/omarchy.log" "plymouth set #77797c #ffffff $UNLOCK_TARGET"
+
 # --- idempotence -----------------------------------------------------------
 
 before="$(grep -c '^theme bg set' "$STUBS/omarchy.log")"
+plymouth_before="$(grep -c '^plymouth set' "$STUBS/omarchy.log")"
 out2="$(cat_bg --yes)"
 after="$(grep -c '^theme bg set' "$STUBS/omarchy.log")"
 
@@ -102,6 +118,9 @@ assert_eq "0" "$(find "$(dirname "$TARGET")" -name '*.bak.*' | wc -l)" "backups"
 
 it "a second run refreshes the live background without rewriting it"
 assert_eq "$((before + 1))" "$after" "bg set calls"
+
+it "a second run does not rebuild Plymouth when its image is current"
+assert_eq "$plymouth_before" "$(grep -c '^plymouth set' "$STUBS/omarchy.log")" "Plymouth set calls"
 
 # --- re-render on theme change --------------------------------------------
 
@@ -129,8 +148,14 @@ env HOME="$NOACT_HOME" PATH="$STUBS:$PATH" \
 it "--no-activate still renders the wallpaper"
 if [[ -f "$NOACT_HOME/.config/omarchy/backgrounds/gruvbox/pixel-cat.png" ]]; then pass; else fail "no wallpaper"; fi
 
+it "--no-activate still renders the unlock image"
+if [[ -f "$NOACT_HOME/.config/omarchy/plymouth/gruvbox/pixel-cat-unlock.png" ]]; then pass; else fail "no unlock image"; fi
+
 it "--no-activate leaves the current background alone"
 assert_eq "0" "$(grep -c '^theme bg set' "$STUBS/omarchy.log" || true)" "bg set calls"
+
+it "--no-activate leaves Plymouth alone"
+assert_eq "0" "$(grep -c '^plymouth set' "$STUBS/omarchy.log" || true)" "Plymouth set calls"
 
 it "--force re-renders identical bytes"
 assert_contains "$(env HOME="$NOACT_HOME" PATH="$STUBS:$PATH" \
