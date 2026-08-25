@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+#
+# setup-cat-background — generate a pixel-art cat wallpaper for the current theme.
+#
+# order: 65
+# description: Generate a pixel-art cat wallpaper for the current theme
+#
+# Scales the approved generated pixel-art asset into a wallpaper. The result
+# lives in the active theme's user background directory so stock wallpapers
+# remain untouched.
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+SOURCE_IMAGE="$SCRIPT_DIR/../assets/cat-wallpaper.png"
+STATE="$HOME/.local/state/omarchy/current"
+BACKGROUND_NAME="pixel-cat.png"
+SIZE="3840x2160"
+BACKGROUND="#77797c"
+ACTIVATE=1
+FORCE=0
+
+usage() {
+  cat <<'USAGE'
+Usage: setup-cat-background [options]
+
+Scales assets/cat-wallpaper.png to a wallpaper, writes it to the active theme's
+user background directory, and makes it current.
+
+Options:
+  --size WxH      Canvas size (default 3840x2160).
+  --no-activate   Generate the wallpaper without changing the current one.
+  --force         Re-render even if the existing wallpaper already matches.
+  -n, --dry-run   Show what would change without changing anything.
+  -y, --yes       Accepted for setup-all compatibility.
+  -h, --help      Show this help.
+
+Environment:
+  DRY_RUN=1       Same as --dry-run.
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --size)        SIZE="${2:-}"; shift ;;
+    --no-activate) ACTIVATE=0 ;;
+    --force)       FORCE=1 ;;
+    -n|--dry-run)  DRY_RUN=1 ;;
+    -y|--yes)      ASSUME_YES=1 ;;
+    -h|--help)     usage; exit 0 ;;
+    *)             usage >&2; die "Unknown argument: $1" ;;
+  esac
+  shift
+done
+
+[[ "$SIZE" =~ ^[0-9]+x[0-9]+$ ]] || die "Invalid --size: $SIZE (expected WxH)"
+
+require_not_root
+require_cmd omarchy
+
+[[ -f "$SOURCE_IMAGE" ]] || die "Missing pixel art: $SOURCE_IMAGE"
+
+# ImageMagick comes from Arch's official repositories, never AUR.
+if ! omarchy pkg present imagemagick; then
+  log "Installing ImageMagick to render the wallpaper"
+  run omarchy pkg add imagemagick
+fi
+[[ "$DRY_RUN" == "1" ]] || require_cmd magick
+
+theme_name="$(cat "$STATE/theme.name" 2>/dev/null || true)"
+[[ -n "$theme_name" ]] || die "No active Omarchy theme found at $STATE/theme.name"
+
+target_dir="$HOME/.config/omarchy/backgrounds/$theme_name"
+target="$target_dir/$BACKGROUND_NAME"
+
+render() {
+  # Preserve the generated pixel edges and full RGB palette. The source is
+  # already 16:9; extent only supplies a neutral edge for other requested sizes.
+  # Excluding metadata timestamps keeps byte comparisons deterministic.
+  magick "$SOURCE_IMAGE" \
+    -filter point -resize "$SIZE" \
+    -background "$BACKGROUND" -gravity center -extent "$SIZE" \
+    -strip -define png:exclude-chunk=date,time \
+    "PNG24:$1"
+}
+
+if [[ "$DRY_RUN" == "1" ]]; then
+  printf '%s  dry%s would render %s at %s from %s\n' \
+    "$C_DIM" "$C_RESET" "$target" "$SIZE" "$(basename "$SOURCE_IMAGE")"
+  [[ "$ACTIVATE" == "1" ]] && printf '%s  dry%s omarchy theme bg set %s\n' "$C_DIM" "$C_RESET" "$target"
+  exit 0
+fi
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+log "Rendering $theme_name cat wallpaper at $SIZE"
+render "$tmp/$BACKGROUND_NAME"
+
+if [[ "$FORCE" != "1" ]] && [[ -f "$target" ]] && cmp -s "$tmp/$BACKGROUND_NAME" "$target"; then
+  skip "$target already up to date"
+else
+  mkdir -p "$target_dir"
+  [[ -f "$target" ]] && cp -a "$target" "$target.bak.$(date +%Y%m%d%H%M%S)"
+  mv "$tmp/$BACKGROUND_NAME" "$target"
+  ok "wrote $target"
+fi
+
+if [[ "$ACTIVATE" == "1" ]]; then
+  # Omarchy Shell deliberately ignores a background-set IPC call when the path
+  # string has not changed, and its base Image caches that path. Bounce through
+  # a private cache alias before returning to the stable target so the final
+  # cache-disabled transition decodes the current bytes. Keep the persisted
+  # current-background symlink pointed at the stable user-background path.
+  reload_dir="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy"
+  reload_target="$reload_dir/pixel-cat-reload.png"
+  mkdir -p "$reload_dir"
+  cp -f "$target" "$reload_target"
+  run omarchy theme bg set "$target"
+  run omarchy shell background setInstant "$reload_target"
+  run omarchy shell background set "$target"
+  ok "refreshed live background"
+fi
+
+run omarchy theme bg cache || true

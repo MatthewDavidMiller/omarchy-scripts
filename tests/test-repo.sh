@@ -10,6 +10,7 @@ for path in \
   id_ed25519 id_rsa secret.pem private.key store.p12 deploy_key \
   .env .env.production secrets/token \
   config.bak.20260101120000 notes.bak \
+  'cat-photo.jpg' 'scan.jpeg' \
   settings.local local/scratch \
   packages/brave/src/file packages/brave/pkg/file \
   packages/brave/brave.rpm packages/brave/brave.pkg.tar.zst \
@@ -24,14 +25,15 @@ done
 for path in \
   README.md LICENSE AGENTS.md CLAUDE.md .gitignore .shellcheckrc .editorconfig \
   bin/setup-all bin/setup-ssh-agent bin/setup-no-idle bin/setup-brave bin/setup-rpi-imager \
-  bin/setup-no-localsend \
+  bin/setup-no-localsend bin/setup-cat-background \
+  assets/cat-wallpaper.png \
   bin/lint bin/install-hooks \
   packages/brave/PKGBUILD.template packages/brave/brave-launcher \
   packages/brave/prepare-latest \
   lib/common.sh lib/tui.sh \
   githooks/pre-commit docker/lint.Dockerfile \
   tests/run tests/helpers.sh tests/test-repo.sh \
-  docs/ci.md docs/testing.md
+  docs/ci.md docs/testing.md docs/setup-cat-background.md
 do
   it "keeps $path tracked"
   if ignored "$path"; then fail "$path must not be ignored"; else pass; fi

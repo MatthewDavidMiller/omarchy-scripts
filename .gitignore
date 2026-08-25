@@ -36,3 +36,8 @@ packages/*/src/
 packages/*/pkg/
 packages/*/*.pkg.tar.*
 packages/*/*.rpm
+
+# Source photographs for generated art. The approved PNG under assets/ is
+# tracked; the personal reference photos stay out of the repository.
+*.jpg
+*.jpeg

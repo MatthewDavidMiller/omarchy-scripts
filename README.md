@@ -9,6 +9,7 @@ re-do on every fresh machine, kept in one place so they run the same way twice.
 bin/          Executable scripts, one per task
 lib/          Shared bash helpers (logging, dry-run, safe file writes, TUI)
 packages/     Vetted local package recipes built from first-party releases
+assets/       Committed artwork used by scripts
 tests/        Test suite, plain bash, no framework
 docker/       Dockerfile for the containerised lint toolchain
 githooks/     Local git hooks — the entire CI/CD pipeline
@@ -47,6 +48,7 @@ touching the system.
 | `bin/setup-no-idle` | Stop the screensaver and idle auto-lock from firing | [docs/setup-no-idle.md](docs/setup-no-idle.md) |
 | `bin/setup-brave` | Build vetted Brave package and make it the default browser | [docs/setup-brave.md](docs/setup-brave.md) |
 | `bin/setup-rpi-imager` | Install Raspberry Pi Imager from Arch Extra | [docs/setup-rpi-imager.md](docs/setup-rpi-imager.md) |
+| `bin/setup-cat-background` | Render a full-color pixel-art cat wallpaper on neutral gray | [docs/setup-cat-background.md](docs/setup-cat-background.md) |
 | `bin/setup-no-chromium-extensions` | Remove Omarchy's bundled Chromium extensions | [docs/setup-no-chromium-extensions.md](docs/setup-no-chromium-extensions.md) |
 | `bin/setup-no-localsend` | Remove LocalSend and the ufw rules that expose it | [docs/setup-no-localsend.md](docs/setup-no-localsend.md) |
 | `bin/lint` | shellcheck in a container — no host tooling to install | [docs/lint.md](docs/lint.md) |
@@ -63,7 +65,7 @@ just by existing.
 ```bash
 ./bin/install-hooks   # once per clone — installs the CI/CD pipeline
 ./bin/lint            # shellcheck, in a container
-./tests/run           # 264 tests, ~7s
+./tests/run           # run the complete test suite
 ```
 
 **CI/CD runs on commit and nowhere else.** `git commit` gates on syntax → lint

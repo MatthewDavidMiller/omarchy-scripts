@@ -5,7 +5,7 @@
 ./tests/run --filter ssh-agent # one file
 ```
 
-215 tests, ~5 seconds. They run automatically on every commit.
+The suite runs automatically on every commit.
 
 ## Why plain bash
 
@@ -42,6 +42,7 @@ would test the mock.
 | `tests/test-setup-ssh-agent.sh` | Full run against a fake HOME, and idempotence |
 | `tests/test-setup-no-idle.sh` | Idle and screensaver toggles against a stubbed `omarchy` |
 | `tests/test-setup-no-localsend.sh` | ufw rule deletion against fixture rules files, and package removal |
+| `tests/test-setup-cat-background.sh` | The approved generated cat asset, deterministic rendering, live refresh, and idempotence |
 | `tests/test-tui.sh` | `lib/tui.sh` fallback menu parsing |
 | `tests/test-lint.sh` | `bin/lint` CLI, exit codes, image policy |
 | `tests/test-repo.sh` | `.gitignore` — secrets excluded, sources not |
