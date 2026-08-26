@@ -1,0 +1,510 @@
+#!/usr/bin/env bash
+#
+# setup-rootless-podman — make rootless Podman the container engine, and
+# uninstall Docker.
+#
+# order: 40
+# description: Swap Docker for rootless Podman
+#
+# Omarchy ships Docker and enables docker.socket (install/config/all.sh and
+# install/config/enable-services.sh). The daemon runs as root, so reaching it
+# means either sudo/polkit on every call or joining the docker group — which
+# omarchy's own install notes describe as "equivalent to passwordless root",
+# and therefore declines to do:
+#
+#   # the docker group is equivalent to passwordless root: any process in it
+#   # can `docker run -v /:/host` and rewrite the host as root.
+#
+# Rootless Podman has no daemon and no root-owned socket. Containers run as
+# the invoking user, mapped into their own subuid range, so a container escape
+# lands on an unprivileged uid rather than on root. That removes the trade-off
+# instead of choosing a side of it.
+#
+# Docker-shaped tooling keeps working: podman-docker provides /usr/bin/docker,
+# and DOCKER_HOST points at the user's podman socket, so omarchy's `d` alias
+# and its Docker TUI (Super + Shift + D) drive Podman without knowing.
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+# Installed always. crun is podman's preferred runtime (containers.conf ships
+# `runtime = "crun"` as its documented default), and it is also what keeps an
+# oci-runtime provider on the system once docker's runc is no longer being held
+# in place by containerd.
+PODMAN_PACKAGES=(podman crun)
+
+# Installed only once docker is gone: podman-docker Conflicts With docker, so
+# pacman refuses to have both.
+DOCKER_CLI_PACKAGE=podman-docker
+
+# Removed together. ufw-docker depends on docker, so it has to go in the same
+# transaction rather than being left behind as a broken dependency. buildx goes
+# because it drives BuildKit inside the daemon, which podman does not provide —
+# `podman build` (buildah) is the replacement.
+DOCKER_PACKAGES=(docker docker-buildx ufw-docker)
+DOCKER_UNITS=(docker.socket docker.service containerd.service)
+# Created by the daemon at runtime, not by the package, so it outlives pacman.
+DOCKER_DATA_DIR="${DOCKER_DATA_DIR:-/var/lib/docker}"
+
+# Two packages deliberately stay:
+#
+#   docker-compose  A standalone Go binary with no dependency on the daemon. It
+#                   drives the Docker API over DOCKER_HOST, so it works against
+#                   podman unchanged, and podman's own `compose` command looks
+#                   for exactly this binary first. Swapping it for the Python
+#                   podman-compose would be a downgrade, not a migration.
+#   lazydocker      Also just a Docker API client, so Super + Shift + D keeps
+#                   working once DOCKER_HOST points at podman.
+
+ENV_D_FILE="$HOME/.config/environment.d/20-podman.conf"
+# Written verbatim into environment.d; systemd expands it, not us.
+# shellcheck disable=SC2016
+PODMAN_SOCK='${XDG_RUNTIME_DIR}/podman/podman.sock'
+
+# How many uids each rootless user gets. 65536 is the conventional size and
+# what `usermod --add-subuids` guides assume; it covers every uid a container
+# image is likely to reference.
+SUBID_COUNT=65536
+SUBID_FLOOR=100000
+
+# The account the subuid range is granted to. USER can be stale or missing when
+# a script is reached through `sudo -u` or a unit file, and granting a range to
+# the wrong name is silent — id(1) is the one that cannot be wrong.
+TARGET_USER="${USER:-$(id -un)}"
+
+# Overridable so the tests can point at fixtures instead of the real /etc.
+SUBUID_FILE="${SUBUID_FILE:-/etc/subuid}"
+SUBGID_FILE="${SUBGID_FILE:-/etc/subgid}"
+UFW_RULES_DIR="${UFW_RULES_DIR:-/etc/ufw}"
+
+# --keep-docker installs and configures podman but leaves docker alone.
+REMOVE_DOCKER=1
+# --keep-firewall-rules leaves omarchy's docker DNS holes in ufw.
+REMOVE_FIREWALL_RULES=1
+
+usage() {
+  cat <<'USAGE'
+Usage: setup-rootless-podman [options]
+
+Installs rootless Podman, points Docker-compatible tooling at it, and removes
+Docker along with the ufw rules omarchy opened for it.
+
+Options:
+  -n, --dry-run              Show what would change without changing anything.
+  -y, --yes                  Do not prompt for confirmation.
+      --keep-docker          Set up Podman only; leave Docker installed.
+      --keep-firewall-rules  Leave omarchy's allow-docker-dns ufw rules alone.
+  -h, --help                 Show this help.
+
+Environment:
+  DRY_RUN=1                  Same as --dry-run.
+  SUBUID_FILE, SUBGID_FILE   Where the subordinate id ranges live.
+  UFW_RULES_DIR              Where ufw keeps user.rules. Default: /etc/ufw.
+  DOCKER_DATA_DIR            The daemon's data directory to report on removal.
+                             Default: /var/lib/docker.
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--dry-run)            DRY_RUN=1 ;;
+    -y|--yes)                ASSUME_YES=1 ;;
+    --keep-docker)           REMOVE_DOCKER=0 ;;
+    --keep-firewall-rules)   REMOVE_FIREWALL_RULES=0 ;;
+    -h|--help)               usage; exit 0 ;;
+    *)                       usage >&2; die "Unknown argument: $1" ;;
+  esac
+  shift
+done
+
+require_not_root
+require_cmd omarchy pacman sudo systemctl
+
+# newuidmap/newgidmap are what let an unprivileged user claim its subuid range.
+# They come from `shadow`, which is not optional on Arch, but rootless podman
+# is silently broken without them, so say so here rather than at first run.
+require_cmd newuidmap newgidmap
+
+# run_quiet — like run, but swallows the command's own output. ufw echoes a
+# line per rule it touches, which just repeats what we are about to log. The
+# dry-run line still goes to stdout, so --dry-run never looks like it acted.
+run_quiet() {
+  if [[ "$DRY_RUN" == "1" ]]; then
+    run "$@"
+  else
+    "$@" >/dev/null
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 1. Packages
+# ---------------------------------------------------------------------------
+# install_packages <pkg...> — add only the ones actually missing, so a repeat
+# run is a visible no-op instead of asking pacman to reconsider.
+install_packages() {
+  local pkg missing=()
+  for pkg in "$@"; do
+    omarchy pkg present "$pkg" || missing+=("$pkg")
+  done
+
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    skip "$* already installed"
+    return 0
+  fi
+
+  run omarchy pkg add "${missing[@]}"
+
+  [[ "$DRY_RUN" == "1" ]] && return 0
+  for pkg in "${missing[@]}"; do
+    omarchy pkg present "$pkg" || die "$pkg was not registered as installed"
+  done
+  ok "installed ${missing[*]}"
+}
+
+install_podman() {
+  log "Installing Podman"
+  install_packages "${PODMAN_PACKAGES[@]}"
+}
+
+# ---------------------------------------------------------------------------
+# 2. Subordinate id ranges
+# ---------------------------------------------------------------------------
+# Rootless podman maps container uids onto a block of host uids the user owns.
+# No block, no rootless containers — this is the one piece that needs root.
+has_subids() {
+  local file="$1"
+  [[ -r "$file" ]] || return 1
+  grep -q "^$TARGET_USER:" "$file"
+}
+
+# next_free_subid <file> — the first id above every range already handed out,
+# so a second account never overlaps the first. usermod has no "pick one for
+# me", and an overlapping range is a cross-user uid collision, not an error.
+next_free_subid() {
+  local file="$1" start count end max="$SUBID_FLOOR"
+  [[ -r "$file" ]] || { printf '%s' "$max"; return 0; }
+  while IFS=: read -r _ start count; do
+    [[ "$start" =~ ^[0-9]+$ && "$count" =~ ^[0-9]+$ ]] || continue
+    end=$((start + count))
+    (( end > max )) && max=$end
+  done < "$file"
+  printf '%s' "$max"
+}
+
+configure_subids() {
+  log "Checking subordinate id ranges"
+
+  if has_subids "$SUBUID_FILE" && has_subids "$SUBGID_FILE"; then
+    skip "$TARGET_USER already has subuid and subgid ranges"
+    return 0
+  fi
+
+  local uid_start gid_start
+  uid_start="$(next_free_subid "$SUBUID_FILE")"
+  gid_start="$(next_free_subid "$SUBGID_FILE")"
+
+  run sudo usermod \
+    --add-subuids "$uid_start-$((uid_start + SUBID_COUNT - 1))" \
+    --add-subgids "$gid_start-$((gid_start + SUBID_COUNT - 1))" \
+    "$TARGET_USER"
+  ok "granted $TARGET_USER $SUBID_COUNT subuids from $uid_start and subgids from $gid_start"
+
+  # An existing rootless store was built against the old (absent) mapping and
+  # will refuse to start containers until it is migrated to the new one.
+  if have podman && [[ -d "${XDG_DATA_HOME:-$HOME/.local/share}/containers/storage" ]]; then
+    run podman system migrate
+    ok "migrated the existing rootless storage to the new id mapping"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 3. The user socket
+# ---------------------------------------------------------------------------
+# Podman needs no daemon, but anything speaking the Docker API over a socket
+# does. podman.socket is socket-activated: nothing runs until something
+# connects, so this costs nothing when idle.
+enable_socket() {
+  log "Enabling podman.socket for $TARGET_USER"
+
+  if systemctl --user is-enabled --quiet podman.socket 2>/dev/null \
+    && systemctl --user is-active --quiet podman.socket 2>/dev/null; then
+    skip "podman.socket already enabled and running"
+    return 0
+  fi
+
+  run systemctl --user enable --now podman.socket
+
+  [[ "$DRY_RUN" == "1" ]] && return 0
+  systemctl --user is-active --quiet podman.socket \
+    || die "podman.socket failed to start: systemctl --user status podman.socket"
+  ok "podman.socket enabled"
+}
+
+# ---------------------------------------------------------------------------
+# 4. Point Docker-shaped tooling at Podman
+# ---------------------------------------------------------------------------
+# DOCKER_HOST is what every Docker API client reads — lazydocker, testcontainers,
+# the docker CLI shim from podman-docker.
+#
+# OMARCHY_DOCKER_SOCKET is omarchy's own override in omarchy-sudo-docker, which
+# decides whether the Docker TUI needs to elevate. It answers "can I write this
+# socket?", so pointing it at the user's podman socket makes Super + Shift + D
+# run lazydocker directly instead of pkexec-ing to a daemon that is now gone.
+# That is a documented environment variable, so nothing under /usr/share/omarchy
+# has to be edited — omarchy update cannot undo this.
+configure_environment() {
+  log "Pointing Docker-compatible tooling at Podman"
+  write_file "$ENV_D_FILE" <<EOF
+# Managed by omarchy-scripts (bin/setup-rootless-podman).
+# Read by systemd --user at login; inherited by Hyprland and everything it spawns.
+DOCKER_HOST=unix://$PODMAN_SOCK
+OMARCHY_DOCKER_SOCKET=$PODMAN_SOCK
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# 5. Remove Docker
+# ---------------------------------------------------------------------------
+installed_docker_packages() {
+  local pkg
+  for pkg in "${DOCKER_PACKAGES[@]}"; do
+    pacman -Qq "$pkg" >/dev/null 2>&1 && printf '%s\n' "$pkg"
+  done
+  return 0
+}
+
+# The daemon is stopped before its files are removed: a running docker whose
+# binaries have been deleted underneath it is a worse state than either.
+stop_docker_units() {
+  local unit state
+  for unit in "${DOCKER_UNITS[@]}"; do
+    systemctl cat "$unit" >/dev/null 2>&1 || continue
+    state="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
+    if [[ "$state" != "enabled" ]] && ! systemctl is-active --quiet "$unit" 2>/dev/null; then
+      skip "$unit already stopped and disabled"
+      continue
+    fi
+    run sudo systemctl disable --now "$unit"
+    ok "$unit stopped and disabled"
+  done
+}
+
+remove_docker_packages() {
+  local -a installed=()
+  mapfile -t installed < <(installed_docker_packages)
+
+  if [[ ${#installed[@]} -eq 0 ]]; then
+    skip "Docker is not installed"
+    return 0
+  fi
+
+  # `pacman -Rs --print` asks pacman for the full removal set — the named
+  # packages plus the dependencies nothing else still needs (containerd, on a
+  # stock omarchy) — without root and without changing anything. Print it
+  # before the confirmation so nothing goes unseen.
+  local -a targets=()
+  mapfile -t targets < <(pacman -Rs --print "${installed[@]}" 2>/dev/null \
+    || printf '%s\n' "${installed[@]}")
+
+  local target
+  for target in "${targets[@]}"; do
+    printf '  %s-%s %s\n' "$C_DIM" "$C_RESET" "$target"
+  done
+
+  if ! confirm "Remove ${#targets[@]} package(s)?"; then
+    skip "left Docker installed"
+    return 1
+  fi
+
+  stop_docker_units
+
+  # `omarchy pkg drop` is pacman -Rns over whatever subset is installed, which
+  # is exactly this: the named packages, their orphaned dependencies, and the
+  # config files pacman still owns.
+  run omarchy pkg drop "${installed[@]}"
+
+  [[ "$DRY_RUN" == "1" ]] && return 0
+  local pkg
+  for pkg in "${installed[@]}"; do
+    pacman -Qq "$pkg" >/dev/null 2>&1 && die "$pkg is still installed"
+  done
+  ok "removed ${installed[*]}"
+}
+
+# ---------------------------------------------------------------------------
+# 6. The firewall rules Docker needed
+# ---------------------------------------------------------------------------
+# Omarchy opens the host resolver to the docker bridge (install/config/
+# firewall.sh):
+#
+#   ufw allow in proto udp from 172.16.0.0/12 to 172.17.0.1 port 53
+#   ufw allow in proto udp from 192.168.0.0/16 to 172.17.0.1 port 53
+#
+# 172.17.0.1 is docker0's gateway address. Rootless podman does not create it:
+# containers reach DNS through pasta in the user's own network namespace, so
+# nothing on the host has to be opened. With docker gone the address does not
+# exist and the rules are inbound allowances for nothing.
+DOCKER_DNS_HOST=172.17.0.1
+DOCKER_DNS_SOURCES=(172.16.0.0/12 192.168.0.0/16)
+
+RULES_CACHE=""
+
+# Prefer the world-readable rules file over `sudo ufw show added`, so the
+# already-done second run never triggers a password prompt — setup-all re-runs
+# this on every configured machine.
+ufw_rules() {
+  local file
+  if [[ -z "$RULES_CACHE" ]]; then
+    if [[ -r "$UFW_RULES_DIR/user.rules" ]]; then
+      for file in "$UFW_RULES_DIR/user.rules" "$UFW_RULES_DIR/user6.rules"; do
+        [[ -r "$file" ]] && RULES_CACHE+="$(cat "$file")"$'\n'
+      done
+    else
+      RULES_CACHE="$(sudo ufw show added 2>/dev/null || true)"$'\n'
+    fi
+  fi
+  printf '%s' "$RULES_CACHE"
+}
+
+# Matches both forms: the `### tuple ### allow udp 53 172.17.0.1 any <src> in`
+# line in user.rules, and the `ufw allow in proto udp from <src> to ...` that
+# `ufw show added` prints. Anchored on the docker0 gateway address, so a DNS
+# rule for anything else cannot match.
+dns_rule_present() {
+  local source="$1"
+  ufw_rules | grep -Eq "allow (udp 53 $DOCKER_DNS_HOST any $source|in proto udp from $source to $DOCKER_DNS_HOST port 53)"
+}
+
+remove_firewall_rules() {
+  if [[ "$REMOVE_FIREWALL_RULES" == "0" ]]; then
+    skip "--keep-firewall-rules: leaving the docker DNS rules in place"
+    return 0
+  fi
+  if ! have ufw; then
+    skip "ufw is not installed — no firewall rules to change"
+    return 0
+  fi
+
+  log "Closing the host resolver to the docker bridge"
+  local source
+  for source in "${DOCKER_DNS_SOURCES[@]}"; do
+    if ! dns_rule_present "$source"; then
+      skip "$source → $DOCKER_DNS_HOST:53 already closed"
+      continue
+    fi
+    # A rule that will not delete is not worth failing the whole run over: the
+    # packages are already gone and the address it names no longer exists.
+    if run_quiet sudo ufw delete allow in proto udp \
+      from "$source" to "$DOCKER_DNS_HOST" port 53; then
+      ok "deleted $source → $DOCKER_DNS_HOST:53"
+    else
+      warn "could not delete the $source rule; remove it with: sudo ufw status numbered"
+    fi
+  done
+  RULES_CACHE=""
+}
+
+configure_docker_removal() {
+  if [[ "$REMOVE_DOCKER" == "0" ]]; then
+    skip "--keep-docker: leaving Docker installed"
+    return 0
+  fi
+
+  log "Removing Docker"
+  remove_docker_packages || return 0
+  remove_firewall_rules
+
+  # Only now: podman-docker Conflicts With docker, so this is the first moment
+  # pacman will accept it.
+  log "Installing the Docker-compatible CLI"
+  install_packages "$DOCKER_CLI_PACKAGE"
+}
+
+# ---------------------------------------------------------------------------
+# 7. Verify
+# ---------------------------------------------------------------------------
+verify() {
+  [[ "$DRY_RUN" == "1" ]] && return 0
+
+  log "Verifying"
+
+  local rootless
+  rootless="$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null || true)"
+  case "$rootless" in
+    true)  ok "podman is running rootless as $TARGET_USER" ;;
+    false) die "podman is running as root; the subuid mapping did not take effect" ;;
+    *)     die "podman info failed: run podman info to see why" ;;
+  esac
+
+  local runtime store
+  runtime="$(podman info --format '{{.Host.OCIRuntime.Name}}' 2>/dev/null || true)"
+  store="$(podman info --format '{{.Store.GraphDriverName}}' 2>/dev/null || true)"
+  ok "runtime $runtime, storage driver $store"
+}
+
+# pacman only removes what it packaged, and /var/lib/docker is not that: the
+# daemon created it at runtime, so the images and volumes in it survive the
+# uninstall. Report it rather than deleting it — it is the one piece of this
+# migration that cannot be undone, so it stays the user's call.
+report_docker_leftovers() {
+  [[ -d "$DOCKER_DATA_DIR" ]] || return 0
+  printf '\n'
+  warn "$DOCKER_DATA_DIR still holds Docker's old images and volumes."
+  warn "pacman does not own it. Once you are sure nothing there is needed:"
+  printf '  %s-%s sudo du -sh %s\n' "$C_DIM" "$C_RESET" "$DOCKER_DATA_DIR"
+  printf '  %s-%s sudo rm -rf %s\n' "$C_DIM" "$C_RESET" "$DOCKER_DATA_DIR"
+}
+
+summary() {
+  log "Done"
+
+  if [[ "$REMOVE_DOCKER" == "0" ]]; then
+    cat <<EOF
+
+Rootless Podman is installed and DOCKER_HOST points at it. Docker is still
+installed; reach its daemon explicitly with:
+
+  DOCKER_HOST=unix:///var/run/docker.sock docker ps
+EOF
+  else
+    cat <<EOF
+
+Containers now run as $TARGET_USER, mapped into a private subuid range, with no
+daemon and no root-owned socket anywhere. Nothing on the machine grants
+passwordless root any more.
+
+The docker CLI is podman-docker's shim, so omarchy's \`d\` alias, \`docker
+compose\`, the Docker TUI (Super + Shift + D) and anything reading DOCKER_HOST
+keep working. Images and containers do NOT carry over — podman has its own
+store under ~/.local/share/containers — so pull or rebuild what you still need.
+EOF
+    report_docker_leftovers
+  fi
+
+  cat <<EOF
+
+Log out and back in (or run: systemctl --user import-environment) so every
+process picks up DOCKER_HOST.
+
+Verify with:
+  podman info --format '{{.Host.Security.Rootless}}'   # true
+  systemctl --user status podman.socket
+  echo \$DOCKER_HOST      # unix://${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock
+  podman run --rm docker.io/library/alpine echo ok
+EOF
+}
+
+main() {
+  install_podman
+  configure_subids
+  enable_socket
+  configure_environment
+  configure_docker_removal
+  verify
+  summary
+}
+
+main "$@"

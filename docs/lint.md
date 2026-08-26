@@ -12,10 +12,16 @@ Runs automatically on commit — see [ci.md](ci.md).
 
 ## Why a container
 
-The only dependency is the container engine omarchy already ships. Nothing gets
-installed on the host, and every machine lints identically — a script that
-passes here passes everywhere, and a linter release cannot quietly change what
-does or does not commit.
+The only dependency is a container engine. Nothing gets installed on the host,
+and every machine lints identically — a script that passes here passes
+everywhere, and a linter release cannot quietly change what does or does not
+commit.
+
+Rootless Podman is preferred over Docker, and is what
+[setup-rootless-podman](setup-rootless-podman.md) leaves on the machine. Either
+engine works; `OMARCHY_CONTAINER_ENGINE=docker` pins one explicitly. The
+Dockerfile format is engine-neutral — podman builds it unchanged — so the file
+keeps its name.
 
 ## The image
 
@@ -40,7 +46,7 @@ takes ~1.3 s, of which ~0.5 s is container startup — the same startup cost as
 any prebuilt image, so nothing is lost by building our own.
 
 **Rebuilds.** The tag is the Dockerfile's own SHA-256 prefix
-(`omarchy-scripts/lint:8a6f97fd1f84`), so editing the file rebuilds on the next
+(`omarchy-scripts/lint:0c02b4ebe533`), so editing the file rebuilds on the next
 run with no version constant to bump, and the superseded image is pruned
 automatically. `--rebuild` forces it. `OMARCHY_LINT_IMAGE=<ref>` uses a
 prebuilt image instead and never builds over it.
@@ -50,18 +56,39 @@ with the repo mounted read-only — a linter reads code, so it gets no more than
 that. The build context is `docker/` alone, so the repo is never sent to the
 daemon. `--fix` is the one exception: shfmt needs the mount writable.
 
+**"As your own uid" is spelled differently per engine.** Under Docker the
+daemon is root, so `--user 1000:1000` simply drops to that uid and the bind
+mount is seen with the host's own ids. Under rootless Podman the container
+already runs as you, inside a user namespace where you are uid 0 and every
+other uid is drawn from your subuid range — so `--user 1000` there means
+*subuid* 1000, which is host uid 100999, a stranger to your own files:
+
+```
+$ podman run --user 1000:1000 -v "$PWD:/mnt" … shfmt --write lib/probe.sh
+open lib/.probe.sh579088012144235543: permission denied
+```
+
+`--userns=keep-id` maps your host uid to itself inside the namespace, which
+makes `--user` mean what it says and keeps written files owned by you. It is
+rootless-only — rootful podman rejects it — so `bin/lint` adds it only after
+asking the engine `podman info --format '{{.Host.Security.Rootless}}'` rather
+than guessing from the engine's name.
+
 To refresh the base image, follow the instructions in the Dockerfile header.
 
 ## Fallbacks
 
-1. `docker`, then `podman` — but only if the daemon actually answers. An
-   installed client with a dead daemon is skipped rather than left to fail
-   slowly.
+1. `podman`, then `docker` — but only if it actually answers. An installed
+   client with a dead daemon is skipped rather than left to fail slowly.
+   Podman goes first because it needs neither a daemon nor root, so on a
+   machine with both it is the one that will answer.
 2. A host-installed `shellcheck`, with a warning that versions may differ.
 3. Neither: exit 3, meaning "no linter available" rather than "lint failed".
 
 `--container` demands a container and fails otherwise; `--no-container` uses
-host tools only.
+host tools only. `OMARCHY_CONTAINER_ENGINE` pins a single engine — naming one
+means that one, so a pinned engine that does not answer is an error rather than
+a silent swap to the other.
 
 ## Options
 
@@ -73,6 +100,11 @@ host tools only.
 | `--no-container` | Use host tools instead of containers |
 | `--container` | Require containers; fail rather than fall back |
 | `-h`, `--help` | Usage |
+
+| Variable | Effect |
+| --- | --- |
+| `OMARCHY_CONTAINER_ENGINE` | Use exactly this engine instead of trying podman then docker |
+| `OMARCHY_LINT_IMAGE` | Use a prebuilt image; never build over it |
 
 Exit codes: `0` clean, `1` problems found, `3` no linter available.
 

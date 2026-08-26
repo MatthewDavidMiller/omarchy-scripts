@@ -51,11 +51,12 @@ touching the system.
 | `bin/setup-cat-background` | Set a pixel-art cat desktop and disk-unlock background | [docs/setup-cat-background.md](docs/setup-cat-background.md) |
 | `bin/setup-no-chromium-extensions` | Remove Omarchy's bundled Chromium extensions | [docs/setup-no-chromium-extensions.md](docs/setup-no-chromium-extensions.md) |
 | `bin/setup-no-localsend` | Remove LocalSend and the ufw rules that expose it | [docs/setup-no-localsend.md](docs/setup-no-localsend.md) |
+| `bin/setup-rootless-podman` | Swap Docker for rootless Podman, keeping the docker CLI | [docs/setup-rootless-podman.md](docs/setup-rootless-podman.md) |
 | `bin/lint` | shellcheck in a container — no host tooling to install | [docs/lint.md](docs/lint.md) |
 
 Container images follow two rules: **reputable sources only** — Docker Official
 Images, pinned by digest — and **small**, so a lint run costs seconds rather
-than minutes.
+than minutes. The engine that runs them is Podman or Docker, whichever answers.
 
 Scripts are discovered automatically — a new `bin/setup-*` joins `setup-all`
 just by existing.
@@ -76,7 +77,9 @@ hosted CI by design. See [docs/ci.md](docs/ci.md).
 Linting runs in a throwaway container built on `alpine` — a Docker Official
 Image, pinned by digest — with shellcheck and shfmt from Alpine's signed
 repositories. No third-party images, nothing installed on the host, and the
-same versions on every machine.
+same versions on every machine. Rootless Podman is preferred over Docker and
+either works; `bin/setup-rootless-podman` is what leaves the machine with the
+former.
 
 Tests are plain bash against a throwaway `HOME` with stubbed system commands,
 so they never touch your real config. See [docs/testing.md](docs/testing.md).

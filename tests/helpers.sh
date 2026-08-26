@@ -85,6 +85,15 @@ assert_file_contains() {
   fi
 }
 
+assert_file() {
+  local file="$1"
+  if [[ -e "$file" ]]; then
+    pass
+  else
+    fail "expected $file to exist"
+  fi
+}
+
 assert_no_file() {
   local file="$1"
   if [[ -e "$file" ]]; then

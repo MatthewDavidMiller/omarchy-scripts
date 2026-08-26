@@ -62,8 +62,8 @@ finish
 ```
 
 Assertions: `assert_eq`, `assert_contains`, `assert_not_contains`,
-`assert_status`, `assert_file_contains`, `assert_no_file`, plus `fail` and
-`pass` for anything custom.
+`assert_status`, `assert_file_contains`, `assert_file`, `assert_no_file`, plus
+`fail` and `pass` for anything custom.
 
 Test the behaviour that would actually bite. The suite pins down things like
 *"a second run leaves the file byte-identical"*, *"`IdentitiesOnly` is not set
@@ -77,3 +77,8 @@ the decisions that are easy to undo by accident later.
   stdin.
 - A comment beginning `# shellcheck` was parsed by shellcheck as a malformed
   directive — in the test suite's own source.
+- `bin/lint` passed `--user $(id -u)` to the container engine, which is correct
+  under docker and wrong under rootless podman: the uid resolves inside the
+  user namespace, so `--fix` could not write files the caller owned. The test
+  asserts on the flags the engine is actually handed, against a stubbed engine,
+  so it holds on machines with no engine installed at all.

@@ -99,6 +99,12 @@ Two rules, applied to anything this repo runs in a container:
 - **Small and cached.** Lint runs happen on every commit, so image size and
   startup are a tax on the edit loop. Build once, tag by the Dockerfile's hash,
   prune what it supersedes.
+- **Engine-neutral.** Podman and Docker both have to work, and podman is tried
+  first — it needs neither a daemon nor root. Where they genuinely differ, ask
+  the engine rather than branching on its name: rootless podman needs
+  `--userns=keep-id` for `--user` to mean the caller's uid, and rootful podman
+  rejects that flag, so the name alone does not answer it. See
+  [lint.md](lint.md).
 
 ## Package sources
 

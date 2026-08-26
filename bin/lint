@@ -2,8 +2,12 @@
 #
 # lint — shellcheck (and optionally shfmt) for every script in this repo.
 #
-# Runs the linters inside a throwaway container, so the only dependency is the
-# container engine omarchy already ships. Nothing is installed on the host.
+# Runs the linters inside a throwaway container, so the only dependency is a
+# container engine. Nothing is installed on the host.
+#
+# Rootless podman is preferred over docker, and is what bin/setup-rootless-podman
+# leaves on the machine. Either engine works; see run_args() for the one place
+# they genuinely differ.
 #
 # The image is built here from docker/lint.Dockerfile, on top of alpine — a
 # Docker Official Image pinned by digest — rather than pulled from a third
@@ -48,7 +52,8 @@ Exit codes:
   0  clean   1  problems found   3  no linter available
 
 The image is built from docker/lint.Dockerfile (alpine + shellcheck + shfmt)
-and cached. Set OMARCHY_LINT_IMAGE to use a prebuilt image instead.
+and cached. Podman is preferred over docker; set OMARCHY_CONTAINER_ENGINE to
+pick one explicitly, or OMARCHY_LINT_IMAGE to use a prebuilt image.
 USAGE
 }
 
@@ -70,14 +75,30 @@ done
 # --- engine ----------------------------------------------------------------
 
 CONTAINER_ENGINE=""
+ENGINE_ROOTLESS=0
+
 detect_engine() {
+  # Podman first: it needs no daemon and no root, so on a machine that has both
+  # it is the one that will actually answer. OMARCHY_CONTAINER_ENGINE pins a
+  # single engine instead — naming one means that one, not "prefer" it.
   local engine
-  for engine in docker podman; do
+  local -a candidates=(podman docker)
+  [[ -n "${OMARCHY_CONTAINER_ENGINE:-}" ]] && candidates=("$OMARCHY_CONTAINER_ENGINE")
+
+  for engine in "${candidates[@]}"; do
     have "$engine" || continue
     # An installed client with no reachable daemon is worse than no client at
     # all: it fails slowly and confusingly. Check before committing to it.
     if timeout 20 "$engine" info >/dev/null 2>&1; then
       CONTAINER_ENGINE="$engine"
+      # Rootless podman maps the caller's uid to root inside the container, and
+      # every other uid into the subuid range. That changes how --user has to
+      # be spelled; ask the engine rather than guessing from its name, since
+      # podman can also be run rootful.
+      if [[ "$engine" == "podman" ]] \
+        && [[ "$(podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null)" == "true" ]]; then
+        ENGINE_ROOTLESS=1
+      fi
       return 0
     fi
   done
@@ -118,13 +139,20 @@ ensure_image() {
     || die "Failed to build $image"
   ok "built $image"
 
-  # Hash tags accumulate one stale image per Dockerfile edit. Drop the old
-  # ones now that the new image is known good.
+  # Hash tags accumulate one per Dockerfile edit. Drop the superseded ones now
+  # that the new image is known good.
+  #
+  # By tag, not by id: an edit that touches only comments rebuilds to layers
+  # that are byte-identical, so the old and new tags name the same image and an
+  # id-based prune can never tell them apart. Removing the tag untags a shared
+  # image and deletes one nothing else names any more, which is right either
+  # way. The refs come from the engine's own output, so podman's localhost/
+  # prefix is carried back to podman verbatim.
   local stale
-  stale="$("$CONTAINER_ENGINE" images --quiet --filter "reference=omarchy-scripts/lint" \
-    | grep -vx "$("$CONTAINER_ENGINE" images --quiet "$image")" || true)"
+  stale="$("$CONTAINER_ENGINE" images --format '{{.Repository}}:{{.Tag}}' \
+    --filter "reference=omarchy-scripts/lint" | grep -v ":${image##*:}$" || true)"
   if [[ -n "$stale" ]]; then
-    # shellcheck disable=SC2086  # deliberate word splitting: one id per line
+    # shellcheck disable=SC2086  # deliberate word splitting: one ref per line
     "$CONTAINER_ENGINE" rmi $stale >/dev/null 2>&1 || true
   fi
 }
@@ -163,6 +191,24 @@ fi
 
 # --- runners ---------------------------------------------------------------
 
+# user_args — how to spell "run as me" for the engine we found.
+#
+# Under docker the daemon is root, so --user is simply the uid to drop to and
+# the bind mount is seen with the host's own uids.
+#
+# Under rootless podman the whole container already runs as the caller, inside
+# a user namespace where the caller is uid 0 and every other uid comes out of
+# the subuid range. --user 1000 there means "subuid 1000", which is host uid
+# 100999 — a stranger to the bind mount, so shfmt --write fails with
+# `permission denied` on files the caller owns. --userns=keep-id maps the host
+# uid to itself inside the namespace instead, which makes --user mean what it
+# says and keeps written files owned by the caller. It is rootless-only, so it
+# is added only when the engine reported rootless.
+user_args() {
+  [[ "$ENGINE_ROOTLESS" == "1" ]] && printf '%s\n' --userns=keep-id
+  printf '%s\n%s:%s\n' --user "$(id -u)" "$(id -g)"
+}
+
 # in_container <writable?> <cmd...> — run a tool from the lint image.
 # The mount is read-only unless the tool needs to write, and the network is
 # off: linters read code and nothing more.
@@ -171,9 +217,12 @@ in_container() {
   local mount="$REPO_ROOT:/mnt:ro"
   [[ "$writable" == "rw" ]] && mount="$REPO_ROOT:/mnt"
 
+  local -a as_user=()
+  mapfile -t as_user < <(user_args)
+
   run "$CONTAINER_ENGINE" run --rm \
     --network none \
-    --user "$(id -u):$(id -g)" \
+    "${as_user[@]}" \
     --volume "$mount" \
     --workdir /mnt \
     "$LINT_IMAGE" "$@"
@@ -208,7 +257,9 @@ if [[ "$USE_CONTAINER" != "no" ]] && detect_engine; then
   MODE=container
   LINT_IMAGE="$(image_name)"
   ensure_image "$LINT_IMAGE"
-  log "Linting ${#FILES[@]} file(s) with $LINT_IMAGE via $CONTAINER_ENGINE"
+  engine_label="$CONTAINER_ENGINE"
+  [[ "$ENGINE_ROOTLESS" == "1" ]] && engine_label="rootless $CONTAINER_ENGINE"
+  log "Linting ${#FILES[@]} file(s) with $LINT_IMAGE via $engine_label"
 elif [[ "$USE_CONTAINER" == "yes" ]]; then
   printf '%s err%s No usable container engine (is the docker daemon running?).\n' "$C_RED" "$C_RESET" >&2
   exit 3

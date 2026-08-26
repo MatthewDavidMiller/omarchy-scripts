@@ -40,7 +40,9 @@ would still fire even with `core.hooksPath` pointed elsewhere.
 If neither a container engine nor a host `shellcheck` is available, `bin/lint`
 exits 3 — "no linter available", distinct from "lint failed" — and the hook
 prints `no linter available, syntax check only` and lets the commit through.
-A stopped docker daemon should not stop you committing.
+A stopped docker daemon should not stop you committing. (Rootless podman, which
+[setup-rootless-podman](setup-rootless-podman.md) installs, has no daemon to
+stop — so on a migrated machine this degradation mostly stops happening.)
 
 ## Bypassing
 
