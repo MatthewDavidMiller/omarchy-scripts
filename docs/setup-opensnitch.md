@@ -240,6 +240,37 @@ If an application is unexpectedly blocked, inspect the OpenSnitch Events view
 and grant the narrowest temporary rule first. Promote it to `always` only after
 the application works and the match fields are understood.
 
+### A rule can be active and still be missing from the UI
+
+The GUI's rule list is built when it connects to the daemon, and its database
+is `file::memory:` by default. The daemon notices a file dropped into its rules
+directory through inotify and reloads immediately — but it does not push that
+change to a UI that is already connected. So every rule installed from outside
+the GUI, which is every rule `setup-opensnitch` imports and every one migrated
+by hand, is enforced at once and invisible until the UI reconnects.
+
+The UI is therefore not the place to check whether a rule is live. These are:
+
+```bash
+ls /etc/opensnitchd/rules/
+grep -a 'Ruleset changed due to' /var/log/opensnitchd.log | tail
+```
+
+Together they say the file is installed and that the daemon accepted it. The
+third check is the one that actually matters: exercise the traffic and see it
+work.
+
+To refresh the UI's view, restart it — the launcher this setup installs is
+enough, and it reconnects on its own:
+
+```bash
+pkill -x opensnitch-ui
+~/.local/bin/opensnitch-ui-secure &
+```
+
+While the UI is down there is no one to answer prompts, so a new connection
+gets the default action — `deny` — with no dialog. Keep the gap short.
+
 To pause enforcement without deleting rules:
 
 ```bash
