@@ -40,7 +40,19 @@ case "$1 $2" in
 esac'
 
 # shellcheck disable=SC2016
-stub_bin "$STUBS" pacman 'printf "Repository      : %s\nName            : arch-audit\n" "${FAKE_ARCH_REPO:-extra}"'
+# shellcheck disable=SC2016
+stub_bin "$STUBS" pacman '
+REPO_VALUE="${FAKE_ARCH_REPO:-extra}"
+PKG_NAME=arch-audit
+# Real `pacman -Si` prints Repository first, then ~20 more fields. The large
+# tail here is deliberate: a reader that exits at the Repository line leaves
+# this writer blocked on a full pipe, and under `set -o pipefail` that SIGPIPE
+# becomes exit 141 for the whole script. Without the padding the race is won
+# often enough that the bug only shows up as an occasional flake.
+printf "Repository      : %s\nName            : %s\n" "$REPO_VALUE" "$PKG_NAME"
+printf "Description     : "
+head -c 200000 /dev/zero | tr "\0" "x"
+printf "\n"'
 
 # shellcheck disable=SC2016
 stub_bin "$STUBS" systemctl '

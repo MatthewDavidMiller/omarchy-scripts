@@ -93,7 +93,7 @@ install_root_file() {
 verify_package_source() {
   local repository
   repository="$(LC_ALL=C pacman -Si opensnitch 2>/dev/null \
-    | awk -F: '/^Repository[[:space:]]*:/ { gsub(/[[:space:]]/, "", $2); print $2; exit }')"
+    | awk -F: '/^Repository[[:space:]]*:/ && !seen { gsub(/[[:space:]]/, "", $2); print $2; seen = 1 }')"
   [[ "$repository" == "extra" ]] \
     || die "opensnitch is not available from Arch's official Extra repository"
   ok "opensnitch is available from Arch Extra"
@@ -219,8 +219,13 @@ stop_existing_ui() {
       pgrep -u "$(id -u)" -x opensnitch-ui >/dev/null 2>&1 || break
       sleep 0.1
     done
-    pgrep -u "$(id -u)" -x opensnitch-ui >/dev/null 2>&1 \
-      && die "the existing OpenSnitch UI did not stop; close it and rerun"
+    # An `if`, not `pgrep ... && die ...`: on the success path pgrep finds
+    # nothing and returns 1, which as the function's last command would make
+    # stop_existing_ui return 1 and abort the whole script under `set -e` —
+    # silently, with the user's UI already killed.
+    if pgrep -u "$(id -u)" -x opensnitch-ui >/dev/null 2>&1; then
+      die "the existing OpenSnitch UI did not stop; close it and rerun"
+    fi
   fi
 }
 

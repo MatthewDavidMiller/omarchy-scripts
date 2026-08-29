@@ -49,6 +49,30 @@ half-configured machine without fear.
 - **Exits non-zero on failure**, so `setup-all` can report it. Exit 0 when the
   work was already done — that is a skip, not a failure.
 
+## Two ways `set -euo pipefail` bites
+
+Both of these have shipped in this repository and both failed the same way: the
+script aborted partway through, with no error message and a confusing exit code,
+on the path where nothing had gone wrong.
+
+- **A function whose last command is a test.** `stop_existing_ui` ended with
+  `pgrep ... && die "the UI did not stop"`. When the UI *had* stopped, `pgrep`
+  returned 1, that became the function's return value, and `set -e` killed the
+  script — after it had already terminated the user's UI. Use an explicit `if`
+  for the failure branch, or end the function with something that returns 0.
+  A predicate function that is only ever called inside `if` is fine; an action
+  function is not.
+- **A pipeline whose reader exits early.** `pacman -Si <pkg> | awk '... exit'`
+  looks harmless, but `awk` closes the pipe as soon as it has what it needs, and
+  a still-writing `pacman` takes SIGPIPE. `pipefail` promotes that to exit 141
+  for the whole script. It is a race, so it fails intermittently and looks like
+  a flaky test rather than a bug. Let the reader consume all of its input —
+  track "already found it" with a flag instead of `exit`.
+
+When a test that exercises one of these passes reliably, check that the fixture
+is actually big enough to lose the race. `tests/test-setup-opensnitch.sh` pads
+its `pacman` stub past the pipe buffer on purpose.
+
 ## Helpers in `lib/common.sh`
 
 | Helper | Purpose |

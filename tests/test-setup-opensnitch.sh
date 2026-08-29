@@ -20,7 +20,17 @@ esac'
 
 # shellcheck disable=SC2016
 stub_bin "$STUBS" pacman '
-printf "Repository      : %s\nName            : opensnitch\n" "${FAKE_OPEN_SNITCH_REPO:-extra}"'
+REPO_VALUE="${FAKE_OPEN_SNITCH_REPO:-extra}"
+PKG_NAME=opensnitch
+# Real `pacman -Si` prints Repository first, then ~20 more fields. The large
+# tail here is deliberate: a reader that exits at the Repository line leaves
+# this writer blocked on a full pipe, and under `set -o pipefail` that SIGPIPE
+# becomes exit 141 for the whole script. Without the padding the race is won
+# often enough that the bug only shows up as an occasional flake.
+printf "Repository      : %s\nName            : %s\n" "$REPO_VALUE" "$PKG_NAME"
+printf "Description     : "
+head -c 200000 /dev/zero | tr "\0" "x"
+printf "\n"'
 
 # shellcheck disable=SC2016
 stub_bin "$STUBS" systemctl '
@@ -194,6 +204,56 @@ assert_contains "$("$REPO_ROOT/bin/setup-opensnitch" --help)" "deny-by-default"
 it "rejects unknown arguments"
 "$REPO_ROOT/bin/setup-opensnitch" --not-an-option >/dev/null 2>&1
 assert_status 1 $?
+
+# --- a running OpenSnitch UI ------------------------------------------------
+#
+# In a live Hyprland session the setup stops any running opensnitch-ui before
+# rewriting its settings. Stopping one successfully must not be mistaken for a
+# failure: the bug this pins down aborted the whole run, silently and with the
+# user's UI already killed, precisely when the stop worked.
+
+UI_HOME="$(make_fake_home)"
+UI_ROOT="$TEST_TMP/ui-root"
+UI_STUBS="$TEST_TMP/ui-stubs"
+make_fixture "$UI_ROOT"
+cp "$STUBS"/{sudo,omarchy,pacman,systemctl} "$UI_STUBS" 2>/dev/null || {
+  mkdir -p "$UI_STUBS"; cp "$STUBS"/{sudo,omarchy,pacman,systemctl} "$UI_STUBS"; }
+
+# Running the first time it is asked, gone thereafter — a UI that shuts down
+# when told to.
+# shellcheck disable=SC2016
+stub_bin "$UI_STUBS" pgrep '
+marker="${TEST_UI_MARKER:?}"
+if [[ -f "$marker" ]]; then exit 1; fi
+: > "$marker"
+exit 0'
+stub_bin "$UI_STUBS" pkill ':'
+stub_bin "$UI_STUBS" hyprctl ':'
+
+ui_out="$(HOME="$UI_HOME" XDG_RUNTIME_DIR="$UI_HOME/run" PATH="$UI_STUBS:$PATH" \
+  FAKE_PKG_DB="$UI_ROOT/pkgdb" FAKE_UNIT_STATE="$UI_ROOT/units" \
+  FAKE_OPEN_SNITCH_REPO=extra \
+  TEST_UI_MARKER="$TEST_TMP/ui-stopped" \
+  HYPRLAND_INSTANCE_SIGNATURE="test-session" \
+  OPEN_SNITCH_DAEMON_CONFIG="$UI_ROOT/etc/opensnitchd/default-config.json" \
+  OPEN_SNITCH_RULES_DIR="$UI_ROOT/etc/opensnitchd/rules" \
+  OPEN_SNITCH_SHARED_RULES_DIR="$UI_ROOT/shared" \
+  OPEN_SNITCH_EBPF_OBJECT="$UI_ROOT/ebpf.o" \
+  OPEN_SNITCH_GUI_SETTINGS="$UI_HOME/.config/opensnitch/settings.conf" \
+  OPEN_SNITCH_AUTOSTART_FILE="$UI_HOME/.config/hypr/autostart.lua" \
+  OPEN_SNITCH_UI_LAUNCHER="$UI_HOME/.local/bin/opensnitch-ui-secure" \
+  OPEN_SNITCH_SKIP_LIVE_UI=1 \
+  "$REPO_ROOT/bin/setup-opensnitch" 2>&1)"
+ui_status=$?
+
+it "does not abort after successfully stopping a running UI"
+assert_status 0 "$ui_status"
+
+it "carries on past the stop and configures the daemon"
+assert_contains "$ui_out" "Synchronizing repository-managed OpenSnitch rules"
+
+it "installs the baseline even when a UI had to be stopped first"
+assert_file "$UI_ROOT/etc/opensnitchd/rules/omarchy-shared-010-allow-systemd-resolved.json"
 
 # --- shape of the committed baseline ---------------------------------------
 #

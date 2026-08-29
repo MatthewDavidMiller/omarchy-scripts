@@ -181,7 +181,7 @@ configure_arch_audit() {
   log "Enabling installed-package vulnerability monitoring"
 
   repository="$(LC_ALL=C pacman -Si arch-audit 2>/dev/null \
-    | awk -F: '/^Repository[[:space:]]*:/ { gsub(/[[:space:]]/, "", $2); print $2; exit }')"
+    | awk -F: '/^Repository[[:space:]]*:/ && !seen { gsub(/[[:space:]]/, "", $2); print $2; seen = 1 }')"
   [[ "$repository" == "extra" ]] \
     || die "arch-audit is not available from Arch's official Extra repository"
   ok "arch-audit is available from Arch Extra"
