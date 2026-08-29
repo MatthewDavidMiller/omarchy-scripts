@@ -68,7 +68,12 @@ require_cmd omarchy pacman makepkg sudo
   || die "Omarchy Chromium flags were not found"
 
 for conflicting_package in brave-bin brave-browser; do
-  if pacman -Q "$conflicting_package" >/dev/null 2>&1; then
+  # pacman resolves -Q targets through provides= entries. Our package provides
+  # both legacy names, so check the resolved package's real name before
+  # treating it as a separately installed conflict.
+  resolved_package="$(pacman -Q "$conflicting_package" 2>/dev/null \
+    | awk 'NR == 1 { print $1 }' || true)"
+  if [[ "$resolved_package" == "$conflicting_package" ]]; then
     die "Remove conflicting package $conflicting_package before installing the vetted build"
   fi
 done

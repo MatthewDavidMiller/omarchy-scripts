@@ -14,7 +14,12 @@ printf '%s\n' \
 # shellcheck disable=SC2016
 stub_bin "$STUBS" pacman '
 case "$*" in
-  "-Q brave-bin"|"-Q brave-browser") exit 1 ;;
+  "-Q brave-bin"|"-Q brave-browser")
+    # pacman resolves queries through provides=, so an installed local package
+    # is returned for both legacy names even though neither is installed.
+    [[ -f "${FAKE_PKG_DB:?}" ]] || exit 1
+    printf "brave-browser-local %s\n" "$(cat "$FAKE_PKG_DB")"
+    ;;
   "-Q brave-browser-local")
     [[ -f "${FAKE_PKG_DB:?}" ]] || exit 1
     printf "brave-browser-local %s\n" "$(cat "$FAKE_PKG_DB")"
@@ -135,6 +140,9 @@ after_writes="$(grep -c '^default browser brave$' "$STUBS/omarchy.log")"
 
 it "a second run does not rebuild the current package"
 assert_eq "$before_builds" "$after_builds" "makepkg calls"
+
+it "provided legacy names are not mistaken for installed conflicts"
+assert_contains "$out2" "already installed"
 
 it "a second run does not reset the default browser"
 assert_eq "$before_writes" "$after_writes" "default-browser writes"
