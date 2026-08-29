@@ -333,9 +333,8 @@ from a session that does not depend on it.
 `opensnitch-rulectl show -o DIR` dumps every rule as JSON with no filtering and
 no root, which is the right tool for a backup. `export-opensnitch-rules` is the
 curated path: it selects rules, normalizes them, and refuses the ones that
-cannot be portable. After using the UI to create an enabled `allow` rule with
-duration `always`, export selected rules to a local directory outside this
-project:
+cannot be portable. After using the UI to create an enabled rule with duration
+`always`, export selected rules to a local directory outside this project:
 
 ```bash
 ./bin/export-opensnitch-rules
@@ -347,7 +346,13 @@ project:
 
 The bare command opens a rule multiselect followed by a local directory picker.
 When rules are supplied as arguments, the directory picker still opens unless
-`--output-dir` or `OPEN_SNITCH_EXPORT_DIR` is set. Project directories are
+`--output-dir` or `OPEN_SNITCH_EXPORT_DIR` is set. The directory of the last
+successful export is recorded in
+`~/.local/state/omarchy-scripts/opensnitch-export-dir` and offered first the
+next time the picker opens, so a repeat export is one confirmation. `--yes`
+takes it without asking; a run with no terminal and no `--yes` never inherits
+it — an unattended run that names no destination still fails, rather than
+writing to whichever directory was last picked by hand. Project directories are
 rejected as export destinations. Arguments must match an internal rule name or
 filename exactly. Exported JSON is normalized and gets a stable
 `omarchy-shared-<slug>-<hash>.json` filename, so exporting it again is a no-op.
@@ -356,6 +361,15 @@ Rules containing a numeric UID, a home-directory path, a process hash, an
 exact command line, an interface, or a private/link-local address are rejected
 as non-portable. After reviewing the JSON, an intentional exception can be
 exported with `--allow-machine-specific`.
+
+Both `allow` and `deny` are exportable, because the shared baseline uses a
+permanent deny as the explicit complement to a narrower allow — see
+[Normalizing learned rules](#normalizing-learned-rules). Exporting a deny
+warns: on its own it is only half a policy, so carry the allows it must lose to
+across with it and check their `precedence` and numbering on the target
+machine. Two rules that share a `name` also share an export filename; the
+export refuses to write both and names them, rather than letting the second
+replace the first.
 
 To import an exported collection on another machine, point setup at its local
 directory:

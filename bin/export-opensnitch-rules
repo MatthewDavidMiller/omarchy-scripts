@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# export-opensnitch-rules — copy selected durable allows to a local directory.
+# export-opensnitch-rules — copy selected durable rules to a local directory.
 #
 set -euo pipefail
 
@@ -11,6 +11,7 @@ source "$REPO_ROOT/lib/common.sh"
 
 RULES_DIR="${OPEN_SNITCH_RULES_DIR:-/etc/opensnitchd/rules}"
 EXPORT_DIR="${OPEN_SNITCH_EXPORT_DIR:-}"
+EXPORT_STATE_FILE="${OPEN_SNITCH_EXPORT_STATE_FILE:-${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-scripts/opensnitch-export-dir}"
 ALLOW_MACHINE_SPECIFIC=0
 WORK_DIR=""
 SELECTORS=()
@@ -19,14 +20,20 @@ usage() {
   cat <<'USAGE'
 Usage: export-opensnitch-rules [options] [RULE ...]
 
-Exports selected enabled, permanent allow rules from /etc/opensnitchd/rules
-to a local directory chosen by the user. With no RULE arguments, opens an
-interactive multiselect. RULE may be an exact rule name or source filename.
+Exports selected enabled, permanent allow and deny rules from
+/etc/opensnitchd/rules to a local directory chosen by the user. A deny is only
+portable together with the allows it complements, so exporting one warns.
+
+With no RULE arguments, opens an interactive multiselect. RULE may be an exact
+rule name or source filename. The directory of the last successful export is
+remembered and offered as the default the next time one is chosen
+interactively.
 
 Options:
   -n, --dry-run                 Preview without writing exported files.
   -o, --output-dir DIR          Export to DIR instead of choosing interactively.
-  -y, --yes                     Accepted for scripting compatibility.
+  -y, --yes                     Reuse the remembered export directory
+                                without asking.
       --allow-machine-specific  Permit rules tied to a UID, home path,
                                 process hash/command, interface, or local IP.
   -h, --help                    Show this help.
@@ -34,6 +41,7 @@ Options:
 Environment (primarily for tests):
   OPEN_SNITCH_RULES_DIR         Installed rules directory.
   OPEN_SNITCH_EXPORT_DIR        Export directory (skips directory selection).
+  OPEN_SNITCH_EXPORT_STATE_FILE File recording the last export directory.
 USAGE
 }
 
@@ -79,10 +87,11 @@ while IFS= read -r -d '' rule; do
 done < <(find "$RULES_DIR" -maxdepth 1 -type f -name '*.json' -print0)
 
 CATALOG="$WORK_DIR/catalog.tsv"
-python - "$STAGED" > "$CATALOG" <<'PY'
-import hashlib, ipaddress, json, pathlib, re, sys
+python - "$STAGED" "$HOME" > "$CATALOG" <<'PY'
+import collections, hashlib, ipaddress, json, pathlib, re, sys
 
 root = pathlib.Path(sys.argv[1])
+home = sys.argv[2].rstrip("/")
 
 def walk_operator(operator):
     if not isinstance(operator, dict):
@@ -111,18 +120,30 @@ def portability(rule):
                     reasons.add("local IP/network")
             except ValueError:
                 pass
-        if "/home/" in data or data.startswith("~/"):
+        # $HOME is not always under /home/, so check both the conventional
+        # prefix and where this machine's home actually is.
+        if data.startswith("~/") or "/home/" in data or (home and home in data):
             reasons.add("home path")
     return ", ".join(sorted(reasons))
+
+def flatten(text):
+    """Collapse whitespace so a value can never break the TSV into new rows.
+
+    Rule data is free text from the GUI. A tab or newline in it used to shift
+    the catalog's columns and invent phantom rows, which made the real rule
+    unselectable and crashed the export on an empty output filename.
+    """
+    return re.sub(r"\s+", " ", text).strip()
 
 def summary(rule):
     parts = []
     for op in walk_operator(rule.get("operator")):
         operand, data = op.get("operand"), op.get("data")
         if operand and operand != "list" and data:
-            parts.append(f"{operand}={data}")
+            parts.append(f"{flatten(str(operand))}={flatten(str(data))}")
     return " AND ".join(parts)[:180] or "no match summary"
 
+rows = []
 for path in sorted(root.glob("*.json")):
     try:
         rule = json.loads(path.read_text(encoding="utf-8"))
@@ -133,12 +154,32 @@ for path in sorted(root.glob("*.json")):
     if not isinstance(name, str) or not name or any(c in name for c in "\t\r\n"):
         print(f"warning: skipping rule with invalid name: {path.name}", file=sys.stderr)
         continue
-    eligible = rule.get("enabled") is True and rule.get("action") == "allow" and rule.get("duration") == "always"
+    action = str(rule.get("action", ""))
+    # A deny is exportable too: the shared baseline uses one as the explicit
+    # complement to a narrower allow. See docs/setup-opensnitch.md.
+    eligible = (
+        rule.get("enabled") is True
+        and action in ("allow", "deny")
+        and rule.get("duration") == "always"
+    )
     slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:72] or "rule"
     digest = hashlib.sha256(name.encode()).hexdigest()[:12]
     output = f"omarchy-shared-{slug}-{digest}.json"
-    fields = (path.name, name, "yes" if eligible else "no", summary(rule), portability(rule) or "-", output)
-    print("\t".join(fields))
+    rows.append((path.name, name, action or "-", "yes" if eligible else "no",
+                 summary(rule), portability(rule) or "-", output))
+
+# The destination filename is derived from the rule name, so two rules sharing
+# a name also share a destination. Exporting them in separate runs would
+# silently replace one with the other; say so while both are still visible.
+counts = collections.Counter(row[6] for row in rows)
+for output, count in sorted(counts.items()):
+    if count > 1:
+        clashing = ", ".join(row[0] for row in rows if row[6] == output)
+        print(f"warning: {clashing} share a rule name and one export filename: {output}",
+              file=sys.stderr)
+
+for row in rows:
+    print("\t".join(row))
 PY
 
 [[ -s "$CATALOG" ]] || die "no readable OpenSnitch rules found in $RULES_DIR"
@@ -148,22 +189,22 @@ declare -A PATH_BY_LABEL=()
 
 choose_interactively() {
   [[ -t 0 && -t 1 ]] || die "no RULE specified and no interactive terminal available"
-  local file name eligible summary _issues _output label choice token input i
+  local file name action eligible summary _issues _output label choice token input i
   local -a labels=()
-  while IFS=$'\t' read -r file name eligible summary _issues _output; do
+  while IFS=$'\t' read -r file name action eligible summary _issues _output; do
     [[ "$eligible" == "yes" ]] || continue
-    label="$name — $summary [$file]"
+    label="$action $name — $summary [$file]"
     labels+=("$label")
     PATH_BY_LABEL["$label"]="$file"
   done < "$CATALOG"
-  [[ ${#labels[@]} -gt 0 ]] || die "no enabled permanent allow rules are available to export"
+  [[ ${#labels[@]} -gt 0 ]] || die "no enabled permanent rules are available to export"
 
   if have gum && [[ -z "${TUI_NO_GUM:-}" ]]; then
     while IFS= read -r choice; do
       [[ -n "$choice" ]] && CHOSEN+=("${PATH_BY_LABEL[$choice]}")
-    done < <(gum choose --no-limit --header "Select portable OpenSnitch allows to export" "${labels[@]}")
+    done < <(gum choose --no-limit --header "Select portable OpenSnitch rules to export" "${labels[@]}")
   else
-    printf 'Select portable OpenSnitch allows to export\n' >&2
+    printf 'Select portable OpenSnitch rules to export\n' >&2
     for i in "${!labels[@]}"; do printf '  %2d) %s\n' $((i + 1)) "${labels[$i]}" >&2; done
     read -r -p "Numbers (space/comma separated, blank cancels): " input
     for token in ${input//,/ }; do
@@ -177,13 +218,13 @@ choose_interactively() {
 }
 
 resolve_selectors() {
-  local selector file name eligible _summary _issues _output found
+  local selector file name _action eligible _summary _issues _output found
   for selector in "${SELECTORS[@]}"; do
     found=0
-    while IFS=$'\t' read -r file name eligible _summary _issues _output; do
+    while IFS=$'\t' read -r file name _action eligible _summary _issues _output; do
       [[ "$selector" == "$file" || "$selector" == "$name" ]] || continue
       [[ "$eligible" == "yes" ]] \
-        || die "$selector is not an enabled permanent allow rule"
+        || die "$selector is not an enabled permanent allow or deny rule"
       CHOSEN+=("$file")
       found=1
     done < "$CATALOG"
@@ -191,16 +232,63 @@ resolve_selectors() {
   done
 }
 
+# The directory of the last successful export, so the next run can offer it
+# instead of making the user walk the picker to the same place again.
+last_export_dir() {
+  local dir=""
+  [[ -f "$EXPORT_STATE_FILE" ]] || return 1
+  IFS= read -r dir < "$EXPORT_STATE_FILE" || true
+  # Only an absolute path is worth offering: EXPORT_DIR is resolved against the
+  # working directory, which is rarely the one the earlier run was started from.
+  [[ "$dir" == /* ]] || return 1
+  printf '%s\n' "$dir"
+}
+
+remember_export_dir() {
+  [[ "$DRY_RUN" == "1" ]] && return 0
+  local state_dir
+  state_dir="$(dirname -- "$EXPORT_STATE_FILE")"
+  if ! mkdir -p -- "$state_dir" || ! printf '%s\n' "$EXPORT_DIR" > "$EXPORT_STATE_FILE"; then
+    warn "could not record the export directory in $EXPORT_STATE_FILE"
+  fi
+  return 0
+}
+
 choose_export_dir() {
-  local selected
+  local selected remembered
   [[ -n "$EXPORT_DIR" ]] && return
-  [[ -t 0 && -t 1 ]] \
-    || die "no export directory specified; rerun with --output-dir DIR"
+  remembered="$(last_export_dir || true)"
+
+  # --yes means "do not ask me", and a remembered directory is the answer.
+  if [[ -n "$remembered" && "${ASSUME_YES:-0}" == "1" ]]; then
+    EXPORT_DIR="$remembered"
+    log "reusing the last export directory: $remembered"
+    return
+  fi
+
+  # Otherwise a non-interactive run never inherits it: a script that did not
+  # name a destination should not silently write to whichever directory a
+  # person last picked.
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    [[ -z "$remembered" ]] \
+      || die "no export directory specified; rerun with --output-dir DIR (last used: $remembered)"
+    die "no export directory specified; rerun with --output-dir DIR"
+  fi
 
   if have gum && [[ -z "${TUI_NO_GUM:-}" ]]; then
-    selected="$(gum file "$HOME" --directory --file=false \
+    if [[ -n "$remembered" ]] && gum confirm "Export to $remembered again?"; then
+      EXPORT_DIR="$remembered"
+      return
+    fi
+    # gum file needs a directory that exists; a remembered path on an unmounted
+    # drive would otherwise abort the picker instead of starting it at $HOME.
+    selected="$(gum file "$([[ -d "$remembered" ]] && printf '%s' "$remembered" || printf '%s' "$HOME")" \
+      --directory --file=false \
       --header "Select a local directory for exported OpenSnitch rules")" \
       || die "no export directory selected"
+  elif [[ -n "$remembered" ]]; then
+    read -r -p "Local export directory [$remembered] (blank keeps it, Ctrl-C cancels): " selected
+    [[ -n "$selected" ]] || selected="$remembered"
   else
     read -r -p "Local export directory (blank cancels): " selected
   fi
@@ -233,17 +321,29 @@ choose_export_dir
 validate_export_dir
 
 declare -A SEEN=()
+declare -A WRITTEN_BY=()
 for selected in "${CHOSEN[@]}"; do
   [[ -n "${SEEN[$selected]:-}" ]] && continue
   SEEN[$selected]=1
 
   row="$(awk -F '\t' -v file="$selected" '$1 == file { print; exit }' "$CATALOG")"
-  IFS=$'\t' read -r _file name _eligible _summary issues output <<< "$row"
+  IFS=$'\t' read -r _file name action _eligible _summary issues output <<< "$row"
   [[ "$issues" == "-" ]] && issues=""
+
+  # Two rules with the same name would land on the same exported file, so the
+  # second would quietly replace the first. Stop instead of picking a winner.
+  if [[ -n "${WRITTEN_BY[$output]:-}" ]]; then
+    die "$selected and ${WRITTEN_BY[$output]} share the rule name \"$name\" and one export filename: $output"
+  fi
+  WRITTEN_BY[$output]="$selected"
+
   if [[ -n "$issues" && "$ALLOW_MACHINE_SPECIFIC" != "1" ]]; then
     die "$name is machine-specific ($issues); review it and rerun with --allow-machine-specific"
   fi
   [[ -z "$issues" ]] || warn "$name contains machine-specific fields: $issues"
+  if [[ "$action" == "deny" ]]; then
+    warn "$name is a deny rule; it is portable only with the allows it complements — check their precedence and ordering on the target machine"
+  fi
 
   normalized="$WORK_DIR/$output"
   python - "$STAGED/$selected" "$normalized" <<'PY'
@@ -258,4 +358,5 @@ PY
   ok "exported rule ready: $output"
 done
 
+remember_export_dir
 ok "export complete: $EXPORT_DIR"
