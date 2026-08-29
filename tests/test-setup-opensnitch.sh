@@ -308,6 +308,22 @@ for path in sorted(pathlib.Path(sys.argv[1]).glob("*.json")):
     if machine_specific:
         problems.append(f"{path.name}: {sorted(machine_specific)} does not belong in a portable rule")
 
+    # A home path carries a username, so the rule only ever matches on the
+    # machine it was written on. export-opensnitch-rules already refuses these;
+    # the baseline has to refuse them too, or a tool installed under ~/ (mise,
+    # cargo, npm) quietly becomes an unportable "portable" rule.
+    def data_of(operator):
+        if not isinstance(operator, dict):
+            return
+        yield str(operator.get("data", ""))
+        for child in operator.get("list") or []:
+            yield from data_of(child)
+
+    for value in data_of(rule.get("operator")):
+        if "/home/" in value or value.startswith("~/"):
+            problems.append(f"{path.name}: home path {value!r} cannot be portable")
+            break
+
 print("\n".join(problems))
 SHAPE
 )"
