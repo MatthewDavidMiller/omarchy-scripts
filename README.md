@@ -57,6 +57,7 @@ touching the system.
 | `bin/setup-security-hardening` | Enforce a safe package, firewall, kernel, and credential-file baseline | [docs/setup-security-hardening.md](docs/setup-security-hardening.md) |
 | `bin/setup-opensnitch` | Opt-in deny-by-default outbound application firewall | [docs/setup-opensnitch.md](docs/setup-opensnitch.md) |
 | `bin/export-opensnitch-rules` | Export reviewed permanent allows for reuse across machines | [docs/setup-opensnitch.md](docs/setup-opensnitch.md) |
+| `bin/opensnitch-rulectl` | Read, apply, delete and trace OpenSnitch rules without root | [docs/setup-opensnitch.md](docs/setup-opensnitch.md) |
 | `bin/lint` | shellcheck in a container — no host tooling to install | [docs/lint.md](docs/lint.md) |
 
 Container images follow two rules: **reputable sources only** — Docker Official

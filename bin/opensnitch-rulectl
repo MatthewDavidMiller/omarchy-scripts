@@ -1,0 +1,660 @@
+#!/usr/bin/env python
+"""opensnitch-rulectl - read and write opensnitchd rules without root.
+
+opensnitchd runs as root, but it is the gRPC *client* of the pair: it dials out
+to the UI's socket under /run/user/<uid>/opensnitch/ and asks it what to do.
+Rules travel back the same way. The UI never touches /etc/opensnitchd/rules --
+it hands the daemon a Notification and the daemon writes the root-owned file
+itself. That is why clicking "allow, always" in the GUI never asks for a
+password, and it is the mechanism this tool borrows.
+
+Only one process can hold that socket, so this tool stops the GUI, serves the
+socket itself for a few seconds, and starts the GUI again. See
+docs/setup-opensnitch.md for what that window does and does not affect.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib
+import importlib.util
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import types
+from concurrent import futures
+from datetime import datetime
+from queue import Empty, Queue
+from typing import NoReturn
+
+# The daemon retries its UI connection every few seconds, so taking over the
+# socket costs one reconnect interval at each end of the session.
+SUBSCRIBE_TIMEOUT = 90.0
+REPLY_TIMEOUT = 30.0
+UI_STOP_TIMEOUT = 10.0
+
+_PROTO_PKG = "_opensnitch_rulectl_proto"
+
+
+# --- output, matching lib/common.sh -----------------------------------------
+
+_COLOUR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def _paint(code: str, text: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if _COLOUR else text
+
+
+def log(msg: str) -> None:
+    print(f"{_paint('34', '==>')} {msg}")
+
+
+def ok(msg: str) -> None:
+    print(f"{_paint('32', '  ok')} {msg}")
+
+
+def skip(msg: str) -> None:
+    print(f"{_paint('2', 'skip')} {msg}")
+
+
+def warn(msg: str) -> None:
+    print(f"{_paint('33', 'warn')} {msg}", file=sys.stderr)
+
+
+def die(msg: str) -> NoReturn:
+    print(f"{_paint('31', ' err')} {msg}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+# --- protobuf ----------------------------------------------------------------
+
+
+def load_proto():
+    """Import the generated protocol modules the OpenSnitch UI package ships.
+
+    Importing `opensnitch.proto` directly would execute its __init__, which
+    pulls in the Qt GUI stack to pick a protobuf variant. This tool has no GUI
+    and wants no Qt, so the generated modules are loaded under a private
+    package name instead. They only need `grpc` and `google.protobuf`.
+    """
+    try:
+        import grpc  # noqa: F401 - checked here so the error is legible
+    except ImportError:
+        die("python-grpcio is not installed; it ships with the opensnitch package")
+
+    spec = importlib.util.find_spec("opensnitch")
+    if spec is None or not spec.origin:
+        die("the OpenSnitch UI Python package was not found; is opensnitch installed?")
+    proto_dir = pathlib.Path(spec.origin).parent / "proto"
+    if not (proto_dir / "ui_pb2.py").exists():
+        die(f"no generated protocol modules under {proto_dir}")
+
+    package = types.ModuleType(_PROTO_PKG)
+    package.__path__ = [str(proto_dir)]
+    sys.modules[_PROTO_PKG] = package
+    return (
+        importlib.import_module(f"{_PROTO_PKG}.ui_pb2"),
+        importlib.import_module(f"{_PROTO_PKG}.ui_pb2_grpc"),
+    )
+
+
+ui_pb2, ui_pb2_grpc = load_proto()
+
+from google.protobuf.json_format import MessageToDict, ParseDict  # noqa: E402
+
+# Field order the daemon and the repository's own rule files use. Anything the
+# proto knows about but this list does not is appended, so a schema addition
+# shows up rather than being silently dropped.
+FIELD_ORDER = (
+    "action",
+    "created",
+    "description",
+    "duration",
+    "enabled",
+    "name",
+    "nolog",
+    "operator",
+    "precedence",
+)
+
+
+def rule_to_json(rule) -> dict:
+    """Render a Rule proto the way the daemon writes it to disk."""
+    value = MessageToDict(
+        rule,
+        preserving_proto_field_name=True,
+        always_print_fields_with_no_presence=True,
+    )
+    # The proto carries `created` as a unix timestamp; on disk it is RFC 3339.
+    if isinstance(value.get("created"), (int, str)):
+        try:
+            stamp = int(value["created"])
+        except (TypeError, ValueError):
+            stamp = 0
+        value["created"] = (
+            datetime.fromtimestamp(stamp).isoformat(timespec="microseconds") + "Z"
+            if stamp
+            else ""
+        )
+    ordered = {key: value[key] for key in FIELD_ORDER if key in value}
+    ordered.update({k: v for k, v in value.items() if k not in ordered})
+    return ordered
+
+
+def rule_from_json(value: dict, source: str):
+    """Parse an on-disk rule file into a Rule proto."""
+    payload = dict(value)
+    # `updated` is written by the daemon but is not part of the wire schema.
+    payload.pop("updated", None)
+    created = payload.get("created")
+    if isinstance(created, str):
+        text = created.rstrip("Z")
+        stamp = 0
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                stamp = int(datetime.strptime(text, fmt).timestamp())
+                break
+            except ValueError:
+                continue
+        payload["created"] = stamp
+    try:
+        return ParseDict(payload, ui_pb2.Rule(), ignore_unknown_fields=True)
+    except Exception as exc:  # protobuf raises several unrelated types
+        die(f"{source}: not a valid OpenSnitch rule: {exc}")
+
+
+def describe(rule) -> str:
+    """One line summarising what a rule matches, for `list`."""
+
+    def walk(operator):
+        if operator.type == "list":
+            return " and ".join(walk(child) for child in operator.list) or "(empty list)"
+        return f"{operator.operand} {operator.type} {operator.data}"
+
+    return walk(rule.operator)
+
+
+# --- the UI half of the protocol ---------------------------------------------
+
+
+class UIService(ui_pb2_grpc.UIServicer):
+    """Just enough of the UI service for the daemon to talk to us.
+
+    The daemon calls Subscribe once (handing over its whole ruleset), then holds
+    a Notifications stream open. Everything this tool does is either read off
+    that Subscribe or pushed down that stream.
+    """
+
+    def __init__(self, deny_prompts: bool):
+        self.subscribed = threading.Event()
+        self.streaming = threading.Event()
+        self.pinged = threading.Event()
+        self.stats = None
+        self.events: dict = {}
+        self.stopping = threading.Event()
+        self.rules: list = []
+        self.outbox: Queue = Queue()
+        self.prompted: list = []
+        self._deny_prompts = deny_prompts
+        self._lock = threading.Lock()
+        self._replies: dict = {}
+        self._events: dict = {}
+
+    # -- served RPCs --
+
+    def Ping(self, request, context):
+        # Every ping carries the daemon's recent connection history, including
+        # which rule matched each one. That is the only place the pairing of
+        # connection to rule is observable, so it is worth keeping.
+        self.stats = request.stats
+        for event in request.stats.events:
+            self.events.setdefault(event.unixnano, event)
+        self.pinged.set()
+        return ui_pb2.PingReply(id=request.id)
+
+    def Subscribe(self, node_config, context):
+        with self._lock:
+            self.rules = list(node_config.rules)
+        self.subscribed.set()
+        # The real GUI returns the config with DefaultAction rewritten to its
+        # own setting. Echoing it back unchanged is the honest no-op: the
+        # daemon keeps exactly the policy it started with.
+        return node_config
+
+    def Notifications(self, reply_iter, context):
+        threading.Thread(
+            target=self._collect_replies, args=(reply_iter,), daemon=True
+        ).start()
+        self.streaming.set()
+        while not self.stopping.is_set() and context.is_active():
+            try:
+                yield self.outbox.get(timeout=0.2)
+            except Empty:
+                continue
+
+    def AskRule(self, request, context):
+        # A prompt arriving while we hold the socket has no GUI to display it.
+        # Answer with the daemon's own default -- deny, for this connection
+        # only -- so nothing is silently made permanent behind the user's back.
+        self.prompted.append(request)
+        return ui_pb2.Rule(
+            name="rulectl-deny-once",
+            enabled=True,
+            action="deny" if self._deny_prompts else "allow",
+            duration="once",
+            operator=ui_pb2.Operator(
+                type="simple", operand="process.path", data=request.process_path
+            ),
+        )
+
+    def PostAlert(self, alert, context):
+        return ui_pb2.MsgResponse(id=alert.id)
+
+    # -- notification plumbing --
+
+    def _collect_replies(self, reply_iter) -> None:
+        try:
+            for reply in reply_iter:
+                with self._lock:
+                    self._replies[reply.id] = reply
+                    event = self._events.get(reply.id)
+                if event is not None:
+                    event.set()
+        except Exception:
+            # The stream ends when the daemon disconnects or we shut down;
+            # a pending send reports the timeout, which is the useful error.
+            pass
+
+    def notify(self, notification, timeout: float = REPLY_TIMEOUT):
+        """Send one notification and wait for the daemon to acknowledge it."""
+        # Same id scheme the GUI uses: the current time with the dot removed.
+        notification.id = int(str(time.time()).replace(".", ""))
+        event = threading.Event()
+        with self._lock:
+            self._events[notification.id] = event
+        self.outbox.put(notification)
+        if not event.wait(timeout):
+            die("the daemon did not acknowledge the change within %.0fs" % timeout)
+        with self._lock:
+            reply = self._replies[notification.id]
+        if reply.code != ui_pb2.OK:
+            die(f"the daemon rejected the change: {reply.data or 'no reason given'}")
+        return reply
+
+
+# --- owning the socket --------------------------------------------------------
+
+
+def pgrep_ui() -> list[str]:
+    result = subprocess.run(
+        ["pgrep", "-u", str(os.getuid()), "-x", "opensnitch-ui"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.stdout.split()
+
+
+class SocketSession:
+    """Stop the GUI, serve its socket, then put the GUI back."""
+
+    def __init__(self, socket_path: pathlib.Path, launcher: str, deny_prompts: bool):
+        self.socket_path = socket_path
+        self.launcher = launcher
+        self.service = UIService(deny_prompts)
+        self._server = None
+        self._ui_was_running = False
+
+    def __enter__(self) -> UIService:
+        self._stop_ui()
+        self._serve()
+        self._await_daemon()
+        return self.service
+
+    def __exit__(self, *_exc) -> None:
+        self.service.stopping.set()
+        if self._server is not None:
+            self._server.stop(2).wait(5)
+        if self.socket_path.is_socket():
+            self.socket_path.unlink(missing_ok=True)
+        self._start_ui()
+
+    # -- steps --
+
+    def _stop_ui(self) -> None:
+        pids = pgrep_ui()
+        if not pids:
+            skip("no OpenSnitch UI running")
+            return
+        self._ui_was_running = True
+        log(f"Stopping the OpenSnitch UI (pid {', '.join(pids)})")
+        subprocess.run(
+            ["pkill", "-TERM", "-u", str(os.getuid()), "-x", "opensnitch-ui"],
+            check=False,
+        )
+        deadline = time.monotonic() + UI_STOP_TIMEOUT
+        while time.monotonic() < deadline:
+            if not pgrep_ui():
+                ok("UI stopped; its socket is ours for the moment")
+                return
+            time.sleep(0.2)
+        die("the OpenSnitch UI did not stop; close it and rerun")
+
+    def _serve(self) -> None:
+        import grpc
+
+        self.socket_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # A live UI would still own this; we only get here once it is gone.
+        if self.socket_path.exists():
+            self.socket_path.unlink()
+        server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
+        ui_pb2_grpc.add_UIServicer_to_server(self.service, server)
+        previous_umask = os.umask(0o077)
+        try:
+            if server.add_insecure_port(f"unix://{self.socket_path}") == 0:
+                die(f"could not bind {self.socket_path}")
+        finally:
+            os.umask(previous_umask)
+        server.start()
+        self._server = server
+
+    def _await_daemon(self) -> None:
+        log("Waiting for opensnitchd to reconnect")
+        if not self.service.subscribed.wait(SUBSCRIBE_TIMEOUT):
+            die(
+                "opensnitchd did not connect within %.0fs; is opensnitchd.service running?"
+                % SUBSCRIBE_TIMEOUT
+            )
+        # Subscribe lands first, the notification stream a moment later.
+        if not self.service.streaming.wait(15):
+            die("opensnitchd subscribed but never opened its notification stream")
+        ok(f"opensnitchd connected with {len(self.service.rules)} rules")
+
+    def _start_ui(self) -> None:
+        if not self._ui_was_running:
+            return
+        log("Restarting the OpenSnitch UI")
+        command = [self.launcher]
+        if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") and shutil.which("uwsm-app"):
+            command = ["uwsm-app", "--", self.launcher]
+        try:
+            subprocess.Popen(
+                command,
+                start_new_session=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as exc:
+            die(f"could not restart the UI ({self.launcher}): {exc}")
+        deadline = time.monotonic() + UI_STOP_TIMEOUT
+        while time.monotonic() < deadline:
+            if pgrep_ui():
+                ok("UI is back; the daemon will reconnect to it within a few seconds")
+                return
+            time.sleep(0.2)
+        warn(f"the UI did not come back; start it yourself with {self.launcher}")
+
+
+# --- commands -----------------------------------------------------------------
+
+
+def select(rules: list, names: list[str]) -> list:
+    if not names:
+        return list(rules)
+    by_name = {rule.name: rule for rule in rules}
+    missing = [name for name in names if name not in by_name]
+    if missing:
+        die("no such rule: " + ", ".join(missing))
+    return [by_name[name] for name in names]
+
+
+def cmd_list(service: UIService, args) -> None:
+    rules = sorted(service.rules, key=lambda rule: rule.name)
+    if not rules:
+        warn("the daemon has no rules loaded")
+        return
+    width = max(len(rule.name) for rule in rules)
+    for rule in rules:
+        state = "" if rule.enabled else " [disabled]"
+        flag = " [precedence]" if rule.precedence else ""
+        print(
+            f"{rule.name:<{width}}  {rule.action:<5} {rule.duration:<6}"
+            f"{state}{flag}  {describe(rule)}"
+        )
+
+
+def cmd_show(service: UIService, args) -> None:
+    rules = select(service.rules, args.names)
+    if args.output_dir:
+        target = pathlib.Path(args.output_dir).expanduser()
+        target.mkdir(parents=True, exist_ok=True)
+        for rule in rules:
+            path = target / f"{rule.name}.json"
+            path.write_text(json.dumps(rule_to_json(rule), indent=2) + "\n")
+            ok(f"wrote {path}")
+        return
+    payload = [rule_to_json(rule) for rule in rules]
+    print(json.dumps(payload[0] if len(payload) == 1 else payload, indent=2))
+
+
+def cmd_apply(service: UIService, args) -> None:
+    rules = [read_rule_file(path) for path in args.files]
+    installed = {rule.name for rule in service.rules}
+    for rule in rules:
+        verb = "replacing" if rule.name in installed else "installing"
+        log(f"{verb} {rule.name}")
+    service.notify(ui_pb2.Notification(type=ui_pb2.CHANGE_RULE, rules=rules))
+    for rule in rules:
+        ok(f"{rule.name} is live")
+
+
+def cmd_delete(service: UIService, args) -> None:
+    rules = select(service.rules, args.names)
+    for rule in rules:
+        service.notify(ui_pb2.Notification(type=ui_pb2.DELETE_RULE, rules=[rule]))
+        ok(f"deleted {rule.name}")
+
+
+def format_connection(connection) -> list[str]:
+    """Render a connection the way the rule engine sees it."""
+    out = [f"  process.path     {connection.process_path}"]
+    # This join is what a process.command operand is matched against, so what
+    # prints here is what a regexp has to fit -- no more, no less. For an
+    # Electron app the argv[0] of the process that actually opens the socket is
+    # the literal string /proc/self/exe, not the interpreter's path.
+    out.append(f"  process.command  {' '.join(connection.process_args)}")
+    out.append(f"  pid/uid          {connection.process_id}/{connection.user_id}")
+    if connection.process_tree:
+        chain = " <- ".join(f"{n.key}[{n.value}]" for n in connection.process_tree)
+        out.append(f"  parents          {chain}")
+    return out
+
+
+def cmd_watch(service: UIService, args) -> None:
+    answer = "allow" if args.allow_prompts else "deny"
+    log(
+        f"Watching for {args.seconds:.0f}s. Exercise the application now. "
+        f"Anything with no matching rule is answered {answer}-once and not saved."
+    )
+    deadline = time.monotonic() + args.seconds
+    while time.monotonic() < deadline:
+        time.sleep(0.5)
+
+    stats = service.stats
+    if stats is not None:
+        print(
+            f"\n     daemon totals since start: {stats.connections} connections, "
+            f"{stats.accepted} accepted, {stats.dropped} dropped, "
+            f"{stats.rule_hits} rule hits, {stats.rule_misses} misses"
+        )
+
+    # The daemon only buffers connection events while a UI is attached, so this
+    # is everything it decided during the window above -- not a history.
+    events = sorted(service.events.values(), key=lambda e: e.unixnano)
+    if args.filter:
+        needle = args.filter.lower()
+        events = [
+            event
+            for event in events
+            if needle in event.connection.process_path.lower()
+            or needle in " ".join(event.connection.process_args).lower()
+            or needle in event.connection.dst_host.lower()
+            or needle in event.rule.name.lower()
+        ]
+    if events:
+        print()
+        ok(f"{len(events)} connection(s) decided during the window")
+        for event in events[-args.count :]:
+            connection = event.connection
+            destination = connection.dst_host or connection.dst_ip
+            verdict = event.rule.action or "default"
+            colour = "32" if verdict == "allow" else "31"
+            print(
+                f"\n{event.time}  {_paint(colour, verdict.upper())}"
+                f"  {destination}:{connection.dst_port}"
+            )
+            print(f"  matched rule     {event.rule.name or '(daemon default action)'}")
+            for line in format_connection(connection):
+                print(line)
+    else:
+        skip("the daemon decided no connections during the window")
+
+    if service.prompted:
+        print()
+        warn(f"{len(service.prompted)} connection(s) matched no rule at all:")
+        for request in service.prompted:
+            destination = request.dst_host or request.dst_ip
+            print(f"\n  {request.protocol} {destination}:{request.dst_port}")
+            for line in format_connection(request):
+                print(line)
+
+
+def read_rule_file(path: str):
+    source = pathlib.Path(path)
+    try:
+        value = json.loads(source.read_text())
+    except FileNotFoundError:
+        die(f"no such file: {source}")
+    except json.JSONDecodeError as exc:
+        die(f"{source}: not valid JSON: {exc}")
+    if not isinstance(value, dict):
+        die(f"{source}: expected one rule object, got {type(value).__name__}")
+    rule = rule_from_json(value, str(source))
+    if not rule.name:
+        die(f"{source}: the rule has no name")
+    # The daemon names the file after the rule, so a mismatch here means the
+    # file you edited is not the file that ends up installed.
+    if source.stem != rule.name:
+        warn(f"{source.name} will be installed as {rule.name}.json")
+    return rule
+
+
+# --- entry point ---------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="opensnitch-rulectl",
+        description=(
+            "Read and write opensnitchd rules over the UI socket, without sudo. "
+            "Briefly stops the OpenSnitch GUI; see docs/setup-opensnitch.md."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Environment:\n"
+            "  OPEN_SNITCH_UI_SOCKET    UI socket path.\n"
+            "  OPEN_SNITCH_UI_LAUNCHER  Command used to start the GUI again.\n"
+        ),
+    )
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    parser.add_argument(
+        "--socket",
+        default=os.environ.get(
+            "OPEN_SNITCH_UI_SOCKET", f"{runtime}/opensnitch/osui.sock"
+        ),
+    )
+    parser.add_argument(
+        "--launcher",
+        default=os.environ.get(
+            "OPEN_SNITCH_UI_LAUNCHER",
+            os.path.expanduser("~/.local/bin/opensnitch-ui-secure"),
+        ),
+    )
+    parser.add_argument(
+        "--allow-prompts",
+        action="store_true",
+        help="answer prompts arriving during the window with allow-once "
+        "instead of deny-once (nothing is made permanent either way)",
+    )
+    parser.add_argument("-n", "--dry-run", action="store_true")
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    listing = subparsers.add_parser("list", help="list the rules the daemon has loaded")
+    listing.set_defaults(handler=cmd_list)
+
+    show = subparsers.add_parser("show", help="print rules as on-disk JSON")
+    show.add_argument("names", nargs="*", metavar="NAME")
+    show.add_argument("-o", "--output-dir", help="write one <name>.json per rule here")
+    show.set_defaults(handler=cmd_show)
+
+    apply_ = subparsers.add_parser("apply", help="install or replace rules from files")
+    apply_.add_argument("files", nargs="+", metavar="FILE")
+    apply_.set_defaults(handler=cmd_apply)
+
+    delete = subparsers.add_parser("delete", help="delete rules by name")
+    delete.add_argument("names", nargs="+", metavar="NAME")
+    delete.set_defaults(handler=cmd_delete)
+
+    watch = subparsers.add_parser(
+        "watch",
+        help="hold the socket and report what the daemon decides, and why",
+    )
+    watch.add_argument(
+        "-s", "--seconds", type=float, default=60.0, help="how long to watch"
+    )
+    watch.add_argument("-c", "--count", type=int, default=40, help="how many to show")
+    watch.add_argument("-f", "--filter", help="only show entries mentioning this text")
+    watch.set_defaults(handler=cmd_watch)
+
+    return parser
+
+
+def main() -> None:
+    if os.getuid() == 0:
+        die("Run this as your normal user, not root. That is the whole point.")
+    args = build_parser().parse_args()
+
+    if args.dry_run:
+        # Dry run deliberately never touches the socket: taking the GUI down is
+        # itself a change, and a --dry-run that does it would be lying.
+        if args.command == "apply":
+            for path in args.files:
+                rule = read_rule_file(path)
+                print(f"  dry would install {rule.name} ({rule.action}/{rule.duration})")
+        elif args.command == "delete":
+            for name in args.names:
+                print(f"  dry would delete {name}")
+        else:
+            print(f"  dry would read the daemon's rules ({args.command})")
+        return
+
+    socket_path = pathlib.Path(args.socket)
+    with SocketSession(socket_path, args.launcher, not args.allow_prompts) as service:
+        args.handler(service, args)
+        if service.prompted and args.command != "watch":
+            paths = sorted({request.process_path for request in service.prompted})
+            warn(
+                "connection prompts arrived while the GUI was down and were "
+                "answered once-only: " + ", ".join(paths)
+            )
+
+
+if __name__ == "__main__":
+    main()

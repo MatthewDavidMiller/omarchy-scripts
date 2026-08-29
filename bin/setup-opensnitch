@@ -146,13 +146,24 @@ with open(destination, "w", encoding="utf-8") as handle:
 PY
 }
 
+# default_duration is a *combo box index*, not a duration. OpenSnitch 1.7.2
+# maps it in dialogs/prompt/_utils.py:get_duration(): 0 once, 1 30s, 2 5m,
+# 3 15m, 4 30m, 5 1h, 6 12h, 7 until restart, anything else always. Index 7 is
+# what we want. Upstream's own Config.DEFAULT_DURATION_IDX is 6 with the
+# comment "until restart", which is wrong, and following it left this machine
+# turning every unanswered prompt into a twelve-hour rule. Twelve hours is long
+# enough for a timed-out deny to outlive the session that caused it and shadow
+# a permanent allow, which is exactly how the Bitwarden rule appeared broken.
+# Re-check this mapping against the installed package before changing it.
+GUI_DURATION_UNTIL_RESTART=7
+
 render_gui_settings() {
   local output="$1" input="$GUI_SETTINGS"
   [[ -f "$input" ]] || input=/dev/null
-  awk -v socket="$SOCKET_ADDRESS" '
+  awk -v socket="$SOCKET_ADDRESS" -v duration_idx="$GUI_DURATION_UNTIL_RESTART" '
     function emit_missing() {
       if (!action) print "default_action=0"
-      if (!duration) print "default_duration=6"
+      if (!duration) print "default_duration=" duration_idx
       if (!address) print "server_address=" socket
     }
     /^\[.*\]$/ {
@@ -162,7 +173,7 @@ render_gui_settings() {
       print; next
     }
     global && /^default_action=/   { print "default_action=0"; action=1; next }
-    global && /^default_duration=/ { print "default_duration=6"; duration=1; next }
+    global && /^default_duration=/ { print "default_duration=" duration_idx; duration=1; next }
     global && /^server_address=/   { print "server_address=" socket; address=1; next }
     { print }
     END {
@@ -171,7 +182,7 @@ render_gui_settings() {
         if (NR) print ""
         print "[global]"
         print "default_action=0"
-        print "default_duration=6"
+        print "default_duration=" duration_idx
         print "server_address=" socket
       }
     }

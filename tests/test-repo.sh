@@ -27,7 +27,7 @@ for path in \
   bin/setup-all bin/setup-ssh-agent bin/setup-no-idle bin/setup-brave bin/setup-rpi-imager \
   bin/setup-no-localsend bin/setup-no-background-network bin/setup-cat-background bin/setup-rootless-podman \
   bin/setup-security-hardening \
-  bin/setup-opensnitch bin/export-opensnitch-rules \
+  bin/setup-opensnitch bin/export-opensnitch-rules bin/opensnitch-rulectl \
   config/opensnitch/rules/omarchy-shared-000-allow-localhost-ipv4.json \
   config/opensnitch/rules/omarchy-shared-001-allow-localhost-ipv6.json \
   config/opensnitch/rules/omarchy-shared-010-allow-systemd-resolved.json \
@@ -51,7 +51,7 @@ for path in \
   docs/setup-security-hardening.md tests/test-setup-security-hardening.sh \
   docs/setup-opensnitch.md tests/test-setup-opensnitch.sh \
   docs/setup-no-background-network.md tests/test-setup-no-background-network.sh \
-  tests/test-export-opensnitch-rules.sh
+  tests/test-export-opensnitch-rules.sh tests/test-opensnitch-rulectl.sh
 do
   it "keeps $path tracked"
   if ignored "$path"; then fail "$path must not be ignored"; else pass; fi

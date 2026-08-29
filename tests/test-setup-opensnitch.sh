@@ -129,7 +129,7 @@ it "uses the private per-user UI socket in daemon and GUI settings"
 assert_contains "$(cat "$ROOT_FIXTURE/etc/opensnitchd/default-config.json" "$HOME_FIXTURE/.config/opensnitch/settings.conf")" "$HOME_FIXTURE/run/opensnitch/osui.sock"
 
 it "keeps GUI prompts deny-by-default with temporary decisions"
-assert_contains "$(cat "$HOME_FIXTURE/.config/opensnitch/settings.conf")" $'default_action=0\ndefault_duration=6'
+assert_contains "$(cat "$HOME_FIXTURE/.config/opensnitch/settings.conf")" $'default_action=0\ndefault_duration=7'
 
 it "adds the Omarchy-native GUI autostart entry"
 assert_file_contains "$HOME_FIXTURE/.config/hypr/autostart.lua" 'o.launch_on_start("opensnitch-ui-secure")'

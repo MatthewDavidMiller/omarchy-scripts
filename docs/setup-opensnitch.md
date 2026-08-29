@@ -37,7 +37,12 @@ The daemon is configured with:
 
 The UI also defaults to deny. New answers last only until restart unless you
 deliberately choose `always`; this prevents one troubleshooting click from
-becoming an unnoticed permanent permission. OpenSnitch documents how the GUI
+becoming an unnoticed permanent permission. That setting is stored as a combo
+box *index*, not a duration — `default_duration=7` is "until restart", and
+index `6`, which upstream's own `DEFAULT_DURATION_IDX` labels "until restart",
+is really `12h`. The distinction matters more than it looks: the prompt also
+has a 30 second timeout that applies the default action unattended, so with
+index 6 every prompt nobody was there to answer became a twelve-hour rule. OpenSnitch documents how the GUI
 policy temporarily overrides the daemon policy while connected in its
 [configuration guide](https://github.com/evilsocket/opensnitch/wiki/Configurations).
 
@@ -134,11 +139,11 @@ Three habits matter more than the numbering:
   updates, and the first symptom is an agent that has lost the network in the
   middle of a session. Use a `regexp` on `process.path`, for example
   `^/home/<user>/\.local/share/mise/installs/claude/[^/]+/claude$`.
-- **Do not grant a shared runtime.** `/usr/lib/electron39/electron` is not
-  Bitwarden; it is every Electron 39 application installed. Identify the
-  application by `process.command`, which carries the app path
-  (`/usr/lib/bitwarden/app.asar`, `/usr/share/cursor/`) that the interpreter
-  path does not.
+- **Do not grant a shared runtime, and do not identify it by app path alone.**
+  `/usr/lib/electron39/electron` is not Bitwarden; it is every Electron 39
+  application installed. The obvious narrowing — match `process.command` for
+  `/usr/lib/bitwarden/app.asar` — installs cleanly, reads correctly, and never
+  fires. See [Why an Electron rule silently misses](#why-an-electron-rule-silently-misses).
 - **Write a description.** The GUI leaves it empty. A year later the only thing
   that distinguishes a deliberate exception from a panicked click is the
   sentence explaining why the destination is as wide as it is.
@@ -166,6 +171,139 @@ watching:
   `arch-audit.timer`, which fires overnight. A vulnerability scanner that has
   quietly stopped scanning is worse than no scanner at all.
 
+### Why an Electron rule silently misses
+
+An Electron application does not open its own sockets. The process you launch
+is the browser process; all networking is handed to a child utility process,
+and that child is what OpenSnitch sees. On this machine Bitwarden's two
+processes look like this:
+
+```
+main     /usr/lib/electron39/electron /usr/lib/bitwarden/app.asar
+network  /proc/self/exe --type=utility --utility-sub-type=network.mojom.NetworkService \
+         --user-data-dir=/home/matthew/.config/Bitwarden ...
+```
+
+Three things follow, and each one breaks an obvious-looking rule:
+
+- **The app path is not on the connecting process.** `app.asar` appears only on
+  the main process. A `process.command` rule that requires it matches the one
+  process that barely touches the network and misses every TLS connection.
+- **`argv[0]` is the literal string `/proc/self/exe`.** Chromium re-executes
+  itself through `/proc/self/exe`, so a pattern anchored with
+  `^/usr/lib/electron[0-9]+/electron ` cannot match the child either. The
+  OpenSnitch GUI knows about this case — it refuses to trust `process.command`
+  when `argv[0]` starts with `/proc` and silently adds a `process.path` clause.
+- **`process.path` is the shared interpreter.** It resolves through
+  `/proc/<pid>/exe` to `/usr/lib/electron39/electron` for the child as well as
+  the parent, so on its own it would grant every Electron 39 application the
+  same access.
+
+What *is* both present on the connecting process and specific to the
+application is `--user-data-dir`. So an Electron rule needs `process.path` to
+pin the interpreter and a `process.command` alternation to pin the application:
+
+```
+process.path     regexp  ^/usr/lib/electron[0-9]+/electron$
+process.command  regexp  (^|\s)/usr/lib/bitwarden/app\.asar(\s|$)|(^|\s)--user-data-dir=/home/matthew/\.config/Bitwarden(\s|$)
+dest.host        simple  vaultwarden.internal.mdmiller.dev
+dest.port        simple  443
+```
+
+The first alternative covers the main process, the second the network child.
+The trailing `(\s|$)` is not decoration: without it `--user-data-dir=.../Cursor`
+also matches a hypothetical `.../CursorEvil`.
+
+Read that rule back and the capitals are gone — the daemon stores
+`.../bitwarden`. That is not corruption. An operator with `sensitive: false`,
+which is the default and what the GUI writes, is case-insensitive, and
+OpenSnitch implements it by lowercasing the pattern when it loads the rule and
+the value before matching. Verified here with a rule whose `process.command`
+pattern was `MiXeDcAsEpRoBe`: it matched a command line carrying exactly that
+mixed-case argument three times out of three, and a command line without it was
+denied. So write the path with its real capitalisation for the next reader, and
+do not be alarmed when it comes back lowercased. Set `sensitive: true` only if
+you actually need case to be significant.
+
+This is why the rule is machine-local rather than part of the portable
+baseline — `--user-data-dir` contains a home path, which is exactly what
+`export-opensnitch-rules` refuses to treat as portable.
+
+Do not guess at any of this. `opensnitch-rulectl watch` prints the command line
+the rule engine actually matches against, which is how the shape above was
+established.
+
+### Precedence is not optional for a curated allow
+
+When two enabled rules match the same connection, a `deny` beats an `allow` of
+equal precedence. Verified on this machine with two throwaway rules matching
+the same `curl` connection: with both at `precedence: false` the connection was
+denied twelve times out of twelve; setting `precedence: true` on the allow
+flipped it to allowed ten times out of ten.
+
+That turns the prompt timeout into a policy bug. A prompt nobody answers
+applies the default action — deny — and saves it as a temporary rule. From
+that moment a permanent, deliberate, non-precedence `allow` is dead until the
+temporary rule expires, and nothing in the UI shows the allow as inactive. This
+machine collected a `deny-12h-simple-usr-lib-electron39-electron` that way more
+than once.
+
+So every curated `allow` in `000`–`170` carries `precedence: true`. The one
+rule that deliberately does not is `190-deny-avahi-non-mdns`: it must lose to
+`030`/`031`, and it does, for the same reason.
+
+A `deny` you actually want still works — it just has to be the highest
+precedence thing that matches, or the only thing that matches.
+
+### Managing rules without root
+
+`opensnitchd` runs as root and owns `/etc/opensnitchd/rules`, but it is the
+gRPC *client* of the pair. The UI is the server: it listens on
+`/run/user/<uid>/opensnitch/osui.sock`, and the daemon dials out to it and asks
+what to do. Rules travel back down that connection. The UI never writes to
+`/etc` — it sends a `CHANGE_RULE` or `DELETE_RULE` notification and the daemon
+writes the root-owned file itself. That is why clicking "allow, always" in the
+GUI has never asked for a password.
+
+`bin/opensnitch-rulectl` borrows the same channel, so nothing in the rule
+workflow needs `sudo`:
+
+```bash
+./bin/opensnitch-rulectl list                     # what the daemon has loaded
+./bin/opensnitch-rulectl show -o ~/rules-backup   # every rule as on-disk JSON
+./bin/opensnitch-rulectl apply rule.json          # install or replace
+./bin/opensnitch-rulectl delete <rule-name>       # remove
+./bin/opensnitch-rulectl watch -s 60              # what the daemon decides, and why
+```
+
+`show` is also the answer to reading rules at all: the daemon writes GUI-created
+rules `0600 root:root`, so `cat` cannot read them either. The daemon hands its
+entire ruleset to whatever UI subscribes, which is where `list` and `show` get
+their data.
+
+Only one process can hold the socket, so the tool stops the GUI, serves the
+socket itself, and starts the GUI again — roughly ninety seconds, most of it
+waiting for the daemon's reconnect backoff. During that window:
+
+- **Enforcement continues.** Rules are evaluated by the daemon, not the UI, so
+  every permanent rule keeps working and the session keeps its network.
+- **Prompts have nowhere to go.** A connection matching no rule is answered
+  `deny` for that one connection and not saved, so the window cannot leave a
+  permanent decision behind. `--allow-prompts` inverts the answer; it is still
+  once-only. Either way `watch` reports what asked.
+- **`--dry-run` does not take the socket at all**, because stopping the GUI is
+  itself a change.
+
+This adds no privilege. Anything that can run as your user can already bind
+that socket when the GUI is not running and answer prompts however it likes —
+that is inherent to OpenSnitch's design, and it is why the socket lives in a
+`0700` directory under `/run/user/<uid>` rather than in `/tmp`. The tool makes
+the existing trust boundary usable; it does not move it.
+
+The one thing this cannot do is edit `/etc/opensnitchd/default-config.json`,
+which is a genuine root file with no UI-side equivalent. `setup-opensnitch`
+still uses `sudo` for that single write.
+
 ### Replacing a rule without losing connectivity
 
 Replacing the allow that the current session depends on is the one edit that
@@ -192,8 +330,12 @@ from a session that does not depend on it.
 
 ## Sharing learned rules
 
-After using the UI to create an enabled `allow` rule with duration `always`,
-export selected rules to a local directory outside this project:
+`opensnitch-rulectl show -o DIR` dumps every rule as JSON with no filtering and
+no root, which is the right tool for a backup. `export-opensnitch-rules` is the
+curated path: it selects rules, normalizes them, and refuses the ones that
+cannot be portable. After using the UI to create an enabled `allow` rule with
+duration `always`, export selected rules to a local directory outside this
+project:
 
 ```bash
 ./bin/export-opensnitch-rules
@@ -233,12 +375,21 @@ GUI-created file outside that namespace is ever pruned.
 systemctl status opensnitchd.service
 grep -E 'DefaultAction|ProcMonitorMethod|Firewall' /etc/opensnitchd/default-config.json
 ls -l /run/user/"$(id -u)"/opensnitch/osui.sock
+./bin/opensnitch-rulectl list
 sudo nft list ruleset | grep -i opensnitch
 ```
 
-If an application is unexpectedly blocked, inspect the OpenSnitch Events view
-and grant the narrowest temporary rule first. Promote it to `always` only after
-the application works and the match fields are understood.
+If an application is unexpectedly blocked, grant the narrowest temporary rule
+first, and promote it to `always` only after the application works and the
+match fields are understood. Find the match fields with
+
+```bash
+./bin/opensnitch-rulectl watch -s 60 -f bitwarden
+```
+
+rather than from the application's launcher or its `ps` output. What a rule
+matches is the connecting process, which for anything Chromium-based is not the
+process you started.
 
 ### A rule can be active and still be missing from the UI
 
@@ -252,13 +403,17 @@ by hand, is enforced at once and invisible until the UI reconnects.
 The UI is therefore not the place to check whether a rule is live. These are:
 
 ```bash
-ls /etc/opensnitchd/rules/
+./bin/opensnitch-rulectl list
 grep -a 'Ruleset changed due to' /var/log/opensnitchd.log | tail
 ```
 
-Together they say the file is installed and that the daemon accepted it. The
-third check is the one that actually matters: exercise the traffic and see it
-work.
+The first is authoritative: it asks the daemon for the ruleset it is actually
+enforcing, rather than reading files the daemon may not have loaded. The second
+says the daemon accepted a change. Neither needs root, and `ls
+/etc/opensnitchd/rules/` is a poor substitute for either — it shows filenames,
+and GUI-created rules are `0600 root:root` so their contents are unreadable
+without `sudo`. The third check is the one that actually matters: exercise the
+traffic and see it work.
 
 To refresh the UI's view, restart it — the launcher this setup installs is
 enough, and it reconnects on its own:

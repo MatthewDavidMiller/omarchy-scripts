@@ -1,7 +1,15 @@
 # Conventions
 
-Rules every script in `bin/` follows. They exist so a script can be re-run on a
-half-configured machine without fear.
+Rules every `setup-*` script in `bin/` follows. They exist so a script can be
+re-run on a half-configured machine without fear.
+
+`bin/` also holds a few commands that are not setup scripts — `lint`,
+`export-opensnitch-rules`, `opensnitch-rulectl`. They keep the `--help`,
+`--dry-run` and never-run-as-root habits below, and skip the rest: there is no
+`order` header, `setup-all` does not discover them, and they are not required
+to be idempotent because they do not configure anything. One of them is Python,
+because it speaks gRPC; see [lint.md](lint.md#what-gets-linted) for what that
+means for linting.
 
 ## Shape
 
