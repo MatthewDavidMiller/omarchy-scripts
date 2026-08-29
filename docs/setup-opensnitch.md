@@ -71,17 +71,21 @@ site domain would defeat the purpose of a manageable policy.
 ## Sharing learned rules
 
 After using the UI to create an enabled `allow` rule with duration `always`,
-export selected rules into this repository:
+export selected rules to a local directory outside this project:
 
 ```bash
 ./bin/export-opensnitch-rules
 ./bin/export-opensnitch-rules allow-firefox
 ./bin/export-opensnitch-rules browser-rule.json
+./bin/export-opensnitch-rules --output-dir "$HOME/Documents/opensnitch-rules" allow-firefox
 ./bin/export-opensnitch-rules --dry-run allow-firefox
 ```
 
-The bare command opens a multiselect. Arguments must match an internal rule
-name or filename exactly. Exported JSON is normalized and gets a stable
+The bare command opens a rule multiselect followed by a local directory picker.
+When rules are supplied as arguments, the directory picker still opens unless
+`--output-dir` or `OPEN_SNITCH_EXPORT_DIR` is set. Project directories are
+rejected as export destinations. Arguments must match an internal rule name or
+filename exactly. Exported JSON is normalized and gets a stable
 `omarchy-shared-<slug>-<hash>.json` filename, so exporting it again is a no-op.
 
 Rules containing a numeric UID, a home-directory path, a process hash, an
@@ -89,17 +93,17 @@ exact command line, an interface, or a private/link-local address are rejected
 as non-portable. After reviewing the JSON, an intentional exception can be
 exported with `--allow-machine-specific`.
 
-On the next setup run, shared rules are added or updated. A same-named local
-rule is backed up and replaced to avoid duplicate evaluation. A deleted shared
-file prunes the installed file with the `omarchy-shared-` prefix, also after a
-backup. No GUI-created file outside that namespace is ever pruned.
+To import an exported collection on another machine, point setup at its local
+directory:
 
-Review and commit the exported JSON before using it on another machine:
-
-```bash
-git diff -- config/opensnitch/rules
-./bin/setup-opensnitch
+```console
+OPEN_SNITCH_SHARED_RULES_DIR="$HOME/Documents/opensnitch-rules" ./bin/setup-opensnitch
 ```
+
+Imported shared rules are added or updated. A same-named local rule is backed
+up and replaced to avoid duplicate evaluation. A deleted shared file prunes the
+installed file with the `omarchy-shared-` prefix, also after a backup. No
+GUI-created file outside that namespace is ever pruned.
 
 ## Verification and recovery
 

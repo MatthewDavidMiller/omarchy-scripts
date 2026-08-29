@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# export-opensnitch-rules — copy selected durable allows into this repository.
+# export-opensnitch-rules — copy selected durable allows to a local directory.
 #
 set -euo pipefail
 
@@ -10,7 +10,7 @@ REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 source "$REPO_ROOT/lib/common.sh"
 
 RULES_DIR="${OPEN_SNITCH_RULES_DIR:-/etc/opensnitchd/rules}"
-EXPORT_DIR="${OPEN_SNITCH_SHARED_RULES_DIR:-$REPO_ROOT/config/opensnitch/rules}"
+EXPORT_DIR="${OPEN_SNITCH_EXPORT_DIR:-}"
 ALLOW_MACHINE_SPECIFIC=0
 WORK_DIR=""
 SELECTORS=()
@@ -20,11 +20,12 @@ usage() {
 Usage: export-opensnitch-rules [options] [RULE ...]
 
 Exports selected enabled, permanent allow rules from /etc/opensnitchd/rules
-to config/opensnitch/rules. With no RULE arguments, opens an interactive
-multiselect. RULE may be an exact OpenSnitch rule name or source filename.
+to a local directory chosen by the user. With no RULE arguments, opens an
+interactive multiselect. RULE may be an exact rule name or source filename.
 
 Options:
-  -n, --dry-run                 Preview without writing project files.
+  -n, --dry-run                 Preview without writing exported files.
+  -o, --output-dir DIR          Export to DIR instead of choosing interactively.
   -y, --yes                     Accepted for scripting compatibility.
       --allow-machine-specific  Permit rules tied to a UID, home path,
                                 process hash/command, interface, or local IP.
@@ -32,13 +33,19 @@ Options:
 
 Environment (primarily for tests):
   OPEN_SNITCH_RULES_DIR         Installed rules directory.
-  OPEN_SNITCH_SHARED_RULES_DIR  Project export directory.
+  OPEN_SNITCH_EXPORT_DIR        Export directory (skips directory selection).
 USAGE
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -n|--dry-run) DRY_RUN=1 ;;
+    -o|--output-dir)
+      [[ $# -ge 2 ]] || die "$1 requires a directory"
+      EXPORT_DIR="$2"
+      shift
+      ;;
+    --output-dir=*) EXPORT_DIR="${1#*=}" ;;
     -y|--yes)     ASSUME_YES=1 ;;
     --allow-machine-specific) ALLOW_MACHINE_SPECIFIC=1 ;;
     -h|--help)    usage; exit 0 ;;
@@ -50,7 +57,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 require_not_root
-require_cmd cp find install mktemp python sudo
+require_cmd cp find install mktemp python realpath sudo
 [[ -d "$RULES_DIR" ]] || die "OpenSnitch rules directory not found: $RULES_DIR"
 
 cleanup() {
@@ -184,11 +191,46 @@ resolve_selectors() {
   done
 }
 
+choose_export_dir() {
+  local selected
+  [[ -n "$EXPORT_DIR" ]] && return
+  [[ -t 0 && -t 1 ]] \
+    || die "no export directory specified; rerun with --output-dir DIR"
+
+  if have gum && [[ -z "${TUI_NO_GUM:-}" ]]; then
+    selected="$(gum file "$HOME" --directory --file=false \
+      --header "Select a local directory for exported OpenSnitch rules")" \
+      || die "no export directory selected"
+  else
+    read -r -p "Local export directory (blank cancels): " selected
+  fi
+  [[ -n "$selected" ]] || die "no export directory selected"
+  EXPORT_DIR="$selected"
+}
+
+validate_export_dir() {
+  local tilde="~"
+  case "$EXPORT_DIR" in
+    "$tilde") EXPORT_DIR="$HOME" ;;
+    "$tilde/"*) EXPORT_DIR="$HOME/${EXPORT_DIR:2}" ;;
+  esac
+  EXPORT_DIR="$(realpath -m -- "$EXPORT_DIR")"
+  case "$EXPORT_DIR/" in
+    "$REPO_ROOT/"*) die "export directory must be outside the project: $EXPORT_DIR" ;;
+  esac
+  if [[ -e "$EXPORT_DIR" && ! -d "$EXPORT_DIR" ]]; then
+    die "export destination is not a directory: $EXPORT_DIR"
+  fi
+}
+
 if [[ ${#SELECTORS[@]} -eq 0 ]]; then
   choose_interactively
 else
   resolve_selectors
 fi
+
+choose_export_dir
+validate_export_dir
 
 declare -A SEEN=()
 for selected in "${CHOSEN[@]}"; do
@@ -213,7 +255,7 @@ with open(sys.argv[2], "w", encoding="utf-8") as handle:
     handle.write("\n")
 PY
   write_file "$EXPORT_DIR/$output" < "$normalized"
-  ok "shared rule ready: $output"
+  ok "exported rule ready: $output"
 done
 
-ok "export complete; review and commit config/opensnitch/rules"
+ok "export complete: $EXPORT_DIR"
