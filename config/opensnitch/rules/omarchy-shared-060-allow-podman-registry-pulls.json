@@ -1,0 +1,39 @@
+{
+  "action": "allow",
+  "created": "2026-08-29T00:00:00Z",
+  "description": "podman and the docker CLI shim pulling the digest-pinned base image that bin/lint builds its toolchain from. Scoped to Docker Hub's own registry, auth, and blob CDN hosts: a pull from anywhere else still prompts, which is the check that a Dockerfile has not quietly changed where its base comes from.",
+  "duration": "always",
+  "enabled": true,
+  "name": "060-omarchy-allow-podman-registry-pulls",
+  "operator": {
+    "data": "",
+    "list": [
+      {
+        "data": "^/usr/bin/(podman|docker)$",
+        "list": null,
+        "operand": "process.path",
+        "sensitive": false,
+        "type": "regexp"
+      },
+      {
+        "data": "^((registry-1|auth|index)\\.docker\\.io|production\\.cloudflare\\.docker\\.com)$",
+        "list": null,
+        "operand": "dest.host",
+        "sensitive": false,
+        "type": "regexp"
+      },
+      {
+        "data": "443",
+        "list": null,
+        "operand": "dest.port",
+        "sensitive": false,
+        "type": "simple"
+      }
+    ],
+    "operand": "list",
+    "sensitive": false,
+    "type": "list"
+  },
+  "precedence": true,
+  "updated": "2026-08-29T00:00:00Z"
+}

@@ -25,13 +25,20 @@ done
 for path in \
   README.md LICENSE AGENTS.md CLAUDE.md .gitignore .shellcheckrc .editorconfig \
   bin/setup-all bin/setup-ssh-agent bin/setup-no-idle bin/setup-brave bin/setup-rpi-imager \
-  bin/setup-no-localsend bin/setup-cat-background bin/setup-rootless-podman \
+  bin/setup-no-localsend bin/setup-no-background-network bin/setup-cat-background bin/setup-rootless-podman \
   bin/setup-security-hardening \
   bin/setup-opensnitch bin/export-opensnitch-rules \
   config/opensnitch/rules/omarchy-shared-000-allow-localhost-ipv4.json \
   config/opensnitch/rules/omarchy-shared-001-allow-localhost-ipv6.json \
   config/opensnitch/rules/omarchy-shared-010-allow-systemd-resolved.json \
   config/opensnitch/rules/omarchy-shared-011-allow-systemd-timesyncd.json \
+  config/opensnitch/rules/omarchy-shared-020-allow-networkmanager-connectivity.json \
+  config/opensnitch/rules/omarchy-shared-030-allow-avahi-mdns-ipv4.json \
+  config/opensnitch/rules/omarchy-shared-031-allow-avahi-mdns-ipv6.json \
+  config/opensnitch/rules/omarchy-shared-040-allow-fwupd-firmware-updates.json \
+  config/opensnitch/rules/omarchy-shared-060-allow-podman-registry-pulls.json \
+  config/opensnitch/rules/omarchy-shared-061-allow-container-egress-to-alpine-cdn.json \
+  config/opensnitch/rules/omarchy-shared-062-allow-curl-brave-release-downloads.json \
   assets/cat-wallpaper.png \
   bin/lint bin/install-hooks \
   packages/brave/PKGBUILD.template packages/brave/brave-launcher \
@@ -43,6 +50,7 @@ for path in \
   docs/setup-rootless-podman.md \
   docs/setup-security-hardening.md tests/test-setup-security-hardening.sh \
   docs/setup-opensnitch.md tests/test-setup-opensnitch.sh \
+  docs/setup-no-background-network.md tests/test-setup-no-background-network.sh \
   tests/test-export-opensnitch-rules.sh
 do
   it "keeps $path tracked"

@@ -1,0 +1,46 @@
+{
+  "action": "allow",
+  "created": "2026-08-29T00:00:00Z",
+  "description": "Avahi mDNS over IPv6. Restricted to the reserved ff02::fb link-local multicast group on port 5353, the IPv6 counterpart of the 224.0.0.251 rule.",
+  "duration": "always",
+  "enabled": true,
+  "name": "031-omarchy-allow-avahi-mdns-ipv6",
+  "operator": {
+    "data": "",
+    "list": [
+      {
+        "data": "/usr/bin/avahi-daemon",
+        "list": null,
+        "operand": "process.path",
+        "sensitive": false,
+        "type": "simple"
+      },
+      {
+        "data": "ff02::fb",
+        "list": null,
+        "operand": "dest.ip",
+        "sensitive": false,
+        "type": "simple"
+      },
+      {
+        "data": "5353",
+        "list": null,
+        "operand": "dest.port",
+        "sensitive": false,
+        "type": "simple"
+      },
+      {
+        "data": "udp",
+        "list": null,
+        "operand": "protocol",
+        "sensitive": false,
+        "type": "simple"
+      }
+    ],
+    "operand": "list",
+    "sensitive": false,
+    "type": "list"
+  },
+  "precedence": true,
+  "updated": "2026-08-29T00:00:00Z"
+}

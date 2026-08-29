@@ -1,0 +1,39 @@
+{
+  "action": "allow",
+  "created": "2026-08-29T00:00:00Z",
+  "description": "fwupd fetching LVFS firmware metadata and firmware images. Both binaries are listed because fwupdmgr hands the download to the daemon in most flows but not all. fwupd.org also carries the optional success/failure report endpoint; declining to report is a fwupd setting, not something to enforce by breaking its host here.",
+  "duration": "always",
+  "enabled": true,
+  "name": "040-omarchy-allow-fwupd-firmware-updates",
+  "operator": {
+    "data": "",
+    "list": [
+      {
+        "data": "^/usr/(bin/fwupdmgr|lib/fwupd/fwupd)$",
+        "list": null,
+        "operand": "process.path",
+        "sensitive": false,
+        "type": "regexp"
+      },
+      {
+        "data": "^(cdn\\.)?fwupd\\.org$",
+        "list": null,
+        "operand": "dest.host",
+        "sensitive": false,
+        "type": "regexp"
+      },
+      {
+        "data": "443",
+        "list": null,
+        "operand": "dest.port",
+        "sensitive": false,
+        "type": "simple"
+      }
+    ],
+    "operand": "list",
+    "sensitive": false,
+    "type": "list"
+  },
+  "precedence": true,
+  "updated": "2026-08-29T00:00:00Z"
+}

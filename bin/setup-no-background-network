@@ -1,0 +1,329 @@
+#!/usr/bin/env bash
+#
+# setup-no-background-network — stop optional polling and telemetry.
+#
+# order: 76
+# description: Stop background network polling and telemetry
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+SHELL_CONFIG="${OMARCHY_SHELL_CONFIG:-$HOME/.config/omarchy/shell.json}"
+CODE_SETTINGS="${VSCODE_SETTINGS_FILE:-$HOME/.config/Code/User/settings.json}"
+CODE_SYNC_MARKER="${VSCODE_SYNC_MARKER:-${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-scripts/vscode-sync-disabled}"
+RPI_SETTINGS="${RPI_IMAGER_SETTINGS_FILE:-$HOME/.config/Raspberry Pi/Raspberry Pi Imager.conf}"
+RULES_DIR="${OPEN_SNITCH_RULES_DIR:-/etc/opensnitchd/rules}"
+WORK_DIR=""
+
+LEGACY_DENY_FILES=(
+  deny-12h-simple-usr-bin-curl.json
+  deny-12h-simple-usr-bin-python3-14.json
+  deny-12h-simple-usr-bin-rpi-imager.json
+  deny-12h-simple-usr-share-code-code.json
+)
+
+usage() {
+  cat <<'USAGE'
+Usage: setup-no-background-network [options]
+
+Disables Omarchy's weather and AI-usage widgets, VS Code telemetry and
+background update/sync checks, and Raspberry Pi Imager telemetry. Once those
+sources are disabled, removes the four reviewed broad OpenSnitch deny rules.
+
+Options:
+  -n, --dry-run   Show what would change without changing anything.
+  -y, --yes       Do not prompt before removing legacy deny rules.
+  -h, --help      Show this help.
+
+Environment (primarily for tests):
+  OMARCHY_SHELL_CONFIG      Omarchy shell JSON path.
+  VSCODE_SETTINGS_FILE      VS Code user settings JSON path.
+  VSCODE_SYNC_MARKER        Marker recording that `code --sync off` succeeded.
+  RPI_IMAGER_SETTINGS_FILE  Raspberry Pi Imager QSettings INI path.
+  OPEN_SNITCH_RULES_DIR     OpenSnitch rules directory.
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--dry-run) DRY_RUN=1 ;;
+    -y|--yes) ASSUME_YES=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; die "Unknown argument: $1" ;;
+  esac
+  shift
+done
+
+require_not_root
+require_cmd awk mktemp omarchy python
+
+cleanup() {
+  [[ -n "$WORK_DIR" ]] && rm -rf -- "$WORK_DIR"
+}
+trap cleanup EXIT
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/omarchy-background-network.XXXXXX")"
+
+plugin_enabled() {
+  local id="$1"
+  [[ -f "$SHELL_CONFIG" ]] || return 0
+  python - "$SHELL_CONFIG" "$id" <<'PY'
+import json, sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    config = json.load(handle)
+target = sys.argv[2]
+for section in (config.get("bar", {}).get("layout", {}) or {}).values():
+    if not isinstance(section, list):
+        continue
+    for entry in section:
+        value = entry.get("id") if isinstance(entry, dict) else entry
+        if value == target:
+            raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+disable_omarchy_polling() {
+  local id
+  log "Disabling Omarchy background polling widgets"
+  for id in omarchy.weather omarchy.agents; do
+    if plugin_enabled "$id"; then
+      run omarchy plugin disable "$id"
+      [[ "$DRY_RUN" == "1" ]] || ok "disabled $id"
+    else
+      skip "$id already disabled"
+    fi
+  done
+}
+
+render_code_settings() {
+  local output="$1" input="$CODE_SETTINGS"
+  [[ -f "$input" ]] || input=/dev/null
+  python - "$input" "$output" <<'PY'
+import json, sys
+
+source, destination = sys.argv[1:]
+if source == "/dev/null":
+    settings = {}
+else:
+    with open(source, encoding="utf-8") as handle:
+        text = handle.read()
+
+    # VS Code accepts JSON with line/block comments and trailing commas. Parse
+    # that small JSONC extension without treating comment markers inside
+    # strings (for example, URLs) as comments.
+    cleaned = []
+    index = 0
+    in_string = False
+    escaped = False
+    while index < len(text):
+        char = text[index]
+        following = text[index + 1] if index + 1 < len(text) else ""
+        if in_string:
+            cleaned.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            cleaned.append(char)
+            index += 1
+        elif char == "/" and following == "/":
+            index += 2
+            while index < len(text) and text[index] not in "\r\n":
+                index += 1
+        elif char == "/" and following == "*":
+            index += 2
+            while index + 1 < len(text) and text[index:index + 2] != "*/":
+                if text[index] in "\r\n":
+                    cleaned.append(text[index])
+                index += 1
+            index = min(index + 2, len(text))
+        else:
+            cleaned.append(char)
+            index += 1
+
+    text = "".join(cleaned)
+    cleaned = []
+    index = 0
+    in_string = False
+    escaped = False
+    while index < len(text):
+        char = text[index]
+        if in_string:
+            cleaned.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+        if char == ",":
+            lookahead = index + 1
+            while lookahead < len(text) and text[lookahead].isspace():
+                lookahead += 1
+            if lookahead < len(text) and text[lookahead] in "]}":
+                index += 1
+                continue
+        cleaned.append(char)
+        index += 1
+    settings = json.loads("".join(cleaned))
+if not isinstance(settings, dict):
+    raise SystemExit("VS Code settings must contain a JSON object")
+
+settings.update({
+    "telemetry.telemetryLevel": "off",
+    "telemetry.feedback.enabled": False,
+    "workbench.enableExperiments": False,
+    "update.mode": "none",
+    "extensions.autoCheckUpdates": False,
+    "extensions.autoUpdate": False,
+    "extensions.ignoreRecommendations": True,
+    "workbench.settings.enableNaturalLanguageSearch": False,
+})
+
+with open(destination, "w", encoding="utf-8") as handle:
+    json.dump(settings, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+}
+
+disable_vscode_background_network() {
+  local rendered="$WORK_DIR/vscode-settings.json"
+  if ! have code && [[ ! -f "$CODE_SETTINGS" ]]; then
+    skip "VS Code is not installed — no VS Code background services to disable"
+    return
+  fi
+
+  log "Disabling VS Code telemetry and background online services"
+  render_code_settings "$rendered"
+  write_file "$CODE_SETTINGS" < "$rendered"
+
+  if [[ -f "$CODE_SYNC_MARKER" ]]; then
+    skip "VS Code Settings Sync already disabled by this setup"
+  elif have code; then
+    run code --sync off
+    if [[ "$DRY_RUN" == "1" ]]; then
+      printf '%s  dry%s would write %s\n' "$C_DIM" "$C_RESET" "$CODE_SYNC_MARKER"
+    else
+      write_file "$CODE_SYNC_MARKER" <<< "disabled"
+    fi
+  else
+    warn "VS Code settings updated, but the code CLI is unavailable; disable Settings Sync manually"
+  fi
+}
+
+render_rpi_settings() {
+  local output="$1" input="$RPI_SETTINGS"
+  [[ -f "$input" ]] || input=/dev/null
+  awk '
+    function emit_telemetry() {
+      if (general && !telemetry) print "telemetry=false"
+    }
+    /^\[.*\]$/ {
+      emit_telemetry()
+      general = ($0 == "[General]")
+      if (general) { found=1; telemetry=0 }
+      print
+      next
+    }
+    general && /^telemetry=/ { print "telemetry=false"; telemetry=1; next }
+    { print }
+    END {
+      emit_telemetry()
+      if (!found) {
+        if (NR) print ""
+        print "[General]"
+        print "telemetry=false"
+      }
+    }
+  ' "$input" > "$output"
+}
+
+# Imaging a card needs root, so rpi-imager is routinely launched with sudo, and
+# Qt then writes its settings file into the user's config directory owned by
+# root. Every later run as the user fails to save. Take ownership back once
+# rather than leaving a root-owned file in $HOME or writing to it as root.
+reclaim_user_file() {
+  local path="$1" owner
+  [[ -e "$path" ]] || return 0
+  [[ ! -w "$path" ]] || return 0
+  owner="$(stat -c '%U' -- "$path" 2>/dev/null || echo unknown)"
+  warn "$path is owned by $owner and not writable by $(id -un)"
+  if ! confirm "Take ownership of $path?"; then
+    skip "left $path unchanged"
+    return 1
+  fi
+  run sudo chown "$(id -u):$(id -g)" -- "$path"
+  run sudo chmod u+rw -- "$path"
+  [[ "$DRY_RUN" == "1" ]] || ok "took ownership of $path"
+}
+
+disable_rpi_telemetry() {
+  local rendered="$WORK_DIR/rpi-imager.conf"
+  if ! have rpi-imager && [[ ! -f "$RPI_SETTINGS" ]]; then
+    skip "Raspberry Pi Imager is not installed — no telemetry setting to change"
+    return
+  fi
+
+  log "Disabling Raspberry Pi Imager telemetry"
+  reclaim_user_file "$RPI_SETTINGS" || return 0
+  render_rpi_settings "$rendered"
+  write_file "$RPI_SETTINGS" < "$rendered"
+}
+
+remove_legacy_denies() {
+  local base file backup stamp
+  local -a present=()
+  for base in "${LEGACY_DENY_FILES[@]}"; do
+    file="$RULES_DIR/$base"
+    [[ -e "$file" ]] && present+=("$file")
+  done
+
+  if [[ ${#present[@]} -eq 0 ]]; then
+    skip "reviewed broad OpenSnitch deny rules already absent"
+    return
+  fi
+
+  log "Removing reviewed broad OpenSnitch deny rules"
+  printf '  %s\n' "${present[@]}"
+  if ! confirm "Back up and remove ${#present[@]} broad deny rule(s)?"; then
+    skip "left OpenSnitch deny rules unchanged"
+    return
+  fi
+
+  stamp="$(date +%Y%m%d%H%M%S)"
+  for file in "${present[@]}"; do
+    backup="$file.bak.$stamp"
+    if [[ "$DRY_RUN" == "1" ]]; then
+      printf '%s  dry%s sudo cp -a -- %s %s\n' "$C_DIM" "$C_RESET" "$file" "$backup"
+      printf '%s  dry%s sudo rm -- %s\n' "$C_DIM" "$C_RESET" "$file"
+    else
+      sudo cp -a -- "$file" "$backup"
+      sudo rm -- "$file"
+      ok "removed $(basename -- "$file") (backup: $backup)"
+    fi
+  done
+}
+
+main() {
+  disable_omarchy_polling
+  disable_vscode_background_network
+  disable_rpi_telemetry
+  remove_legacy_denies
+  ok "background polling and telemetry disabled"
+}
+
+main "$@"

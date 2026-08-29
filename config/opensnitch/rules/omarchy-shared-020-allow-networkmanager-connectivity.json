@@ -1,0 +1,39 @@
+{
+  "action": "allow",
+  "created": "2026-08-29T00:00:00Z",
+  "description": "NetworkManager's captive-portal check. Arch ships connectivity.conf pointing at ping.archlinux.org over plain HTTP; without this the applet reports every network as limited.",
+  "duration": "always",
+  "enabled": true,
+  "name": "020-omarchy-allow-networkmanager-connectivity",
+  "operator": {
+    "data": "",
+    "list": [
+      {
+        "data": "/usr/bin/NetworkManager",
+        "list": null,
+        "operand": "process.path",
+        "sensitive": false,
+        "type": "simple"
+      },
+      {
+        "data": "ping.archlinux.org",
+        "list": null,
+        "operand": "dest.host",
+        "sensitive": false,
+        "type": "simple"
+      },
+      {
+        "data": "80",
+        "list": null,
+        "operand": "dest.port",
+        "sensitive": false,
+        "type": "simple"
+      }
+    ],
+    "operand": "list",
+    "sensitive": false,
+    "type": "list"
+  },
+  "precedence": true,
+  "updated": "2026-08-29T00:00:00Z"
+}

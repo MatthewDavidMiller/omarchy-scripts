@@ -1,0 +1,39 @@
+{
+  "action": "allow",
+  "created": "2026-08-29T00:00:00Z",
+  "description": "curl fetching Brave's release metadata, signing key, checksums, and the release RPM that packages/brave repackages. This is the documented alternative to a process-wide curl allow: curl is constrained to the four hosts that recipe actually names, including the githubusercontent hosts GitHub redirects release assets to.",
+  "duration": "always",
+  "enabled": true,
+  "name": "062-omarchy-allow-curl-brave-release-downloads",
+  "operator": {
+    "data": "",
+    "list": [
+      {
+        "data": "/usr/bin/curl",
+        "list": null,
+        "operand": "process.path",
+        "sensitive": false,
+        "type": "simple"
+      },
+      {
+        "data": "^(versions\\.brave\\.com|brave-browser-downloads\\.s3\\.brave\\.com|github\\.com|[a-z0-9-]+\\.githubusercontent\\.com)$",
+        "list": null,
+        "operand": "dest.host",
+        "sensitive": false,
+        "type": "regexp"
+      },
+      {
+        "data": "443",
+        "list": null,
+        "operand": "dest.port",
+        "sensitive": false,
+        "type": "simple"
+      }
+    ],
+    "operand": "list",
+    "sensitive": false,
+    "type": "list"
+  },
+  "precedence": true,
+  "updated": "2026-08-29T00:00:00Z"
+}

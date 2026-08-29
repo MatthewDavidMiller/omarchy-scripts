@@ -195,4 +195,68 @@ it "rejects unknown arguments"
 "$REPO_ROOT/bin/setup-opensnitch" --not-an-option >/dev/null 2>&1
 assert_status 1 $?
 
+# --- shape of the committed baseline ---------------------------------------
+#
+# The baseline is the one rule set that ships to every machine, so a mistake
+# here is a mistake everywhere. These checks are about shape, not content: the
+# rules stay allow-only, take precedence over learned denies, name the
+# executable they were written for, and explain themselves.
+
+shape_report="$(python - "$REPO_ROOT/config/opensnitch/rules" <<'SHAPE'
+import json, pathlib, re, sys
+
+problems = []
+for path in sorted(pathlib.Path(sys.argv[1]).glob("*.json")):
+    try:
+        rule = json.loads(path.read_text())
+    except ValueError as error:
+        problems.append(f"{path.name}: invalid JSON ({error})")
+        continue
+
+    prefix = re.match(r"omarchy-shared-(\d{3})-", path.name)
+    if not prefix:
+        problems.append(f"{path.name}: filename lacks an omarchy-shared-NNN- prefix")
+    elif not str(rule.get("name", "")).startswith(prefix.group(1) + "-"):
+        problems.append(f"{path.name}: name {rule.get('name')!r} does not start with {prefix.group(1)}-")
+
+    if rule.get("action") != "allow":
+        problems.append(f"{path.name}: baseline rules are allow-only, not {rule.get('action')!r}")
+    if rule.get("duration") != "always":
+        problems.append(f"{path.name}: baseline rules must be permanent")
+    if rule.get("enabled") is not True:
+        problems.append(f"{path.name}: baseline rules must ship enabled")
+    if rule.get("precedence") is not True:
+        problems.append(f"{path.name}: baseline rules must outrank learned denies")
+
+    operands = set()
+
+    def walk(operator):
+        if not isinstance(operator, dict):
+            return
+        operands.add(operator.get("operand"))
+        for child in operator.get("list") or []:
+            walk(child)
+
+    walk(rule.get("operator"))
+
+    # Localhost is matched by destination alone. Every other baseline rule must
+    # name the executable it was written for, or it is a process-wide hole.
+    if "dest.network" not in operands and "process.path" not in operands:
+        problems.append(f"{path.name}: no process.path, so it is not scoped to one executable")
+
+    machine_specific = operands & {"user.id", "process.command"}
+    if machine_specific:
+        problems.append(f"{path.name}: {sorted(machine_specific)} does not belong in a portable rule")
+
+print("\n".join(problems))
+SHAPE
+)"
+
+it "every committed baseline rule keeps the shared-rule shape"
+assert_eq "" "$shape_report" "baseline rule problems"
+
+it "ships the full baseline: system essentials, maintenance, and repo workflows"
+baseline_count="$(find "$REPO_ROOT/config/opensnitch/rules" -name 'omarchy-shared-*.json' | wc -l)"
+assert_eq "11" "$baseline_count" "baseline rule count"
+
 finish

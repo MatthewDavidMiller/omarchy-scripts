@@ -41,6 +41,7 @@ would test the mock.
 | `tests/test-setup-all.sh` | Discovery, ordering, `--only`/`--skip`, failure reporting |
 | `tests/test-setup-ssh-agent.sh` | Full run against a fake HOME, and idempotence |
 | `tests/test-setup-no-idle.sh` | Idle and screensaver toggles against a stubbed `omarchy` |
+| `tests/test-setup-no-background-network.sh` | Omarchy polling widgets, VS Code/RPi settings, and exact OpenSnitch deny cleanup |
 | `tests/test-setup-no-localsend.sh` | ufw rule deletion against fixture rules files, and package removal |
 | `tests/test-setup-opensnitch.sh` | package provenance, fail-closed configuration, shared rules, and service state |
 | `tests/test-export-opensnitch-rules.sh` | rule eligibility, portability checks, stable export, and dry-run safety |

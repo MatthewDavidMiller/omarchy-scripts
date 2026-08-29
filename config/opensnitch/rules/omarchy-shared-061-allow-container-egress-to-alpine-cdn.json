@@ -1,0 +1,39 @@
+{
+  "action": "allow",
+  "created": "2026-08-29T00:00:00Z",
+  "description": "Rootless container egress to the Alpine package CDN, used by docker/lint.Dockerfile to apk add shellcheck and shfmt while the lint image builds. Rootless podman routes container traffic through pasta, so the connection is attributed to that helper rather than to podman \u2014 and pasta is a symlink that dispatches to a CPU-specific build, so the path OpenSnitch reports is /usr/bin/passt.avx2 on a machine with AVX2 and /usr/bin/passt without it. The pattern covers both, which is why this is a regexp and not the obvious literal path.",
+  "duration": "always",
+  "enabled": true,
+  "name": "061-omarchy-allow-container-egress-to-alpine-cdn",
+  "operator": {
+    "data": "",
+    "list": [
+      {
+        "data": "^/usr/bin/(passt|pasta)(\\.avx2)?$",
+        "list": null,
+        "operand": "process.path",
+        "sensitive": false,
+        "type": "regexp"
+      },
+      {
+        "data": "^dl-cdn\\.alpinelinux\\.org$",
+        "list": null,
+        "operand": "dest.host",
+        "sensitive": false,
+        "type": "regexp"
+      },
+      {
+        "data": "443",
+        "list": null,
+        "operand": "dest.port",
+        "sensitive": false,
+        "type": "simple"
+      }
+    ],
+    "operand": "list",
+    "sensitive": false,
+    "type": "list"
+  },
+  "precedence": true,
+  "updated": "2026-08-29T00:00:00Z"
+}
