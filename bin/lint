@@ -160,12 +160,17 @@ ensure_image() {
 # --- file discovery --------------------------------------------------------
 
 discover_files() {
-  local file
+  local file line
   shopt -s nullglob
   for file in "$REPO_ROOT"/bin/* "$REPO_ROOT"/lib/*.sh "$REPO_ROOT"/githooks/* \
               "$REPO_ROOT"/tests/run "$REPO_ROOT"/tests/*.sh; do
     [[ -f "$file" ]] || continue
     [[ "$file" == *.bak.* ]] && continue
+    # bin/ holds commands, not only shell ones. shellcheck errors out on a
+    # script it cannot parse (SC1071), so decide by shebang rather than by
+    # location — otherwise adding one Python tool fails the whole lint.
+    read -r line < "$file" || true
+    [[ "$line" =~ ^#!.*(bash|dash|ksh|sh)([[:space:]]|$) ]] || continue
     printf '%s\n' "${file#"$REPO_ROOT"/}"
   done
   shopt -u nullglob

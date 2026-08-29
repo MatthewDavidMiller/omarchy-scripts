@@ -23,6 +23,16 @@ engine works; `OMARCHY_CONTAINER_ENGINE=docker` pins one explicitly. The
 Dockerfile format is engine-neutral — podman builds it unchanged — so the file
 keeps its name.
 
+## What gets linted
+
+`bin/*`, `lib/*.sh`, `githooks/*`, `tests/run`, and `tests/*.sh`, minus
+`.bak.*` copies — and minus anything whose shebang is not a shell. `bin/` holds
+commands rather than shell scripts specifically, and shellcheck refuses a
+language it cannot parse with `SC1071 (error)`, which fails the run rather than
+skipping the file. So discovery reads the first line and passes on the rest.
+A Python command in `bin/` is therefore unlinted, not broken; give it its own
+checks if it grows enough to need them.
+
 ## The image
 
 Built locally from [`docker/lint.Dockerfile`](../docker/lint.Dockerfile):

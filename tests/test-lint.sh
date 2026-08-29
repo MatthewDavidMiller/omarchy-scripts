@@ -157,6 +157,24 @@ if [[ -n "$real_engine" ]]; then
   out="$(lint)" && status=0 || status=$?
   assert_status 0 "$status"
 
+  # bin/ holds commands, not only shell ones. shellcheck aborts with SC1071 on
+  # a language it cannot parse, so one Python tool would otherwise fail the
+  # whole run.
+  it "skips a non-shell command in bin/ instead of failing on it"
+  cat > "$REPO_ROOT/bin/zz-test-not-shell" <<'PYSCRIPT'
+#!/usr/bin/env python
+import sys
+sys.exit(0)
+PYSCRIPT
+  chmod +x "$REPO_ROOT/bin/zz-test-not-shell"
+  out="$(lint)" && status=0 || status=$?
+  rm -f "$REPO_ROOT/bin/zz-test-not-shell"
+  if [[ $status -eq 0 && "$out" != *SC1071* ]]; then
+    pass
+  else
+    fail "expected the Python file to be skipped" "exit $status" "${out:0:400}"
+  fi
+
   it "reports the image it used"
   assert_contains "$out" "omarchy-scripts/lint:"
 

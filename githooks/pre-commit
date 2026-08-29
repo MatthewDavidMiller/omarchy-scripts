@@ -18,31 +18,41 @@ fail=0
 staged=$(git diff --cached --name-only --diff-filter=ACM)
 [[ -z "$staged" ]] && exit 0
 
-# Anything under bin/, lib/, or githooks/, plus anything with a shell shebang.
+# Shell scripts, decided by shebang rather than by location. bin/ holds
+# commands, not shell scripts specifically, and `bash -n` on a Python file is a
+# syntax error while shellcheck refuses it outright with SC1071 — so a
+# location-based filter would block every commit touching a non-shell command.
+# bin/lint's discover_files applies the same rule.
 scripts=()
+commands=()
 while IFS= read -r f; do
   [[ -f "$f" ]] || continue
   case "$f" in
-    bin/*|lib/*|githooks/*|*.sh|*.bash) scripts+=("$f"); continue ;;
+    bin/*) commands+=("$f") ;;
   esac
-  head -n1 "$f" | grep -qE '^#!.*(bash|sh)\b' && scripts+=("$f")
+  head -n1 "$f" | grep -qE '^#!.*(bash|dash|ksh|sh)([[:space:]]|$)' && scripts+=("$f")
 done <<< "$staged"
 
-[[ ${#scripts[@]} -eq 0 ]] && exit 0
+# The executable check below applies to every command, shell or not.
+if [[ ${#scripts[@]} -eq 0 && ${#commands[@]} -eq 0 ]]; then
+  exit 0
+fi
 
-for f in "${scripts[@]}"; do
+for f in "${scripts[@]+"${scripts[@]}"}"; do
   if ! bash -n "$f"; then
     echo "pre-commit: syntax error in $f" >&2
     fail=1
   fi
 done
 
-./bin/lint "${scripts[@]}"
-case "$?" in
-  0) ;;
-  3) echo "pre-commit: no linter available, syntax check only" >&2 ;;
-  *) fail=1 ;;
-esac
+if [[ ${#scripts[@]} -gt 0 ]]; then
+  ./bin/lint "${scripts[@]}"
+  case "$?" in
+    0) ;;
+    3) echo "pre-commit: no linter available, syntax check only" >&2 ;;
+    *) fail=1 ;;
+  esac
+fi
 
 # The suite is fast and hermetic (throwaway HOME, stubbed commands), so it runs
 # on every commit rather than being deferred to push.
@@ -54,15 +64,11 @@ if [[ -x ./tests/run ]]; then
 fi
 
 # Executables in bin/ must stay executable.
-for f in "${scripts[@]}"; do
-  case "$f" in
-    bin/*)
-      if [[ "$(git ls-files --stage "$f" | cut -d' ' -f1)" != "100755" ]]; then
-        echo "pre-commit: $f is not executable (git update-index --chmod=+x $f)" >&2
-        fail=1
-      fi
-      ;;
-  esac
+for f in "${commands[@]+"${commands[@]}"}"; do
+  if [[ "$(git ls-files --stage "$f" | cut -d' ' -f1)" != "100755" ]]; then
+    echo "pre-commit: $f is not executable (git update-index --chmod=+x $f)" >&2
+    fail=1
+  fi
 done
 
 exit "$fail"
