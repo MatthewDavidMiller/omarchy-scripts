@@ -52,6 +52,7 @@ touching the system.
 | `bin/setup-no-chromium-extensions` | Remove Omarchy's bundled Chromium extensions | [docs/setup-no-chromium-extensions.md](docs/setup-no-chromium-extensions.md) |
 | `bin/setup-no-localsend` | Remove LocalSend and the ufw rules that expose it | [docs/setup-no-localsend.md](docs/setup-no-localsend.md) |
 | `bin/setup-rootless-podman` | Swap Docker for rootless Podman, keeping the docker CLI | [docs/setup-rootless-podman.md](docs/setup-rootless-podman.md) |
+| `bin/setup-security-hardening` | Enforce a safe package, firewall, kernel, and credential-file baseline | [docs/setup-security-hardening.md](docs/setup-security-hardening.md) |
 | `bin/lint` | shellcheck in a container — no host tooling to install | [docs/lint.md](docs/lint.md) |
 
 Container images follow two rules: **reputable sources only** — Docker Official

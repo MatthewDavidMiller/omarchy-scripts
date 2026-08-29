@@ -26,6 +26,7 @@ for path in \
   README.md LICENSE AGENTS.md CLAUDE.md .gitignore .shellcheckrc .editorconfig \
   bin/setup-all bin/setup-ssh-agent bin/setup-no-idle bin/setup-brave bin/setup-rpi-imager \
   bin/setup-no-localsend bin/setup-cat-background bin/setup-rootless-podman \
+  bin/setup-security-hardening \
   assets/cat-wallpaper.png \
   bin/lint bin/install-hooks \
   packages/brave/PKGBUILD.template packages/brave/brave-launcher \
@@ -34,7 +35,8 @@ for path in \
   githooks/pre-commit docker/lint.Dockerfile \
   tests/run tests/helpers.sh tests/test-repo.sh \
   docs/ci.md docs/testing.md docs/setup-cat-background.md \
-  docs/setup-rootless-podman.md
+  docs/setup-rootless-podman.md \
+  docs/setup-security-hardening.md tests/test-setup-security-hardening.sh
 do
   it "keeps $path tracked"
   if ignored "$path"; then fail "$path must not be ignored"; else pass; fi

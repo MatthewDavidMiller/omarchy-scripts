@@ -1,0 +1,472 @@
+#!/usr/bin/env bash
+#
+# setup-security-hardening — apply a conservative Omarchy security baseline.
+#
+# order: 90
+# description: Safe package, firewall, kernel, and credential-file hardening
+#
+# This deliberately leaves desktop convenience and hardware behavior alone:
+# autologin, idle locking, SSH-agent lifetime, discovery services, Bluetooth,
+# and input-group membership are audited but never changed. Boot-sensitive
+# controls such as AppArmor, Secure Boot, IOMMU, and kernel lockdown are also
+# report-only.
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+PACMAN_CONF="${PACMAN_CONF:-/etc/pacman.conf}"
+SYSCTL_FILE="${SYSCTL_FILE:-/etc/sysctl.d/60-omarchy-security.conf}"
+SDDM_CONFIG_DIR="${SDDM_CONFIG_DIR:-/etc/sddm.conf.d}"
+STAY_AWAKE_FILE="${STAY_AWAKE_FILE:-$HOME/.local/state/omarchy/indicators/stay-awake}"
+KEYRING_DIR="${KEYRING_DIR:-$HOME/.local/share/keyrings}"
+SSH_DIR="${SSH_DIR:-$HOME/.ssh}"
+OMARCHY_KEY_FINGERPRINT="${OMARCHY_KEY_FINGERPRINT:-40DFB630FF42BCFFB047046CF0134EE680CAC571}"
+OMARCHY_SIGLEVEL='SigLevel = Required DatabaseOptional TrustedOnly'
+
+WORK_DIR=""
+
+usage() {
+  cat <<'USAGE'
+Usage: setup-security-hardening [options]
+
+Applies a conservative security baseline without changing desktop login,
+idle-lock, hardware, discovery, or boot behavior. It also prints a read-only
+report of important risks that were deliberately left alone.
+
+Options:
+  -n, --dry-run   Show what would change without changing anything.
+  -y, --yes       Accepted for setup-all compatibility; no prompts are used.
+  -h, --help      Show this help.
+
+Environment (primarily for tests):
+  DRY_RUN                 Same as --dry-run when set to 1.
+  PACMAN_CONF             Pacman configuration path.
+  SYSCTL_FILE             Security sysctl drop-in path.
+  SDDM_CONFIG_DIR         SDDM drop-in directory.
+  STAY_AWAKE_FILE         Omarchy stay-awake indicator path.
+  KEYRING_DIR, SSH_DIR    Credential directory paths.
+  OMARCHY_KEY_FINGERPRINT Expected trusted Omarchy signing key fingerprint.
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--dry-run) DRY_RUN=1 ;;
+    -y|--yes)     ASSUME_YES=1 ;;
+    -h|--help)    usage; exit 0 ;;
+    *)            usage >&2; die "Unknown argument: $1" ;;
+  esac
+  shift
+done
+
+require_not_root
+require_cmd awk chmod cmp find grep id mktemp omarchy pacman pacman-key sudo sysctl systemctl ufw
+
+cleanup() {
+  [[ -n "$WORK_DIR" ]] && rm -rf "$WORK_DIR"
+}
+trap cleanup EXIT
+
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/omarchy-security.XXXXXX")"
+
+# install_root_file <source> <destination> — compare, back up, and install a
+# root-owned config. Tests point destination at a fixture and stub sudo.
+install_root_file() {
+  local source="$1" destination="$2" backup
+
+  if [[ -f "$destination" ]] && cmp -s "$source" "$destination"; then
+    skip "$destination already up to date"
+    return 1
+  fi
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    printf '%s  dry%s would write %s\n' "$C_DIM" "$C_RESET" "$destination"
+    return 0
+  fi
+
+  if [[ -f "$destination" ]]; then
+    backup="$destination.bak.$(date +%Y%m%d%H%M%S)"
+    sudo cp -a -- "$destination" "$backup"
+    ok "backed up $destination to $backup"
+  fi
+
+  sudo install -D -m 0644 -- "$source" "$destination"
+  ok "wrote $destination"
+}
+
+# ---------------------------------------------------------------------------
+# 1. Require trusted signatures from the Omarchy package repository
+# ---------------------------------------------------------------------------
+
+verify_omarchy_key() {
+  local key_info normalized_fingerprint
+
+  key_info="$(LC_ALL=C pacman-key --finger "$OMARCHY_KEY_FINGERPRINT" 2>/dev/null)" \
+    || die "Omarchy signing key $OMARCHY_KEY_FINGERPRINT is not in pacman's keyring"
+
+  normalized_fingerprint="$(printf '%s\n' "$key_info" \
+    | awk '/^[[:space:]]+[[:xdigit:] ]{40,}$/ { gsub(/[[:space:]]/, ""); print; exit }')"
+  [[ "$normalized_fingerprint" == "$OMARCHY_KEY_FINGERPRINT" ]] \
+    || die "pacman-key returned the wrong Omarchy signing-key fingerprint"
+
+  printf '%s\n' "$key_info" | grep -Eq '\[[[:space:]]*full[[:space:]]*\]' \
+    || die "Omarchy signing key $OMARCHY_KEY_FINGERPRINT is not fully trusted"
+
+  ok "Omarchy signing key is present and fully trusted"
+}
+
+render_pacman_conf() {
+  local output="$1"
+
+  awk -v desired="$OMARCHY_SIGLEVEL" '
+    function emit_siglevel() {
+      if (!inserted) {
+        print desired
+        inserted = 1
+      }
+    }
+
+    /^\[[^]]+\][[:space:]]*$/ {
+      if (in_omarchy) emit_siglevel()
+      in_omarchy = ($0 == "[omarchy]")
+      if (in_omarchy) {
+        found = 1
+        inserted = 0
+      }
+      print
+      next
+    }
+
+    in_omarchy && /^[[:space:]]*SigLevel[[:space:]]*=/ {
+      emit_siglevel()
+      next
+    }
+
+    { print }
+
+    END {
+      if (in_omarchy) emit_siglevel()
+      if (!found) exit 42
+    }
+  ' "$PACMAN_CONF" > "$output"
+}
+
+configure_package_signatures() {
+  local rendered="$WORK_DIR/pacman.conf"
+
+  log "Requiring trusted Omarchy package signatures"
+  [[ -r "$PACMAN_CONF" ]] || die "Cannot read $PACMAN_CONF"
+  verify_omarchy_key
+
+  if ! render_pacman_conf "$rendered"; then
+    die "$PACMAN_CONF has no [omarchy] repository section"
+  fi
+
+  install_root_file "$rendered" "$PACMAN_CONF" || true
+}
+
+# ---------------------------------------------------------------------------
+# 2. Install Arch's vulnerability scanner and enable its packaged timer
+# ---------------------------------------------------------------------------
+
+arch_audit_installed() {
+  omarchy pkg present arch-audit
+}
+
+configure_arch_audit() {
+  local repository
+  log "Enabling installed-package vulnerability monitoring"
+
+  repository="$(LC_ALL=C pacman -Si arch-audit 2>/dev/null \
+    | awk -F: '/^Repository[[:space:]]*:/ { gsub(/[[:space:]]/, "", $2); print $2; exit }')"
+  [[ "$repository" == "extra" ]] \
+    || die "arch-audit is not available from Arch's official Extra repository"
+  ok "arch-audit is available from Arch Extra"
+
+  if arch_audit_installed; then
+    skip "arch-audit already installed"
+  else
+    run omarchy pkg add arch-audit
+    if [[ "$DRY_RUN" != "1" ]]; then
+      arch_audit_installed || die "arch-audit was not registered as installed"
+    fi
+  fi
+
+  if [[ "$DRY_RUN" != "1" ]]; then
+    systemctl cat arch-audit.timer >/dev/null 2>&1 \
+      || die "the official arch-audit package did not provide arch-audit.timer"
+  fi
+
+  if systemctl is-enabled --quiet arch-audit.timer 2>/dev/null; then
+    skip "arch-audit.timer already enabled"
+  else
+    run sudo systemctl enable --now arch-audit.timer
+    ok "arch-audit.timer enabled"
+  fi
+}
+
+run_arch_audit() {
+  local output status=0
+  [[ "$DRY_RUN" == "1" ]] && { skip "dry run: initial vulnerability audit not run"; return; }
+  have arch-audit || { warn "arch-audit is unavailable after installation"; return; }
+
+  log "Checking installed packages for known vulnerabilities"
+  output="$(arch-audit --upgradable 2>&1)" || status=$?
+
+  if [[ -n "$output" ]]; then
+    warn "arch-audit reported:"
+    printf '%s\n' "$output"
+  elif [[ "$status" -eq 0 ]]; then
+    ok "no known fixed vulnerabilities found in installed Arch packages"
+  else
+    warn "arch-audit could not complete (exit $status); its timer will retry"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 3. Keep UFW on with conservative defaults, preserving every explicit rule
+# ---------------------------------------------------------------------------
+
+ufw_status() {
+  if [[ "$DRY_RUN" == "1" ]]; then
+    sudo -n ufw status verbose 2>/dev/null || true
+  else
+    sudo ufw status verbose 2>/dev/null || true
+  fi
+}
+
+configure_firewall() {
+  local status
+  log "Enforcing the UFW baseline"
+  status="$(ufw_status)"
+
+  if grep -Eq '^Default: deny \(incoming\), allow \(outgoing\)' <<< "$status"; then
+    skip "UFW default policies already deny incoming and allow outgoing"
+  else
+    run sudo ufw default deny incoming
+    run sudo ufw default allow outgoing
+    ok "UFW default policies set"
+  fi
+
+  if grep -Eq '^Logging: on \(low\)$' <<< "$status"; then
+    skip "UFW low-rate logging already enabled"
+  else
+    run sudo ufw logging low
+    ok "UFW low-rate logging enabled"
+  fi
+
+  # Set policy before activation so a previously inactive firewall never has
+  # a permissive window between being enabled and receiving its defaults.
+  if grep -q '^Status: active$' <<< "$status"; then
+    skip "UFW already active"
+  else
+    run sudo ufw --force enable
+    ok "UFW enabled"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 4. Close information leaks and redirect handling without breaking dev tools
+# ---------------------------------------------------------------------------
+
+render_sysctl() {
+  cat > "$1" <<'EOF'
+# Managed by omarchy-scripts (bin/setup-security-hardening).
+# Restrict kernel-address disclosure while retaining root debugging access.
+kernel.kptr_restrict = 1
+
+# This workstation is not a router. Do not emit or trust ICMP redirects.
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.secure_redirects = 0
+net.ipv4.conf.default.secure_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+EOF
+}
+
+configure_sysctl() {
+  local rendered="$WORK_DIR/security-sysctl.conf" changed=0
+  log "Applying conservative kernel and network hardening"
+  render_sysctl "$rendered"
+
+  if install_root_file "$rendered" "$SYSCTL_FILE"; then
+    changed=1
+  fi
+
+  if [[ "$changed" == "1" ]]; then
+    run sudo sysctl -p "$SYSCTL_FILE"
+  else
+    skip "security sysctls already installed"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 5. Remove group/world access without changing any owner permission bits
+# ---------------------------------------------------------------------------
+
+tighten_path() {
+  local path="$1" mode
+  [[ -e "$path" ]] || return 0
+  mode="$(stat -c '%a' "$path")"
+  if (( (8#$mode & 077) != 0 )); then
+    run chmod go-rwx -- "$path"
+    ok "removed group/world access from $path"
+  fi
+}
+
+tighten_tree() {
+  local root="$1" path
+  [[ -d "$root" ]] || return 0
+
+  while IFS= read -r -d '' path; do
+    run chmod go-rwx -- "$path"
+    ok "removed group/world access from $path"
+  done < <(find "$root" -xdev -type d -perm /0077 -print0)
+
+  while IFS= read -r -d '' path; do
+    run chmod go-rwx -- "$path"
+    ok "removed group/world access from $path"
+  done < <(find "$root" -xdev -type f -perm /0077 -print0)
+}
+
+configure_credential_permissions() {
+  log "Restricting credential-file permissions"
+  tighten_path "$HOME"
+  tighten_tree "$SSH_DIR"
+  tighten_tree "$KEYRING_DIR"
+  ok "credential directories checked"
+}
+
+# ---------------------------------------------------------------------------
+# 6. Report deliberately preserved risks without reading stored secret values
+# ---------------------------------------------------------------------------
+
+report_item() {
+  local level="$1" message="$2"
+  printf '  %-5s %s\n' "$level" "$message"
+}
+
+keyring_never_locks() {
+  local file="$KEYRING_DIR/Default_keyring.keyring"
+  [[ -r "$file" ]] || return 1
+  awk '
+    /^\[keyring\]$/ { metadata = 1; next }
+    /^\[/ && metadata { exit }
+    metadata && /^(lock-on-idle|lock-after)=false$/ { found = 1 }
+    END { exit !found }
+  ' "$file"
+}
+
+service_enabled_or_active() {
+  systemctl is-enabled --quiet "$1" 2>/dev/null \
+    || systemctl is-active --quiet "$1" 2>/dev/null
+}
+
+security_report() {
+  local firewall_report groups listener_data="" public_listeners="" service
+  log "Security posture (report only)"
+
+  if lsblk -no FSTYPE 2>/dev/null | grep -qx 'crypto_LUKS'; then
+    report_item ok "LUKS disk encryption detected"
+  else
+    report_item WARN "LUKS disk encryption was not detected"
+  fi
+
+  firewall_report="$(ufw_status)"
+  if grep -q '^Status: active$' <<< "$firewall_report"; then
+    report_item ok "UFW is active"
+  elif [[ "$DRY_RUN" == "1" && -z "$firewall_report" ]]; then
+    report_item INFO "UFW status unavailable without a cached sudo credential during dry run"
+  else
+    report_item WARN "UFW does not report as active"
+  fi
+
+  if have ss; then
+    if listener_data="$(ss -H -lntu 2>/dev/null)"; then
+      public_listeners="$(printf '%s\n' "$listener_data" \
+        | awk 'NF >= 5 && $5 !~ /^(127\.|\[?::1\]?[:%])/ { print $1 " " $5 }' \
+        | sort -u)"
+      if [[ -n "$public_listeners" ]]; then
+        report_item INFO "non-loopback listeners exist (explicit UFW rules still control ingress)"
+        printf '%s\n' "$public_listeners" | sed 's/^/        /'
+      else
+        report_item ok "no non-loopback TCP/UDP listeners detected"
+      fi
+    else
+      report_item INFO "listening sockets could not be inspected"
+    fi
+  fi
+
+  if grep -RqsE '^[[:space:]]*User[[:space:]]*=' "$SDDM_CONFIG_DIR" 2>/dev/null; then
+    report_item WARN "SDDM autologin remains enabled by choice"
+  fi
+  [[ -e "$STAY_AWAKE_FILE" ]] \
+    && report_item WARN "Omarchy idle locking remains disabled by choice"
+  keyring_never_locks \
+    && report_item WARN "the default desktop keyring is configured never to lock"
+
+  groups=" $(id -nG) "
+  [[ "$groups" == *' docker '* ]] \
+    && report_item WARN "docker-group membership grants root-equivalent daemon access"
+  [[ "$groups" == *' empower '* ]] \
+    && report_item WARN "empower-group membership grants passwordless privileged actions"
+  [[ "$groups" == *' input '* ]] \
+    && report_item WARN "input-group membership can bypass Wayland input isolation; retained by choice"
+
+  for service in avahi-daemon.service cups-browsed.service bluetooth.service; do
+    service_enabled_or_active "$service" \
+      && report_item INFO "$service remains available by choice"
+  done
+
+  if [[ -r /sys/kernel/security/lsm ]] \
+      && grep -qw apparmor /sys/kernel/security/lsm; then
+    report_item ok "AppArmor is active"
+  else
+    report_item INFO "AppArmor is not active; boot-sensitive MAC changes were excluded"
+  fi
+
+  if [[ -r /sys/kernel/security/lockdown ]] \
+      && ! grep -q '\[none\]' /sys/kernel/security/lockdown; then
+    report_item ok "kernel lockdown is active"
+  else
+    report_item INFO "kernel lockdown is not active"
+  fi
+
+  if find /sys/kernel/iommu_groups -mindepth 1 -maxdepth 1 -type d -print -quit 2>/dev/null \
+      | grep -q .; then
+    report_item ok "IOMMU groups detected"
+  else
+    report_item INFO "IOMMU protection was not detected"
+  fi
+
+  if have fwupdmgr; then
+    if fwupdmgr security 2>/dev/null \
+        | sed $'s/\033\[[0-9;]*m//g' \
+        | grep -Eq 'UEFI secure boot:[[:space:]]+Enabled'; then
+      report_item ok "UEFI Secure Boot is enabled"
+    else
+      report_item INFO "UEFI Secure Boot is not enabled"
+    fi
+  fi
+}
+
+main() {
+  configure_package_signatures
+  configure_arch_audit
+  configure_firewall
+  configure_sysctl
+  configure_credential_permissions
+  run_arch_audit
+  security_report
+
+  printf '\n'
+  ok "Conservative security baseline complete"
+}
+
+main "$@"
