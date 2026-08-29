@@ -9,6 +9,7 @@ re-do on every fresh machine, kept in one place so they run the same way twice.
 bin/          Executable scripts, one per task
 lib/          Shared bash helpers (logging, dry-run, safe file writes, TUI)
 packages/     Vetted local package recipes built from first-party releases
+config/       Portable configuration imported by setup scripts
 assets/       Committed artwork used by scripts
 tests/        Test suite, plain bash, no framework
 docker/       Dockerfile for the containerised lint toolchain
@@ -53,6 +54,8 @@ touching the system.
 | `bin/setup-no-localsend` | Remove LocalSend and the ufw rules that expose it | [docs/setup-no-localsend.md](docs/setup-no-localsend.md) |
 | `bin/setup-rootless-podman` | Swap Docker for rootless Podman, keeping the docker CLI | [docs/setup-rootless-podman.md](docs/setup-rootless-podman.md) |
 | `bin/setup-security-hardening` | Enforce a safe package, firewall, kernel, and credential-file baseline | [docs/setup-security-hardening.md](docs/setup-security-hardening.md) |
+| `bin/setup-opensnitch` | Opt-in deny-by-default outbound application firewall | [docs/setup-opensnitch.md](docs/setup-opensnitch.md) |
+| `bin/export-opensnitch-rules` | Export reviewed permanent allows for reuse across machines | [docs/setup-opensnitch.md](docs/setup-opensnitch.md) |
 | `bin/lint` | shellcheck in a container — no host tooling to install | [docs/lint.md](docs/lint.md) |
 
 Container images follow two rules: **reputable sources only** — Docker Official
@@ -60,7 +63,8 @@ Images, pinned by digest — and **small**, so a lint run costs seconds rather
 than minutes. The engine that runs them is Podman or Docker, whichever answers.
 
 Scripts are discovered automatically — a new `bin/setup-*` joins `setup-all`
-just by existing.
+just by existing. Scripts marked `# default: no`, such as OpenSnitch, run only
+when explicitly selected with `setup-all --only NAME`.
 
 ## Development
 

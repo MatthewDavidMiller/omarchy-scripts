@@ -1,0 +1,16 @@
+{
+  "action": "allow",
+  "created": "2026-08-29T00:00:00Z",
+  "duration": "always",
+  "enabled": true,
+  "name": "001-omarchy-allow-localhost-ipv6",
+  "operator": {
+    "data": "::1/128",
+    "list": [],
+    "operand": "dest.network",
+    "sensitive": false,
+    "type": "network"
+  },
+  "precedence": true,
+  "updated": "2026-08-29T00:00:00Z"
+}

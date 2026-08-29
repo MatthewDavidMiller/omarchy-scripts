@@ -1,0 +1,38 @@
+{
+  "action": "allow",
+  "created": "2026-08-29T00:00:00Z",
+  "duration": "always",
+  "enabled": true,
+  "name": "011-omarchy-allow-systemd-timesyncd-ntp",
+  "operator": {
+    "data": "",
+    "list": [
+      {
+        "data": "/usr/lib/systemd/systemd-timesyncd",
+        "list": null,
+        "operand": "process.path",
+        "sensitive": false,
+        "type": "simple"
+      },
+      {
+        "data": "123",
+        "list": null,
+        "operand": "dest.port",
+        "sensitive": false,
+        "type": "simple"
+      },
+      {
+        "data": "udp",
+        "list": null,
+        "operand": "protocol",
+        "sensitive": false,
+        "type": "simple"
+      }
+    ],
+    "operand": "list",
+    "sensitive": false,
+    "type": "list"
+  },
+  "precedence": true,
+  "updated": "2026-08-29T00:00:00Z"
+}

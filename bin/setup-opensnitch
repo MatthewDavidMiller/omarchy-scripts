@@ -1,0 +1,388 @@
+#!/usr/bin/env bash
+#
+# setup-opensnitch — install a maintainable outbound application firewall.
+#
+# order: 95
+# default: no
+# description: Opt-in deny-by-default outbound application firewall
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=../lib/common.sh
+source "$REPO_ROOT/lib/common.sh"
+
+DAEMON_CONFIG="${OPEN_SNITCH_DAEMON_CONFIG:-/etc/opensnitchd/default-config.json}"
+RULES_DIR="${OPEN_SNITCH_RULES_DIR:-/etc/opensnitchd/rules}"
+SHARED_RULES_DIR="${OPEN_SNITCH_SHARED_RULES_DIR:-$REPO_ROOT/config/opensnitch/rules}"
+GUI_SETTINGS="${OPEN_SNITCH_GUI_SETTINGS:-$HOME/.config/opensnitch/settings.conf}"
+AUTOSTART_FILE="${OPEN_SNITCH_AUTOSTART_FILE:-$HOME/.config/hypr/autostart.lua}"
+UI_LAUNCHER="${OPEN_SNITCH_UI_LAUNCHER:-$HOME/.local/bin/opensnitch-ui-secure}"
+RUNTIME_ROOT="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+RUNTIME_DIR="$RUNTIME_ROOT/opensnitch"
+SOCKET_PATH="$RUNTIME_DIR/osui.sock"
+SOCKET_ADDRESS="unix://$SOCKET_PATH"
+WORK_DIR=""
+
+usage() {
+  cat <<'USAGE'
+Usage: setup-opensnitch [options]
+
+Installs OpenSnitch from Arch Extra, imports this repository's shared rules,
+and enables deny-by-default outbound application control. UFW remains the
+inbound firewall. This script is opt-in; setup-all runs it only when selected
+with --only opensnitch.
+
+Options:
+  -n, --dry-run   Show what would change without changing anything.
+  -y, --yes       Accepted for setup-all compatibility; no prompts are used.
+  -h, --help      Show this help.
+
+Environment (primarily for tests):
+  OPEN_SNITCH_DAEMON_CONFIG    Daemon JSON path.
+  OPEN_SNITCH_RULES_DIR        Installed rules directory.
+  OPEN_SNITCH_SHARED_RULES_DIR Repository-managed rules directory.
+  OPEN_SNITCH_GUI_SETTINGS     GUI QSettings INI path.
+  OPEN_SNITCH_AUTOSTART_FILE   Hyprland user autostart path.
+  OPEN_SNITCH_UI_LAUNCHER      Secure GUI launcher path.
+  OPEN_SNITCH_SKIP_LIVE_UI     Set to 1 to configure without launching the GUI.
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--dry-run) DRY_RUN=1 ;;
+    -y|--yes)     ASSUME_YES=1 ;;
+    -h|--help)    usage; exit 0 ;;
+    *)            usage >&2; die "Unknown argument: $1" ;;
+  esac
+  shift
+done
+
+require_not_root
+require_cmd awk chmod cmp grep id mktemp omarchy pacman pgrep pkill python sleep sudo systemctl
+
+cleanup() {
+  [[ -n "$WORK_DIR" ]] && rm -rf -- "$WORK_DIR"
+}
+trap cleanup EXIT
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/omarchy-opensnitch.XXXXXX")"
+
+# Compare, back up, and install a root-owned file. Tests point destinations at
+# fixtures and stub sudo, so no test reaches the real system.
+install_root_file() {
+  local source="$1" destination="$2" mode="${3:-0644}" backup
+  if [[ -f "$destination" ]] && cmp -s "$source" "$destination"; then
+    skip "$destination already up to date"
+    return 1
+  fi
+  if [[ "$DRY_RUN" == "1" ]]; then
+    printf '%s  dry%s would write %s\n' "$C_DIM" "$C_RESET" "$destination"
+    return 0
+  fi
+  if [[ -f "$destination" ]]; then
+    backup="$destination.bak.$(date +%Y%m%d%H%M%S)"
+    sudo cp -a -- "$destination" "$backup"
+    ok "backed up $destination to $backup"
+  fi
+  sudo install -D -m "$mode" -- "$source" "$destination"
+  ok "wrote $destination"
+}
+
+verify_package_source() {
+  local repository
+  repository="$(LC_ALL=C pacman -Si opensnitch 2>/dev/null \
+    | awk -F: '/^Repository[[:space:]]*:/ { gsub(/[[:space:]]/, "", $2); print $2; exit }')"
+  [[ "$repository" == "extra" ]] \
+    || die "opensnitch is not available from Arch's official Extra repository"
+  ok "opensnitch is available from Arch Extra"
+}
+
+install_package() {
+  if omarchy pkg present opensnitch; then
+    skip "opensnitch already installed"
+  else
+    run omarchy pkg add opensnitch
+  fi
+  [[ "$DRY_RUN" == "1" ]] && return
+  omarchy pkg present opensnitch || die "opensnitch was not registered as installed"
+  systemctl cat opensnitchd.service >/dev/null 2>&1 \
+    || die "the opensnitch package did not provide opensnitchd.service"
+  [[ -r "${OPEN_SNITCH_EBPF_OBJECT:-/usr/lib/opensnitchd/ebpf/opensnitch.o}" ]] \
+    || die "the opensnitch package did not provide its eBPF monitor"
+}
+
+render_daemon_config() {
+  local output="$1"
+  python - "$DAEMON_CONFIG" "$output" "$SOCKET_ADDRESS" <<'PY'
+import json, sys
+
+source, destination, socket = sys.argv[1:]
+with open(source, encoding="utf-8") as handle:
+    config = json.load(handle)
+
+for key in ("Server", "FwOptions", "Rules"):
+    if not isinstance(config.get(key), dict):
+        raise SystemExit(f"unsupported OpenSnitch config: missing object {key}")
+
+config["Server"]["Address"] = socket
+config["DefaultAction"] = "deny"
+config["InterceptUnknown"] = False
+config["ProcMonitorMethod"] = "ebpf"
+config["Firewall"] = "nftables"
+config["Rules"]["EnableChecksums"] = True
+
+# OpenSnitch 1.7 uses QueueBypass; newer schemas use ActionOnOverflow. Only
+# modify keys understood by the installed package.
+if "QueueBypass" in config["FwOptions"]:
+    config["FwOptions"]["QueueBypass"] = False
+if "ActionOnOverflow" in config["FwOptions"]:
+    config["FwOptions"]["ActionOnOverflow"] = "drop"
+
+with open(destination, "w", encoding="utf-8") as handle:
+    json.dump(config, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+}
+
+render_gui_settings() {
+  local output="$1" input="$GUI_SETTINGS"
+  [[ -f "$input" ]] || input=/dev/null
+  awk -v socket="$SOCKET_ADDRESS" '
+    function emit_missing() {
+      if (!action) print "default_action=0"
+      if (!duration) print "default_duration=6"
+      if (!address) print "server_address=" socket
+    }
+    /^\[.*\]$/ {
+      if (global) emit_missing()
+      global = ($0 == "[global]")
+      if (global) { found=1; action=duration=address=0 }
+      print; next
+    }
+    global && /^default_action=/   { print "default_action=0"; action=1; next }
+    global && /^default_duration=/ { print "default_duration=6"; duration=1; next }
+    global && /^server_address=/   { print "server_address=" socket; address=1; next }
+    { print }
+    END {
+      if (global) emit_missing()
+      if (!found) {
+        if (NR) print ""
+        print "[global]"
+        print "default_action=0"
+        print "default_duration=6"
+        print "server_address=" socket
+      }
+    }
+  ' "$input" > "$output"
+}
+
+write_user_configuration() {
+  local launcher autostart rendered="$WORK_DIR/settings.conf"
+  render_gui_settings "$rendered"
+  write_file "$GUI_SETTINGS" < "$rendered"
+
+  launcher="$(cat <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/opensnitch"
+install -d -m 0700 -- "$runtime_dir"
+exec opensnitch-ui --background --socket "unix://$runtime_dir/osui.sock"
+EOF
+)"
+  write_file "$UI_LAUNCHER" <<< "$launcher"
+  if [[ "$DRY_RUN" != "1" && ! -x "$UI_LAUNCHER" ]]; then
+    chmod 0755 "$UI_LAUNCHER"
+  fi
+
+  autostart="$(awk '
+    /^-- BEGIN omarchy-scripts opensnitch$/ { managed=1; next }
+    /^-- END omarchy-scripts opensnitch$/   { managed=0; next }
+    !managed { print }
+  ' "$AUTOSTART_FILE" 2>/dev/null || true)"
+  autostart="${autostart%$'\n'}"
+  [[ -n "$autostart" ]] && autostart+=$'\n\n'
+  autostart+="-- BEGIN omarchy-scripts opensnitch"$'\n'
+  autostart+='o.launch_on_start("opensnitch-ui-secure")'$'\n'
+  autostart+="-- END omarchy-scripts opensnitch"
+  write_file "$AUTOSTART_FILE" <<< "$autostart"
+}
+
+stop_existing_ui() {
+  [[ "$DRY_RUN" == "1" || -z "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]] && return 0
+  if pgrep -u "$(id -u)" -x opensnitch-ui >/dev/null 2>&1; then
+    pkill -TERM -u "$(id -u)" -x opensnitch-ui || true
+    # Give QSettings a chance to flush before this script writes the canonical
+    # deny policy and private socket address.
+    for _ in {1..20}; do
+      pgrep -u "$(id -u)" -x opensnitch-ui >/dev/null 2>&1 || break
+      sleep 0.1
+    done
+    pgrep -u "$(id -u)" -x opensnitch-ui >/dev/null 2>&1 \
+      && die "the existing OpenSnitch UI did not stop; close it and rerun"
+  fi
+}
+
+rule_name() {
+  local source="$1"
+  if [[ -r "$source" ]]; then
+    python - "$source" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    value = json.load(handle)
+name = value.get("name")
+if not isinstance(name, str) or not name:
+    raise SystemExit(1)
+print(name)
+PY
+  else
+    sudo cat -- "$source" | python -c '
+import json, sys
+value = json.load(sys.stdin)
+name = value.get("name")
+if not isinstance(name, str) or not name:
+    raise SystemExit(1)
+print(name)'
+  fi
+}
+
+import_shared_rules() {
+  local source base destination name existing existing_name backup
+  local -a shared=() installed=()
+  shopt -s nullglob
+  shared=("$SHARED_RULES_DIR"/omarchy-shared-*.json)
+  shopt -u nullglob
+  [[ ${#shared[@]} -gt 0 ]] || die "no shared OpenSnitch rules found in $SHARED_RULES_DIR"
+
+  if [[ -d "$RULES_DIR" ]]; then
+    shopt -s nullglob
+    installed=("$RULES_DIR"/*.json)
+    shopt -u nullglob
+  fi
+
+  for source in "${shared[@]}"; do
+    python -m json.tool "$source" >/dev/null \
+      || die "invalid shared OpenSnitch rule: $source"
+    base="$(basename -- "$source")"
+    destination="$RULES_DIR/$base"
+    name="$(rule_name "$source")" || die "shared rule has no name: $source"
+
+    for existing in "${installed[@]+"${installed[@]}"}"; do
+      [[ "$existing" == "$destination" || ! -f "$existing" ]] && continue
+      existing_name="$(rule_name "$existing" 2>/dev/null || true)"
+      [[ "$existing_name" == "$name" ]] || continue
+      if [[ "$DRY_RUN" == "1" ]]; then
+        printf '%s  dry%s would replace duplicate rule %s\n' "$C_DIM" "$C_RESET" "$existing"
+      else
+        backup="$existing.bak.$(date +%Y%m%d%H%M%S)"
+        sudo cp -a -- "$existing" "$backup"
+        sudo rm -- "$existing"
+        ok "replaced duplicate rule $existing (backup: $backup)"
+      fi
+    done
+    install_root_file "$source" "$destination" || true
+  done
+
+  # This prefix is exclusively repository-owned, so pruning cannot touch rules
+  # created locally through the GUI.
+  for existing in "${installed[@]+"${installed[@]}"}"; do
+    base="$(basename -- "$existing")"
+    [[ "$base" == omarchy-shared-*.json ]] || continue
+    [[ -f "$SHARED_RULES_DIR/$base" ]] && continue
+    if [[ "$DRY_RUN" == "1" ]]; then
+      printf '%s  dry%s would prune %s\n' "$C_DIM" "$C_RESET" "$existing"
+    else
+      backup="$existing.bak.$(date +%Y%m%d%H%M%S)"
+      sudo cp -a -- "$existing" "$backup"
+      sudo rm -- "$existing"
+      ok "pruned $existing (backup: $backup)"
+    fi
+  done
+}
+
+configure_daemon() {
+  local rendered="$WORK_DIR/default-config.json"
+  if [[ ! -r "$DAEMON_CONFIG" && "$DRY_RUN" == "1" ]]; then
+    printf '%s  dry%s would securely patch %s\n' "$C_DIM" "$C_RESET" "$DAEMON_CONFIG"
+    return
+  fi
+  [[ -r "$DAEMON_CONFIG" ]] || die "cannot read $DAEMON_CONFIG after installation"
+  render_daemon_config "$rendered"
+  install_root_file "$rendered" "$DAEMON_CONFIG" || true
+}
+
+validate_hyprland() {
+  [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]] || return 0
+  have hyprctl || { warn "hyprctl unavailable; validate $AUTOSTART_FILE after login"; return; }
+  if [[ "$DRY_RUN" == "1" ]]; then
+    run hyprctl reload
+    run hyprctl configerrors
+    return
+  fi
+  hyprctl reload >/dev/null
+  local errors
+  errors="$(hyprctl configerrors)"
+  [[ -z "$errors" ]] || die "Hyprland config errors after OpenSnitch autostart update: $errors"
+  ok "Hyprland configuration is valid"
+}
+
+start_services() {
+  local gui_ready=0 i
+  if systemctl is-enabled --quiet opensnitchd.service 2>/dev/null; then
+    skip "opensnitchd.service already enabled"
+  else
+    run sudo systemctl enable opensnitchd.service
+  fi
+
+  if [[ "${OPEN_SNITCH_SKIP_LIVE_UI:-0}" == "1" || "$DRY_RUN" == "1" ]]; then
+    skip "live OpenSnitch UI launch skipped"
+  elif [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]] && have uwsm-app; then
+    uwsm-app -- "$UI_LAUNCHER" >"$WORK_DIR/opensnitch-ui.log" 2>&1 &
+    for ((i=0; i<50; i++)); do
+      [[ -S "$SOCKET_PATH" ]] && { gui_ready=1; break; }
+      sleep 0.1
+    done
+    [[ "$gui_ready" == "1" ]] \
+      || die "OpenSnitch UI did not create $SOCKET_PATH"
+    ok "OpenSnitch UI is listening on its private runtime socket"
+  else
+    warn "no live Hyprland session; the UI and enforcement will start at next login/boot"
+  fi
+
+  if [[ "$gui_ready" == "1" || "${OPEN_SNITCH_SKIP_LIVE_UI:-0}" == "1" ]]; then
+    if systemctl is-active --quiet opensnitchd.service 2>/dev/null; then
+      skip "opensnitchd.service already active; configuration and rules reload automatically"
+    else
+      run sudo systemctl start opensnitchd.service
+    fi
+    if [[ "$DRY_RUN" != "1" ]]; then
+      systemctl is-active --quiet opensnitchd.service \
+        || die "opensnitchd.service failed to start"
+    fi
+    ok "OpenSnitch outbound enforcement is active"
+  else
+    skip "daemon not started without a live UI; it remains enabled for boot"
+  fi
+}
+
+main() {
+  log "Installing OpenSnitch from Arch Extra"
+  verify_package_source
+  install_package
+
+  log "Configuring deny-by-default outbound control"
+  stop_existing_ui
+  write_user_configuration
+  validate_hyprland
+  configure_daemon
+
+  log "Synchronizing repository-managed OpenSnitch rules"
+  import_shared_rules
+
+  log "Enabling OpenSnitch"
+  start_services
+  ok "OpenSnitch setup complete; use export-opensnitch-rules to share durable allows"
+}
+
+main

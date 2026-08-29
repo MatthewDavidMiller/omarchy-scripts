@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+#
+# export-opensnitch-rules — copy selected durable allows into this repository.
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=../lib/common.sh
+source "$REPO_ROOT/lib/common.sh"
+
+RULES_DIR="${OPEN_SNITCH_RULES_DIR:-/etc/opensnitchd/rules}"
+EXPORT_DIR="${OPEN_SNITCH_SHARED_RULES_DIR:-$REPO_ROOT/config/opensnitch/rules}"
+ALLOW_MACHINE_SPECIFIC=0
+WORK_DIR=""
+SELECTORS=()
+
+usage() {
+  cat <<'USAGE'
+Usage: export-opensnitch-rules [options] [RULE ...]
+
+Exports selected enabled, permanent allow rules from /etc/opensnitchd/rules
+to config/opensnitch/rules. With no RULE arguments, opens an interactive
+multiselect. RULE may be an exact OpenSnitch rule name or source filename.
+
+Options:
+  -n, --dry-run                 Preview without writing project files.
+  -y, --yes                     Accepted for scripting compatibility.
+      --allow-machine-specific  Permit rules tied to a UID, home path,
+                                process hash/command, interface, or local IP.
+  -h, --help                    Show this help.
+
+Environment (primarily for tests):
+  OPEN_SNITCH_RULES_DIR         Installed rules directory.
+  OPEN_SNITCH_SHARED_RULES_DIR  Project export directory.
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--dry-run) DRY_RUN=1 ;;
+    -y|--yes)     ASSUME_YES=1 ;;
+    --allow-machine-specific) ALLOW_MACHINE_SPECIFIC=1 ;;
+    -h|--help)    usage; exit 0 ;;
+    --)           shift; SELECTORS+=("$@"); break ;;
+    -*)           usage >&2; die "Unknown argument: $1" ;;
+    *)            SELECTORS+=("$1") ;;
+  esac
+  shift
+done
+
+require_not_root
+require_cmd cp find install mktemp python sudo
+[[ -d "$RULES_DIR" ]] || die "OpenSnitch rules directory not found: $RULES_DIR"
+
+cleanup() {
+  [[ -n "$WORK_DIR" ]] && rm -rf -- "$WORK_DIR"
+}
+trap cleanup EXIT
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/omarchy-opensnitch-export.XXXXXX")"
+STAGED="$WORK_DIR/rules"
+mkdir -p "$STAGED"
+
+# Rules are normally root-owned. Stage read-only copies so JSON parsing and the
+# interactive menu never need to run as root.
+while IFS= read -r -d '' rule; do
+  if [[ -r "$rule" ]]; then
+    cp -- "$rule" "$STAGED/$(basename -- "$rule")"
+  else
+    sudo install -m 0644 -- "$rule" "$STAGED/$(basename -- "$rule")"
+  fi
+done < <(find "$RULES_DIR" -maxdepth 1 -type f -name '*.json' -print0)
+
+CATALOG="$WORK_DIR/catalog.tsv"
+python - "$STAGED" > "$CATALOG" <<'PY'
+import hashlib, ipaddress, json, pathlib, re, sys
+
+root = pathlib.Path(sys.argv[1])
+
+def walk_operator(operator):
+    if not isinstance(operator, dict):
+        return
+    yield operator
+    for child in operator.get("list") or []:
+        yield from walk_operator(child)
+
+def portability(rule):
+    reasons = set()
+    for op in walk_operator(rule.get("operator")):
+        operand = str(op.get("operand", ""))
+        data = str(op.get("data", ""))
+        if operand == "user.id":
+            reasons.add("UID")
+        if operand == "process.command":
+            reasons.add("exact command line")
+        if operand.startswith("process.hash"):
+            reasons.add("process hash")
+        if operand in ("iface.in", "iface.out"):
+            reasons.add("interface")
+        if operand in ("source.ip", "source.network", "dest.ip", "dest.network"):
+            try:
+                value = ipaddress.ip_network(data, strict=False)
+                if value.is_private or value.is_link_local:
+                    reasons.add("local IP/network")
+            except ValueError:
+                pass
+        if "/home/" in data or data.startswith("~/"):
+            reasons.add("home path")
+    return ", ".join(sorted(reasons))
+
+def summary(rule):
+    parts = []
+    for op in walk_operator(rule.get("operator")):
+        operand, data = op.get("operand"), op.get("data")
+        if operand and operand != "list" and data:
+            parts.append(f"{operand}={data}")
+    return " AND ".join(parts)[:180] or "no match summary"
+
+for path in sorted(root.glob("*.json")):
+    try:
+        rule = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as error:
+        print(f"warning: skipping invalid JSON {path.name}: {error}", file=sys.stderr)
+        continue
+    name = rule.get("name")
+    if not isinstance(name, str) or not name or any(c in name for c in "\t\r\n"):
+        print(f"warning: skipping rule with invalid name: {path.name}", file=sys.stderr)
+        continue
+    eligible = rule.get("enabled") is True and rule.get("action") == "allow" and rule.get("duration") == "always"
+    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:72] or "rule"
+    digest = hashlib.sha256(name.encode()).hexdigest()[:12]
+    output = f"omarchy-shared-{slug}-{digest}.json"
+    fields = (path.name, name, "yes" if eligible else "no", summary(rule), portability(rule) or "-", output)
+    print("\t".join(fields))
+PY
+
+[[ -s "$CATALOG" ]] || die "no readable OpenSnitch rules found in $RULES_DIR"
+
+declare -a CHOSEN=()
+declare -A PATH_BY_LABEL=()
+
+choose_interactively() {
+  [[ -t 0 && -t 1 ]] || die "no RULE specified and no interactive terminal available"
+  local file name eligible summary _issues _output label choice token input i
+  local -a labels=()
+  while IFS=$'\t' read -r file name eligible summary _issues _output; do
+    [[ "$eligible" == "yes" ]] || continue
+    label="$name — $summary [$file]"
+    labels+=("$label")
+    PATH_BY_LABEL["$label"]="$file"
+  done < "$CATALOG"
+  [[ ${#labels[@]} -gt 0 ]] || die "no enabled permanent allow rules are available to export"
+
+  if have gum && [[ -z "${TUI_NO_GUM:-}" ]]; then
+    while IFS= read -r choice; do
+      [[ -n "$choice" ]] && CHOSEN+=("${PATH_BY_LABEL[$choice]}")
+    done < <(gum choose --no-limit --header "Select portable OpenSnitch allows to export" "${labels[@]}")
+  else
+    printf 'Select portable OpenSnitch allows to export\n' >&2
+    for i in "${!labels[@]}"; do printf '  %2d) %s\n' $((i + 1)) "${labels[$i]}" >&2; done
+    read -r -p "Numbers (space/comma separated, blank cancels): " input
+    for token in ${input//,/ }; do
+      if [[ ! "$token" =~ ^[0-9]+$ ]] || (( token < 1 || token > ${#labels[@]} )); then
+        die "invalid selection: $token"
+      fi
+      CHOSEN+=("${PATH_BY_LABEL["${labels[$((token - 1))]}"]}")
+    done
+  fi
+  [[ ${#CHOSEN[@]} -gt 0 ]] || die "no rules selected"
+}
+
+resolve_selectors() {
+  local selector file name eligible _summary _issues _output found
+  for selector in "${SELECTORS[@]}"; do
+    found=0
+    while IFS=$'\t' read -r file name eligible _summary _issues _output; do
+      [[ "$selector" == "$file" || "$selector" == "$name" ]] || continue
+      [[ "$eligible" == "yes" ]] \
+        || die "$selector is not an enabled permanent allow rule"
+      CHOSEN+=("$file")
+      found=1
+    done < "$CATALOG"
+    [[ "$found" == "1" ]] || die "no exact OpenSnitch rule match: $selector"
+  done
+}
+
+if [[ ${#SELECTORS[@]} -eq 0 ]]; then
+  choose_interactively
+else
+  resolve_selectors
+fi
+
+declare -A SEEN=()
+for selected in "${CHOSEN[@]}"; do
+  [[ -n "${SEEN[$selected]:-}" ]] && continue
+  SEEN[$selected]=1
+
+  row="$(awk -F '\t' -v file="$selected" '$1 == file { print; exit }' "$CATALOG")"
+  IFS=$'\t' read -r _file name _eligible _summary issues output <<< "$row"
+  [[ "$issues" == "-" ]] && issues=""
+  if [[ -n "$issues" && "$ALLOW_MACHINE_SPECIFIC" != "1" ]]; then
+    die "$name is machine-specific ($issues); review it and rerun with --allow-machine-specific"
+  fi
+  [[ -z "$issues" ]] || warn "$name contains machine-specific fields: $issues"
+
+  normalized="$WORK_DIR/$output"
+  python - "$STAGED/$selected" "$normalized" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    rule = json.load(handle)
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    json.dump(rule, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+  write_file "$EXPORT_DIR/$output" < "$normalized"
+  ok "shared rule ready: $output"
+done
+
+ok "export complete; review and commit config/opensnitch/rules"

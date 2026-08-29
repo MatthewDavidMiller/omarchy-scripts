@@ -7,7 +7,9 @@
 # script declares its position with an `# order: NN` header comment
 # (default 50); ties break alphabetically.
 #
-# Every script is idempotent, so this is safe to re-run any time.
+# Every script is idempotent, so this is safe to re-run any time. A script
+# declaring `# default: no` remains available through --only but is omitted
+# from ordinary "run everything" invocations.
 #
 # Run with no arguments in a terminal it opens a TUI; pass any flag (or pipe
 # it) and it behaves as a plain non-interactive runner.
@@ -109,7 +111,7 @@ selected() {
 }
 
 discover() {
-  local file base
+  local file base default
   shopt -s nullglob
   for file in "$SCRIPT_DIR"/setup-*; do
     base="$(basename -- "$file")"
@@ -120,6 +122,10 @@ discover() {
       continue
     fi
     selected "${base#setup-}" || continue
+    default="$(meta "$file" default yes)"
+    if [[ ${#ONLY[@]} -eq 0 && "$default" == "no" ]]; then
+      continue
+    fi
     printf '%s\t%s\t%s\n' "$(meta "$file" order 50)" "$base" "$(meta "$file" description '')"
   done
   shopt -u nullglob

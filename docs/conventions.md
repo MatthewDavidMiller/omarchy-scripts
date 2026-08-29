@@ -21,6 +21,10 @@ half-configured machine without fear.
   # description: Shown by setup-all --list
   ```
 
+  A disruptive or specialized setup may declare `# default: no`. It remains
+  runnable directly and through `setup-all --only <name>`, but is omitted from
+  ordinary run-everything discovery.
+
   `order` defaults to 50. See [setup-all.md](setup-all.md) for the ranges.
   Keep `description` short and comma-free — it is a menu label, and `setup-all`
   rewrites commas to `·` so they cannot corrupt gum's selection list.

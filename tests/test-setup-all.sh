@@ -9,6 +9,8 @@ find "$repo/bin" -maxdepth 1 -name 'setup-*' ! -name 'setup-all' -delete
 make_setup_script "$repo/bin" setup-beta  50 "beta script"
 make_setup_script "$repo/bin" setup-alpha 10 "alpha script"
 make_setup_script "$repo/bin" setup-omega 90 "omega script"
+make_setup_script "$repo/bin" setup-optional 95 "optional script"
+sed -i '4i# default: no' "$repo/bin/setup-optional"
 
 setup_all() { "$repo/bin/setup-all" "$@" 2>&1; }
 
@@ -28,6 +30,12 @@ rm -f "$repo/bin/setup-noorder"
 it "runs every script when given none to skip"
 out="$(setup_all --no-tui)"
 assert_contains "$out" "All 3 script(s) completed"
+
+it "omits scripts declaring default: no from ordinary runs"
+assert_not_contains "$out" "[setup-optional]"
+
+it "--only explicitly selects a default: no script"
+assert_contains "$(setup_all --no-tui --only optional)" "[setup-optional]"
 
 it "passes --dry-run through to each script"
 assert_contains "$(setup_all --no-tui --dry-run)" "[setup-alpha] args: --dry-run"

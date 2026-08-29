@@ -27,6 +27,11 @@ for path in \
   bin/setup-all bin/setup-ssh-agent bin/setup-no-idle bin/setup-brave bin/setup-rpi-imager \
   bin/setup-no-localsend bin/setup-cat-background bin/setup-rootless-podman \
   bin/setup-security-hardening \
+  bin/setup-opensnitch bin/export-opensnitch-rules \
+  config/opensnitch/rules/omarchy-shared-000-allow-localhost-ipv4.json \
+  config/opensnitch/rules/omarchy-shared-001-allow-localhost-ipv6.json \
+  config/opensnitch/rules/omarchy-shared-010-allow-systemd-resolved.json \
+  config/opensnitch/rules/omarchy-shared-011-allow-systemd-timesyncd.json \
   assets/cat-wallpaper.png \
   bin/lint bin/install-hooks \
   packages/brave/PKGBUILD.template packages/brave/brave-launcher \
@@ -36,7 +41,9 @@ for path in \
   tests/run tests/helpers.sh tests/test-repo.sh \
   docs/ci.md docs/testing.md docs/setup-cat-background.md \
   docs/setup-rootless-podman.md \
-  docs/setup-security-hardening.md tests/test-setup-security-hardening.sh
+  docs/setup-security-hardening.md tests/test-setup-security-hardening.sh \
+  docs/setup-opensnitch.md tests/test-setup-opensnitch.sh \
+  tests/test-export-opensnitch-rules.sh
 do
   it "keeps $path tracked"
   if ignored "$path"; then fail "$path must not be ignored"; else pass; fi

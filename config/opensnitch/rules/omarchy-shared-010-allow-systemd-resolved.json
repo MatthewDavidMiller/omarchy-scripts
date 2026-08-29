@@ -1,0 +1,31 @@
+{
+  "action": "allow",
+  "created": "2026-08-29T00:00:00Z",
+  "duration": "always",
+  "enabled": true,
+  "name": "010-omarchy-allow-systemd-resolved-dns",
+  "operator": {
+    "data": "",
+    "list": [
+      {
+        "data": "/usr/lib/systemd/systemd-resolved",
+        "list": null,
+        "operand": "process.path",
+        "sensitive": false,
+        "type": "simple"
+      },
+      {
+        "data": "^(53|853)$",
+        "list": null,
+        "operand": "dest.port",
+        "sensitive": false,
+        "type": "regexp"
+      }
+    ],
+    "operand": "list",
+    "sensitive": false,
+    "type": "list"
+  },
+  "precedence": true,
+  "updated": "2026-08-29T00:00:00Z"
+}

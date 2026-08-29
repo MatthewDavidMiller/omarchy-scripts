@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+# bin/setup-opensnitch — package, config, rule synchronization, and systemd
+# behavior against disposable fixtures. No real firewall or service is touched.
+source "$(dirname "${BASH_SOURCE[0]}")/helpers.sh"
+
+STUBS="$TEST_TMP/stubs"
+
+# shellcheck disable=SC2016
+stub_bin "$STUBS" sudo '
+exec "$@"'
+
+# shellcheck disable=SC2016
+stub_bin "$STUBS" omarchy '
+db="${FAKE_PKG_DB:?}"
+case "$1 $2" in
+  "pkg present") [[ -f "$db/$3" ]] ;;
+  "pkg add") : > "$db/$3" ;;
+  *) echo "unexpected omarchy call: $*" >&2; exit 1 ;;
+esac'
+
+# shellcheck disable=SC2016
+stub_bin "$STUBS" pacman '
+printf "Repository      : %s\nName            : opensnitch\n" "${FAKE_OPEN_SNITCH_REPO:-extra}"'
+
+# shellcheck disable=SC2016
+stub_bin "$STUBS" systemctl '
+state="${FAKE_UNIT_STATE:?}"
+case "$*" in
+  "cat opensnitchd.service") exit 0 ;;
+  "is-enabled --quiet opensnitchd.service") [[ -f "$state/enabled" ]] ;;
+  "enable opensnitchd.service") : > "$state/enabled" ;;
+  "is-active --quiet opensnitchd.service") [[ -f "$state/active" ]] ;;
+  "start opensnitchd.service"|"restart opensnitchd.service") : > "$state/active" ;;
+  *) echo "unexpected systemctl call: $*" >&2; exit 1 ;;
+esac'
+
+stub_bin "$STUBS" pgrep 'exit 1'
+
+make_fixture() {
+  local root="$1"
+  mkdir -p "$root/etc/opensnitchd/rules" "$root/shared" "$root/pkgdb" "$root/units"
+  : > "$root/ebpf.o"
+  cat > "$root/etc/opensnitchd/default-config.json" <<'JSON'
+{
+  "Server": {"Address": "unix:///tmp/osui.sock", "LogFile": "/var/log/opensnitchd.log"},
+  "DefaultAction": "allow",
+  "InterceptUnknown": true,
+  "ProcMonitorMethod": "proc",
+  "Firewall": "iptables",
+  "FwOptions": {"QueueBypass": true, "ActionOnOverflow": "accept", "MonitorInterval": "15s"},
+  "Rules": {"Path": "/etc/opensnitchd/rules", "EnableChecksums": false},
+  "Stats": {"Workers": 6}
+}
+JSON
+  cp "$REPO_ROOT"/config/opensnitch/rules/*.json "$root/shared/"
+}
+
+run_setup() {
+  local home="$1" root="$2"; shift 2
+  HOME="$home" XDG_RUNTIME_DIR="$home/run" PATH="$STUBS:$PATH" \
+    FAKE_PKG_DB="$root/pkgdb" FAKE_UNIT_STATE="$root/units" \
+    FAKE_OPEN_SNITCH_REPO="${FAKE_OPEN_SNITCH_REPO:-extra}" \
+    HYPRLAND_INSTANCE_SIGNATURE="" \
+    OPEN_SNITCH_DAEMON_CONFIG="$root/etc/opensnitchd/default-config.json" \
+    OPEN_SNITCH_RULES_DIR="$root/etc/opensnitchd/rules" \
+    OPEN_SNITCH_SHARED_RULES_DIR="$root/shared" \
+    OPEN_SNITCH_EBPF_OBJECT="$root/ebpf.o" \
+    OPEN_SNITCH_GUI_SETTINGS="$home/.config/opensnitch/settings.conf" \
+    OPEN_SNITCH_AUTOSTART_FILE="$home/.config/hypr/autostart.lua" \
+    OPEN_SNITCH_UI_LAUNCHER="$home/.local/bin/opensnitch-ui-secure" \
+    OPEN_SNITCH_SKIP_LIVE_UI=1 \
+    "$REPO_ROOT/bin/setup-opensnitch" "$@" 2>&1
+}
+
+HOME_FIXTURE="$(make_fake_home)"
+ROOT_FIXTURE="$TEST_TMP/root"
+make_fixture "$ROOT_FIXTURE"
+
+cat > "$ROOT_FIXTURE/etc/opensnitchd/rules/old-local-name.json" <<'JSON'
+{
+  "name": "000-omarchy-allow-localhost-ipv4",
+  "enabled": true,
+  "action": "allow",
+  "duration": "always",
+  "operator": {"type": "simple", "operand": "dest.host", "data": "wrong.example"}
+}
+JSON
+printf '{"name":"stale","enabled":true}\n' \
+  > "$ROOT_FIXTURE/etc/opensnitchd/rules/omarchy-shared-stale.json"
+printf '{"name":"user-local","enabled":true}\n' \
+  > "$ROOT_FIXTURE/etc/opensnitchd/rules/user-local.json"
+
+run_setup "$HOME_FIXTURE" "$ROOT_FIXTURE" > "$TEST_TMP/initial-setup.out"
+setup_status=$?
+
+it "completes against a supported OpenSnitch package"
+assert_status 0 "$setup_status"
+
+it "installs opensnitch through omarchy pkg add"
+assert_file_contains "$STUBS/omarchy.log" "pkg add opensnitch"
+
+it "sets daemon enforcement to deny"
+assert_eq "deny" "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["DefaultAction"])' "$ROOT_FIXTURE/etc/opensnitchd/default-config.json")"
+
+it "uses nftables and eBPF with unknown traffic dropped"
+daemon_values="$(python -c 'import json,sys; c=json.load(open(sys.argv[1])); print(c["Firewall"], c["ProcMonitorMethod"], c["InterceptUnknown"])' "$ROOT_FIXTURE/etc/opensnitchd/default-config.json")"
+assert_eq "nftables ebpf False" "$daemon_values"
+
+it "turns queue bypass off for fail-closed behavior"
+assert_eq "False" "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["FwOptions"]["QueueBypass"])' "$ROOT_FIXTURE/etc/opensnitchd/default-config.json")"
+
+it "uses drop for newer overflow schemas"
+assert_eq "drop" "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["FwOptions"]["ActionOnOverflow"])' "$ROOT_FIXTURE/etc/opensnitchd/default-config.json")"
+
+it "preserves unrelated package configuration"
+assert_eq "6" "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["Stats"]["Workers"])' "$ROOT_FIXTURE/etc/opensnitchd/default-config.json")"
+
+it "uses the private per-user UI socket in daemon and GUI settings"
+assert_contains "$(cat "$ROOT_FIXTURE/etc/opensnitchd/default-config.json" "$HOME_FIXTURE/.config/opensnitch/settings.conf")" "$HOME_FIXTURE/run/opensnitch/osui.sock"
+
+it "keeps GUI prompts deny-by-default with temporary decisions"
+assert_contains "$(cat "$HOME_FIXTURE/.config/opensnitch/settings.conf")" $'default_action=0\ndefault_duration=6'
+
+it "adds the Omarchy-native GUI autostart entry"
+assert_file_contains "$HOME_FIXTURE/.config/hypr/autostart.lua" 'o.launch_on_start("opensnitch-ui-secure")'
+
+it "writes an executable private-socket UI launcher"
+if [[ -x "$HOME_FIXTURE/.local/bin/opensnitch-ui-secure" ]]; then pass; else fail "launcher is not executable"; fi
+
+it "imports the portable baseline rules"
+assert_file "$ROOT_FIXTURE/etc/opensnitchd/rules/omarchy-shared-010-allow-systemd-resolved.json"
+
+it "backs up and removes a duplicate local rule"
+assert_no_file "$ROOT_FIXTURE/etc/opensnitchd/rules/old-local-name.json"
+duplicate_backups=("$ROOT_FIXTURE"/etc/opensnitchd/rules/old-local-name.json.bak.*)
+assert_file "${duplicate_backups[0]}"
+
+it "prunes a stale repository-managed rule"
+assert_no_file "$ROOT_FIXTURE/etc/opensnitchd/rules/omarchy-shared-stale.json"
+
+it "never prunes an unrelated GUI-created rule"
+assert_file "$ROOT_FIXTURE/etc/opensnitchd/rules/user-local.json"
+
+it "enables and starts opensnitchd"
+assert_file_contains "$STUBS/systemctl.log" "enable opensnitchd.service"
+assert_file_contains "$STUBS/systemctl.log" "start opensnitchd.service"
+
+sudo_writes_before="$(grep -cE '^(install|rm|cp)' "$STUBS/sudo.log" || true)"
+system_writes_before="$(grep -cE '^(enable|start|restart)' "$STUBS/systemctl.log")"
+out2="$(run_setup "$HOME_FIXTURE" "$ROOT_FIXTURE")"
+
+it "a second run reports installed configuration as unchanged"
+assert_contains "$out2" "already up to date"
+
+it "a second run issues no root file writes"
+assert_eq "$sudo_writes_before" "$(grep -cE '^(install|rm|cp)' "$STUBS/sudo.log" || true)" "sudo writes"
+
+it "a second run does not restart or re-enable the service"
+assert_eq "$system_writes_before" "$(grep -cE '^(enable|start|restart)' "$STUBS/systemctl.log")" "systemd writes"
+
+# --- dry-run safety --------------------------------------------------------
+
+DRY_HOME="$(make_fake_home)"
+DRY_ROOT="$TEST_TMP/dry-root"
+make_fixture "$DRY_ROOT"
+config_before="$(cat "$DRY_ROOT/etc/opensnitchd/default-config.json")"
+dry_out="$(run_setup "$DRY_HOME" "$DRY_ROOT" --dry-run)"
+
+it "--dry-run previews package installation"
+assert_contains "$dry_out" "omarchy pkg add opensnitch"
+
+it "--dry-run leaves daemon configuration unchanged"
+assert_eq "$config_before" "$(cat "$DRY_ROOT/etc/opensnitchd/default-config.json")" "daemon config"
+
+it "--dry-run does not create user configuration"
+assert_no_file "$DRY_HOME/.config/opensnitch/settings.conf"
+
+it "--dry-run does not install shared rules"
+installed_count="$(find "$DRY_ROOT/etc/opensnitchd/rules" -name 'omarchy-shared-*.json' | wc -l)"
+assert_eq "0" "$installed_count" "installed shared rules"
+
+# --- package policy --------------------------------------------------------
+
+BAD_HOME="$(make_fake_home)"
+BAD_ROOT="$TEST_TMP/bad-root"
+make_fixture "$BAD_ROOT"
+it "rejects opensnitch from a non-Extra package source"
+FAKE_OPEN_SNITCH_REPO=community run_setup "$BAD_HOME" "$BAD_ROOT" >/dev/null 2>&1
+assert_status 1 $?
+
+it "help text is available without touching the system"
+assert_contains "$("$REPO_ROOT/bin/setup-opensnitch" --help)" "deny-by-default"
+
+it "rejects unknown arguments"
+"$REPO_ROOT/bin/setup-opensnitch" --not-an-option >/dev/null 2>&1
+assert_status 1 $?
+
+finish

@@ -14,7 +14,9 @@ Safe to run any time. Every script is idempotent, so a second run reports
 ## How scripts are discovered
 
 `setup-all` globs `bin/setup-*` (excluding itself). A new script joins the run
-just by existing and being executable — there is no list to update.
+just by existing and being executable — there is no list to update. A script
+with `# default: no` is opt-in: ordinary runs and `--list` omit it, while
+`--only NAME` selects it explicitly.
 
 Order comes from a header comment in each script:
 
@@ -25,6 +27,7 @@ Order comes from a header comment in each script:
 #
 # order: 20
 # description: Shown in --list and in the run header
+# default: no  # optional; omit this line for normal scripts
 ```
 
 `order` defaults to `50` if absent; ties break alphabetically. Leave gaps
