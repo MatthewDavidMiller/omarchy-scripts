@@ -331,8 +331,8 @@ SHAPE
 it "every committed baseline rule keeps the shared-rule shape"
 assert_eq "" "$shape_report" "baseline rule problems"
 
-it "ships the full baseline: system essentials, maintenance, and repo workflows"
+it "ships the full baseline: system essentials, maintenance, repo and project workflows"
 baseline_count="$(find "$REPO_ROOT/config/opensnitch/rules" -name 'omarchy-shared-*.json' | wc -l)"
-assert_eq "11" "$baseline_count" "baseline rule count"
+assert_eq "15" "$baseline_count" "baseline rule count"
 
 finish

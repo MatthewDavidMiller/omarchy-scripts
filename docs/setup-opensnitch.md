@@ -63,6 +63,7 @@ this" and "this repository's own workflow needs it" stays visible:
 | `000`–`039` | System essentials | localhost v4/v6; `systemd-resolved` on 53/853; `systemd-timesyncd` on UDP 123; `NetworkManager` to `ping.archlinux.org:80`; `avahi-daemon` to the mDNS multicast groups on UDP 5353 |
 | `040`–`059` | Scheduled system maintenance | `fwupd` to `fwupd.org`/`cdn.fwupd.org` for LVFS firmware metadata and images |
 | `060`–`079` | This repository's own tooling | `podman`/`docker` to Docker Hub for the `bin/lint` base image; rootless container egress to `dl-cdn.alpinelinux.org`; `curl` to the four hosts `packages/brave` downloads from |
+| `080`–`099` | Other projects' build toolchains on this machine | rootless container egress to the Rust distribution and crate registry, the Python package index, GitHub release assets and the RustSec advisory database, and the registries `trivy` pulls its vulnerability database from |
 
 The essentials keep login-time local IPC, name resolution, clock
 synchronization, connectivity detection, and `.local` discovery working without
@@ -99,6 +100,26 @@ Two of the tooling rules are worth reading before you copy them:
   fetch from, including the `*.githubusercontent.com` hosts that GitHub
   redirects release assets to. Constraining `curl` by destination is the point;
   a process-wide `curl` allow would be worse than no rule at all.
+
+The `080` band covers build toolchains belonging to other projects on this
+machine — currently `rpi-omt-client`, whose gates run entirely inside a
+container and therefore reach the network as pasta, exactly as `061` does.
+Because every rootless container shares that one helper, these rules cannot be
+scoped to a project; they are scoped to what the project downloads. That is the
+honest description of what they grant: any rootless container may reach
+`crates.io`, PyPI, GitHub, and the trivy database hosts. Keeping each purpose in
+its own numbered rule is what makes that reviewable — deleting the Python rule
+tells you immediately which gate stops working, where one merged
+"development" allow would not.
+
+Two consequences are worth stating plainly. A rule naming `github.com` alone
+would allow the request and deny the payload, because GitHub redirects release
+assets to `*.githubusercontent.com`; that alternation is load-bearing rather
+than defensive. And `083` deliberately omits `storage.googleapis.com`, which
+trivy's preferred `mirror.gcr.io` may redirect to: allowing it would open every
+Google Cloud Storage bucket to every container, and the `ghcr.io` fallback
+already completes the scan. A stall on the mirror is a prompt worth answering
+by hand rather than a hole worth opening permanently.
 
 Something that reaches the network on a timer rather than when you ask it to
 needs a permanent rule or it will prompt when nobody is at the machine.

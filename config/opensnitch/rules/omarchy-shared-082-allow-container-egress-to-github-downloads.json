@@ -1,0 +1,39 @@
+{
+  "action": "allow",
+  "created": "2026-08-30T00:00:00Z",
+  "description": "Rootless container egress to GitHub, used by rpi-omt-client's gate toolbox for the two pinned release binaries it installs (hadolint and trivy) and for the RustSec advisory database that cargo-deny clones on every supply-chain gate. The githubusercontent alternation is not optional: GitHub redirects release-asset downloads to those hosts, so a rule naming github.com alone allows the request and denies the payload. This is the widest rule in the band \u2014 it is host-scoped rather than repository-scoped, because neither the redirect targets nor a git clone expose the repository to the firewall.",
+  "duration": "always",
+  "enabled": true,
+  "name": "082-omarchy-allow-container-egress-to-github-downloads",
+  "operator": {
+    "data": "",
+    "list": [
+      {
+        "data": "^/usr/bin/(passt|pasta)(\\.avx2)?$",
+        "list": null,
+        "operand": "process.path",
+        "sensitive": false,
+        "type": "regexp"
+      },
+      {
+        "data": "^(github\\.com|[a-z0-9-]+\\.githubusercontent\\.com)$",
+        "list": null,
+        "operand": "dest.host",
+        "sensitive": false,
+        "type": "regexp"
+      },
+      {
+        "data": "443",
+        "list": null,
+        "operand": "dest.port",
+        "sensitive": false,
+        "type": "simple"
+      }
+    ],
+    "operand": "list",
+    "sensitive": false,
+    "type": "list"
+  },
+  "precedence": true,
+  "updated": "2026-08-30T00:00:00Z"
+}

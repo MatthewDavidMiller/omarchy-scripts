@@ -1,0 +1,39 @@
+{
+  "action": "allow",
+  "created": "2026-08-30T00:00:00Z",
+  "description": "Rootless container egress to the Python package index, used by rpi-omt-client's gate toolbox while it installs tests/requirements-dev.txt into its virtualenv. Two hosts only: pypi.org serves the index and files.pythonhosted.org serves the wheels it redirects to. A pip install from any other index still prompts, which is the check that a requirements file has not grown an --extra-index-url.",
+  "duration": "always",
+  "enabled": true,
+  "name": "081-omarchy-allow-container-egress-to-python-packages",
+  "operator": {
+    "data": "",
+    "list": [
+      {
+        "data": "^/usr/bin/(passt|pasta)(\\.avx2)?$",
+        "list": null,
+        "operand": "process.path",
+        "sensitive": false,
+        "type": "regexp"
+      },
+      {
+        "data": "^(pypi\\.org|files\\.pythonhosted\\.org)$",
+        "list": null,
+        "operand": "dest.host",
+        "sensitive": false,
+        "type": "regexp"
+      },
+      {
+        "data": "443",
+        "list": null,
+        "operand": "dest.port",
+        "sensitive": false,
+        "type": "simple"
+      }
+    ],
+    "operand": "list",
+    "sensitive": false,
+    "type": "list"
+  },
+  "precedence": true,
+  "updated": "2026-08-30T00:00:00Z"
+}

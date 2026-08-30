@@ -1,0 +1,39 @@
+{
+  "action": "allow",
+  "created": "2026-08-30T00:00:00Z",
+  "description": "Rootless container egress to the Rust distribution and crate registry, used by rpi-omt-client's gate toolbox while it installs the pinned toolchain (rustup components and the Windows GNU and musl targets) and resolves the workspace's dependencies. Attributed to pasta rather than podman because the traffic originates inside a container \u2014 see 061-omarchy-allow-container-egress-to-alpine-cdn for why the path is a pattern. Scoped to the four hosts rustup and a sparse-protocol cargo actually contact, so a build script that fetches from somewhere else still prompts.",
+  "duration": "always",
+  "enabled": true,
+  "name": "080-omarchy-allow-container-egress-to-rust-toolchain",
+  "operator": {
+    "data": "",
+    "list": [
+      {
+        "data": "^/usr/bin/(passt|pasta)(\\.avx2)?$",
+        "list": null,
+        "operand": "process.path",
+        "sensitive": false,
+        "type": "regexp"
+      },
+      {
+        "data": "^(static\\.rust-lang\\.org|(index|static)\\.crates\\.io|crates\\.io)$",
+        "list": null,
+        "operand": "dest.host",
+        "sensitive": false,
+        "type": "regexp"
+      },
+      {
+        "data": "443",
+        "list": null,
+        "operand": "dest.port",
+        "sensitive": false,
+        "type": "simple"
+      }
+    ],
+    "operand": "list",
+    "sensitive": false,
+    "type": "list"
+  },
+  "precedence": true,
+  "updated": "2026-08-30T00:00:00Z"
+}

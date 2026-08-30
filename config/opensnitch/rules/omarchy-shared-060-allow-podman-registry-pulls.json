@@ -1,7 +1,7 @@
 {
   "action": "allow",
   "created": "2026-08-29T00:00:00Z",
-  "description": "podman and the docker CLI shim pulling the digest-pinned base image that bin/lint builds its toolchain from. Scoped to Docker Hub's own registry, auth, and blob CDN hosts: a pull from anywhere else still prompts, which is the check that a Dockerfile has not quietly changed where its base comes from.",
+  "description": "podman and the docker CLI shim pulling the digest-pinned base images that bin/lint and other projects' toolchains build from. Scoped to Docker Hub's own registry, auth, and blob CDN hosts: a pull from anywhere else still prompts, which is the check that a Dockerfile has not quietly changed where its base comes from. Both CDN spellings are listed because Docker Hub serves blobs from production.cloudflare.docker.com or production.cloudfront.docker.com depending on the client and region \u2014 a rule carrying only one of them fails intermittently and looks like a network fault rather than a policy gap.",
   "duration": "always",
   "enabled": true,
   "name": "060-omarchy-allow-podman-registry-pulls",
@@ -16,7 +16,7 @@
         "type": "regexp"
       },
       {
-        "data": "^((registry-1|auth|index)\\.docker\\.io|production\\.cloudflare\\.docker\\.com)$",
+        "data": "^((registry-1|auth|index)\\.docker\\.io|production\\.(cloudflare|cloudfront)\\.docker\\.com)$",
         "list": null,
         "operand": "dest.host",
         "sensitive": false,
@@ -35,5 +35,5 @@
     "type": "list"
   },
   "precedence": true,
-  "updated": "2026-08-29T00:00:00Z"
+  "updated": "2026-08-30T00:00:00Z"
 }
