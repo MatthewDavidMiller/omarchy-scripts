@@ -60,11 +60,26 @@ case "$*" in
   *) echo "unexpected: $*" >&2; exit 1 ;;
 esac'
 
+# The managed-policy directory has to end up root-owned, which an unprivileged
+# test cannot produce. These runs name the invoking user as the owner the
+# script must enforce, so creation, repair, and verification are all exercised;
+# that the default owner really is root:root is asserted separately below.
+POLICY_OWNER="$(id -un):$(id -gn)"
+
+# policy_fixture <name> — a managed-policy directory under two ancestors, laid
+# out like /etc/brave/policies/managed.
+policy_fixture() { printf '%s/%s/brave/policies/managed' "$TEST_TMP" "$1"; }
+
+# policy_parents <dir> — the two ancestors of a fixture, shortest first.
+policy_parents() { printf '%s %s' "${1%/*/*}" "${1%/*}"; }
+
 brave_setup() {
   local home="$1" policy="$2" db="$3"; shift 3
   env HOME="$home" PATH="$STUBS:$PATH" \
       XDG_CONFIG_HOME="$home/.config" OMARCHY_ROOT="$OMARCHY_FIXTURE" \
-      BRAVE_POLICY_DIR="$policy" BRAVE_PREPARE_LATEST="$STUBS/prepare-latest" \
+      BRAVE_POLICY_DIR="$policy" BRAVE_POLICY_PARENTS="$(policy_parents "$policy")" \
+      BRAVE_POLICY_OWNER="$POLICY_OWNER" \
+      BRAVE_PREPARE_LATEST="$STUBS/prepare-latest" \
       FAKE_PKG_DB="$db" \
       "$REPO_ROOT/bin/setup-brave" "$@" 2>&1
 }
@@ -72,7 +87,7 @@ brave_setup() {
 # --- dry run ---------------------------------------------------------------
 
 DRY_HOME="$(make_fake_home)"
-DRY_POLICY="$TEST_TMP/dry-policy"
+DRY_POLICY="$(policy_fixture dry)"
 DRY_DB="$TEST_TMP/dry-package"
 out="$(brave_setup "$DRY_HOME" "$DRY_POLICY" "$DRY_DB" --dry-run --yes)"
 
@@ -94,7 +109,7 @@ if [[ ! -f "$STUBS/makepkg.log" ]]; then pass; else fail "makepkg was invoked"; 
 # --- install and idempotence ----------------------------------------------
 
 HOME_ONE="$(make_fake_home)"
-POLICY_ONE="$TEST_TMP/policy-one"
+POLICY_ONE="$(policy_fixture one)"
 DB_ONE="$TEST_TMP/package-one"
 out="$(brave_setup "$HOME_ONE" "$POLICY_ONE" "$DB_ONE" --yes)"
 
@@ -126,6 +141,13 @@ assert_not_contains "$(cat "$STUBS/omarchy.log")" "install chromium"
 it "creates and applies the Brave theme policy"
 if [[ -f "$POLICY_ONE/color.json" ]]; then pass; else fail "theme policy missing"; fi
 
+it "creates the managed-policy directory owned by the enforced owner"
+assert_eq "755 ${POLICY_OWNER%%:*}" "$(stat -c '%a %U' "$POLICY_ONE")" "policy directory"
+
+it "hardens the ancestors of the managed-policy directory too"
+assert_eq "755 755" \
+  "$(stat -c '%a' "${POLICY_ONE%/*/*}" "${POLICY_ONE%/*}" | paste -sd' ')" "ancestor modes"
+
 it "makes Brave the default browser"
 assert_eq "brave" "$(cat "$HOME_ONE/.default-browser")" "default browser"
 
@@ -150,10 +172,68 @@ assert_eq "$before_writes" "$after_writes" "default-browser writes"
 it "a second run reports the installed package"
 assert_contains "$out2" "already installed"
 
+it "a second run keeps the policy file the owner already wrote"
+assert_file "$POLICY_ONE/color.json"
+
+# --- policy-directory repair -----------------------------------------------
+# Omarchy 4 hardened the Chromium-family policy directories because anything
+# the user can write there is browser policy the whole machine trusts. Earlier
+# versions of this script created Brave's directory owned by the invoking user,
+# so a rerun has to take it back rather than leave it as it found it.
+
+LOOSE_HOME="$(make_fake_home)"
+LOOSE_POLICY="$(policy_fixture loose)"
+mkdir -p "$LOOSE_POLICY"
+chmod 0777 "$LOOSE_POLICY"
+loose_out="$(brave_setup "$LOOSE_HOME" "$LOOSE_POLICY" "$TEST_TMP/loose-package" --yes)"
+
+it "takes back a group- and world-writable policy directory"
+assert_eq "755" "$(stat -c '%a' "$LOOSE_POLICY")" "repaired policy mode"
+
+it "reports which directory it took back"
+assert_contains "$loose_out" "Taking $LOOSE_POLICY back"
+
+# The real machine needs root:root, which an unprivileged test cannot produce.
+# Record what the script asks sudo for, and confirm it refuses to report
+# success while the directory is still owned by the invoking user.
+RECORD_STUBS="$TEST_TMP/record-stubs"
+stub_bin "$RECORD_STUBS" sudo ''
+for command in omarchy makepkg pacman; do
+  ln -s "$STUBS/$command" "$RECORD_STUBS/$command"
+done
+ROOT_HOME="$(make_fake_home)"
+ROOT_POLICY="$(policy_fixture root)"
+mkdir -p "$ROOT_POLICY"
+: > "$ROOT_POLICY/color.json"
+root_out="$(env HOME="$ROOT_HOME" PATH="$RECORD_STUBS:$PATH" \
+  XDG_CONFIG_HOME="$ROOT_HOME/.config" OMARCHY_ROOT="$OMARCHY_FIXTURE" \
+  BRAVE_POLICY_DIR="$ROOT_POLICY" BRAVE_POLICY_PARENTS="$(policy_parents "$ROOT_POLICY")" \
+  BRAVE_PREPARE_LATEST="$STUBS/prepare-latest" \
+  FAKE_PKG_DB="$TEST_TMP/root-package" \
+  "$REPO_ROOT/bin/setup-brave" --yes 2>&1)"
+status=$?
+
+it "asks for a root-owned managed-policy directory by default"
+assert_file_contains "$RECORD_STUBS/sudo.log" \
+  "install -d -m 0755 -o root -g root -- $ROOT_POLICY"
+
+it "hardens the default ancestors too"
+assert_file_contains "$RECORD_STUBS/sudo.log" \
+  "install -d -m 0755 -o root -g root -- ${ROOT_POLICY%/*}"
+
+it "removes policy files root did not write"
+assert_file_contains "$RECORD_STUBS/sudo.log" "rm -rf -- $ROOT_POLICY/color.json"
+
+it "fails when the policy directory could not be taken back"
+assert_status 1 "$status"
+
+it "explains that the policy directory is still not root-owned"
+assert_contains "$root_out" "policy directory is not a root-owned 0755 directory"
+
 # --- upgrades and failures -------------------------------------------------
 
 OLD_HOME="$(make_fake_home)"
-OLD_POLICY="$TEST_TMP/old-policy"
+OLD_POLICY="$(policy_fixture old)"
 OLD_DB="$TEST_TMP/old-package"
 printf '1.93.136-1\n' > "$OLD_DB"
 brave_setup "$OLD_HOME" "$OLD_POLICY" "$OLD_DB" --yes >/dev/null
@@ -164,7 +244,9 @@ assert_eq "1.93.138-1" "$(cat "$OLD_DB")" "upgraded package version"
 FAIL_HOME="$(make_fake_home)"
 env HOME="$FAIL_HOME" PATH="$STUBS:$PATH" \
   XDG_CONFIG_HOME="$FAIL_HOME/.config" OMARCHY_ROOT="$OMARCHY_FIXTURE" \
-  BRAVE_POLICY_DIR="$TEST_TMP/fail-policy" BRAVE_PREPARE_LATEST="$STUBS/prepare-latest" \
+  BRAVE_POLICY_DIR="$(policy_fixture fail)" BRAVE_POLICY_OWNER="$POLICY_OWNER" \
+  BRAVE_POLICY_PARENTS="$(policy_parents "$(policy_fixture fail)")" \
+  BRAVE_PREPARE_LATEST="$STUBS/prepare-latest" \
   FAKE_PKG_DB="$TEST_TMP/fail-package" \
   MAKEPKG_FAIL=1 "$REPO_ROOT/bin/setup-brave" --yes >/dev/null 2>&1
 status=$?
@@ -185,7 +267,9 @@ for command in omarchy makepkg sudo; do
 done
 conflict_out="$(env HOME="$CONFLICT_HOME" PATH="$CONFLICT_STUBS:$PATH" \
   XDG_CONFIG_HOME="$CONFLICT_HOME/.config" OMARCHY_ROOT="$OMARCHY_FIXTURE" \
-  BRAVE_POLICY_DIR="$TEST_TMP/conflict-policy" BRAVE_PREPARE_LATEST="$STUBS/prepare-latest" \
+  BRAVE_POLICY_DIR="$(policy_fixture conflict)" BRAVE_POLICY_OWNER="$POLICY_OWNER" \
+  BRAVE_POLICY_PARENTS="$(policy_parents "$(policy_fixture conflict)")" \
+  BRAVE_PREPARE_LATEST="$STUBS/prepare-latest" \
   FAKE_PKG_DB="$TEST_TMP/conflict-package" \
   "$REPO_ROOT/bin/setup-brave" --yes 2>&1)"
 status=$?
@@ -199,7 +283,9 @@ assert_contains "$conflict_out" "Remove conflicting package brave-bin"
 NOOP_HOME="$(make_fake_home)"
 noop_out="$(env HOME="$NOOP_HOME" PATH="$STUBS:$PATH" \
   XDG_CONFIG_HOME="$NOOP_HOME/.config" OMARCHY_ROOT="$OMARCHY_FIXTURE" \
-  BRAVE_POLICY_DIR="$TEST_TMP/noop-policy" BRAVE_PREPARE_LATEST="$STUBS/prepare-latest" \
+  BRAVE_POLICY_DIR="$(policy_fixture noop)" BRAVE_POLICY_OWNER="$POLICY_OWNER" \
+  BRAVE_POLICY_PARENTS="$(policy_parents "$(policy_fixture noop)")" \
+  BRAVE_PREPARE_LATEST="$STUBS/prepare-latest" \
   FAKE_PKG_DB="$TEST_TMP/noop-package" \
   MAKEPKG_NOOP=1 "$REPO_ROOT/bin/setup-brave" --yes 2>&1)"
 status=$?

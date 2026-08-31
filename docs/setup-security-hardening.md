@@ -16,8 +16,8 @@ that remove Docker and LocalSend firewall rules.
 
 ### Omarchy package signatures
 
-Omarchy packages are signed by the key in `omarchy-keyring`, but Omarchy 4.0.1
-ships its repository with this permissive policy:
+Older Omarchy installs carried a permissive override on their package
+repository:
 
 ```ini
 [omarchy]
@@ -25,17 +25,24 @@ SigLevel = Optional TrustAll
 ```
 
 That validates a signature when one is present but does not reject an unsigned
-package. The script verifies the expected Omarchy fingerprint is present and
-fully trusted, then changes only that repository to:
+package. Omarchy 4 now signs its packages and dropped that override in its own
+migration, so a current install inherits the global `SigLevel = Required
+DatabaseOptional` instead.
+
+The script verifies the expected Omarchy fingerprint is present and fully
+trusted, then states the requirement on the repository itself:
 
 ```ini
 SigLevel = Required DatabaseOptional TrustedOnly
 ```
 
-Package signatures therefore become mandatory and must come from a fully
-trusted key. Repository database signatures remain optional because the
-Omarchy database is not signed. `LocalFileSigLevel` is left alone so the vetted
-Brave recipe in this repository can still install its locally built package.
+`TrustedOnly` is pacman's default, so on an up-to-date machine this is the
+inherited policy written down where it applies: the repository keeps requiring
+trusted signatures even if the global default is later loosened, and a machine
+that never ran Omarchy's migration is repaired here. Repository database
+signatures remain optional because the Omarchy database is not signed.
+`LocalFileSigLevel` is left alone so the vetted Brave recipe in this repository
+can still install its locally built package.
 
 The old pacman configuration is backed up before the change. A missing,
 different, or untrusted Omarchy signing key stops the script before it changes
@@ -92,8 +99,11 @@ The final audit reports, but never changes:
 - disk encryption and non-loopback listeners;
 - SDDM autologin and Omarchy's stay-awake state;
 - whether the default desktop keyring locks;
-- `docker`, `empower`, and `input` group membership;
-- Avahi, printer discovery, and Bluetooth availability;
+- `docker`, `empower`, and `input` group membership — Omarchy 4 no longer
+  grants `input`, so membership that remains is reported with the command that
+  drops it;
+- Avahi and Bluetooth availability, and `cups-browsed` if it is still enabled
+  after Omarchy 4 removed automatic printer discovery;
 - AppArmor, kernel lockdown, IOMMU, and Secure Boot status.
 
 The keyring check reads only the `[keyring]` metadata block. Stored credential
@@ -105,7 +115,8 @@ This safe profile does not enable AppArmor, USBGuard, a hardened kernel, Secure
 Boot, IOMMU boot parameters, kernel lockdown, service sandbox overrides, or
 coredump restrictions. It also preserves autologin, disabled idle locking,
 unlimited SSH-agent lifetime, Bluetooth, discovery services, and `input` group
-membership.
+membership. Group membership and service state are reported, never changed:
+dropping the `input` group or a withdrawn discovery daemon is left to you.
 
 ## Options
 

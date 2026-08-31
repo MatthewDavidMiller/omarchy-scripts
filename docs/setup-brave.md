@@ -33,13 +33,26 @@ After package installation, the script:
 1. Installs Omarchy's Chromium flags for native Wayland, filtered through
    `setup-no-chromium-extensions` so Copy URL, Download Video, and WhatsApp Slim
    remain disabled.
-2. Creates Brave's managed-policy directory and applies the current theme.
+2. Creates Brave's managed-policy directory, `/etc/brave/policies/managed`,
+   and applies the current theme.
 3. Selects Brave through `omarchy default browser brave`, which updates XDG URL
    handlers.
 
 It deliberately does not install the Copy URL or video-download native
 messaging integrations. This keeps standalone Brave setup consistent with the
 repository's Chromium-extension removal script.
+
+### Managed-policy ownership
+
+Chromium-family managed policy applies to every profile on the machine, so the
+directory it is read from and each of its ancestors are created `root`-owned
+and `0755` — anything the invoking user could write there would be browser
+policy the whole system trusts. Omarchy 4 hardened these directories for the
+same reason and now writes `color.json` itself through a privileged helper.
+
+Earlier versions of this script created the directory owned by the invoking
+user. A rerun takes it back, removes policy files `root` did not write, and
+refuses to report success while the directory is still owned by anyone else.
 
 Each state is checked independently, making the script safe to rerun or use to
 repair a partial setup.

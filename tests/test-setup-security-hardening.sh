@@ -98,7 +98,7 @@ stub_bin "$STUBS" ss 'printf "udp UNCONN 0 0 0.0.0.0:5353 0.0.0.0:*\n"'
 stub_bin "$STUBS" fwupdmgr 'printf "UEFI secure boot: Disabled\n"'
 
 # The real account running tests is irrelevant; make the audit deterministic
-# and expose the intentionally retained input-group warning.
+# and expose the input-group warning.
 # shellcheck disable=SC2016
 stub_bin "$STUBS" id '
 case "$1" in
@@ -282,6 +282,12 @@ assert_eq "600" "$(stat -c '%a' "$KEYRING_FILE")" "keyring mode"
 
 it "reports deliberately preserved convenience and device risks"
 assert_contains "$out" "SDDM autologin remains enabled by choice"
+
+it "warns that input-group membership is no longer something Omarchy grants"
+assert_contains "$out" "input-group membership allows unprivileged keylogging"
+
+it "warns about the printer-discovery daemon Omarchy withdrew"
+assert_contains "$out" "cups-browsed is still enabled"
 
 it "reports a real non-loopback listener without inventing a blank one"
 assert_contains "$out" "udp 0.0.0.0:5353"

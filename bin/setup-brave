@@ -22,8 +22,13 @@ PREPARE_LATEST="${BRAVE_PREPARE_LATEST:-$PACKAGE_DIR/prepare-latest}"
 EXTENSION_FILTER="${BRAVE_EXTENSION_FILTER:-$REPO_ROOT/bin/setup-no-chromium-extensions}"
 OMARCHY_ROOT="${OMARCHY_ROOT:-/usr/share/omarchy}"
 POLICY_DIR="${BRAVE_POLICY_DIR:-/etc/brave/policies/managed}"
-CURRENT_USER="$(id -un)"
-CURRENT_GROUP="$(id -gn)"
+# Ancestors of the managed directory, shortest first. Omarchy hardens these as
+# well: a directory the user owns anywhere on the path lets the leaf be renamed
+# aside and replaced with one they control.
+read -r -a POLICY_PARENTS <<< "${BRAVE_POLICY_PARENTS-/etc/brave /etc/brave/policies}"
+POLICY_OWNER="${BRAVE_POLICY_OWNER:-root:root}"
+POLICY_USER="${POLICY_OWNER%%:*}"
+POLICY_GROUP="${POLICY_OWNER##*:}"
 FLAGS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/brave-flags.conf"
 
 usage() {
@@ -56,7 +61,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 require_not_root
-require_cmd omarchy pacman makepkg sudo
+require_cmd omarchy pacman makepkg sudo find stat
 [[ "$(uname -m)" == "x86_64" ]] \
   || die "The vetted Brave package currently supports x86_64 only"
 [[ -f "$PACKAGE_DIR/PKGBUILD.template" && -f "$PACKAGE_DIR/brave-launcher" \
@@ -107,12 +112,70 @@ cp "$OMARCHY_ROOT/config/chromium-flags.conf" "$build_dir/brave-flags.conf"
 CHROMIUM_FLAGS_DIR="$build_dir" "$EXTENSION_FILTER" --yes >/dev/null
 write_file "$FLAGS_FILE" < "$build_dir/brave-flags.conf"
 
-if [[ ! -d "$POLICY_DIR" || ! -w "$POLICY_DIR" ]]; then
-  log "Creating Brave's managed-policy directory"
-  run sudo install -d -m 0755 -o "$CURRENT_USER" -g "$CURRENT_GROUP" "$POLICY_DIR"
-else
-  skip "Brave policy directory is ready"
-fi
+# Chromium-family managed policy applies to every profile on the machine, so
+# every directory on the way to it has to be root-owned: anything the user can
+# write there is browser policy the whole system trusts. Omarchy 4 hardened
+# these directories for that reason, and now writes color.json itself through a
+# privileged helper, so the only thing left here is to present the directory
+# Brave reads in the same shape — including repairing one that an earlier
+# version of this script created owned by the invoking user.
+#
+# policy_dir_hardened <dir> — true when <dir> is a real directory owned by
+# POLICY_USER with no group or world write access.
+policy_dir_hardened() {
+  local dir="$1"
+  [[ -d "$dir" && ! -L "$dir" ]] || return 1
+  [[ "$(stat -c '%U' -- "$dir")" == "$POLICY_USER" ]] || return 1
+  [[ "$(stat -c '%a' -- "$dir")" == "755" ]] || return 1
+}
+
+# ensure_policy_dir <dir> — create <dir>, or take back one this script left
+# owned by the invoking user. install -d applies ownership and mode to a
+# directory that already exists, so it serves both.
+ensure_policy_dir() {
+  local dir="$1"
+
+  if [[ -L "$dir" || ( -e "$dir" && ! -d "$dir" ) ]]; then
+    die "$dir is not a directory; inspect and remove it before rerunning"
+  fi
+
+  if policy_dir_hardened "$dir"; then
+    skip "$dir is already owned by $POLICY_USER"
+    return 0
+  fi
+
+  if [[ -d "$dir" ]]; then
+    log "Taking $dir back for $POLICY_USER"
+  else
+    log "Creating $dir"
+  fi
+  run sudo install -d -m 0755 -o "$POLICY_USER" -g "$POLICY_GROUP" -- "$dir"
+  [[ "$DRY_RUN" == "1" ]] || ok "$dir is owned by $POLICY_USER"
+}
+
+# purge_foreign_policy_files <dir> — remove policy files POLICY_USER does not
+# own, the way Omarchy's own repair does. A root-owned directory holding a
+# user-owned color.json still lets that user set machine-wide policy; the theme
+# step below writes a root-owned replacement.
+purge_foreign_policy_files() {
+  local dir="$1" entry
+  local -a foreign=()
+
+  [[ -d "$dir" ]] || return 0
+  while IFS= read -r -d '' entry; do
+    foreign+=("$entry")
+  done < <(find "$dir" -mindepth 1 -maxdepth 1 ! -user "$POLICY_USER" -print0)
+
+  for entry in "${foreign[@]}"; do
+    run sudo rm -rf -- "$entry"
+    [[ "$DRY_RUN" == "1" ]] || ok "removed $entry, which $POLICY_USER did not write"
+  done
+}
+
+for policy_path in "${POLICY_PARENTS[@]}" "$POLICY_DIR"; do
+  ensure_policy_dir "$policy_path"
+done
+purge_foreign_policy_files "$POLICY_DIR"
 
 if [[ ! -f "$POLICY_DIR/color.json" ]]; then
   log "Applying the current Omarchy browser theme to Brave"
@@ -139,5 +202,7 @@ fi
 [[ -f "$FLAGS_FILE" ]] || die "Brave's Omarchy flags are missing"
 [[ -f "$POLICY_DIR/color.json" ]] \
   || die "Brave's Omarchy theme policy is missing"
+policy_dir_hardened "$POLICY_DIR" \
+  || die "Brave's policy directory is not a $POLICY_USER-owned 0755 directory"
 
 ok "Vetted Brave installed with Omarchy integration and set as default"

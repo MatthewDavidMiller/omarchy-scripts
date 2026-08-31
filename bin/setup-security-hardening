@@ -416,10 +416,20 @@ security_report() {
     && report_item WARN "docker-group membership grants root-equivalent daemon access"
   [[ "$groups" == *' empower '* ]] \
     && report_item WARN "empower-group membership grants passwordless privileged actions"
+  # Omarchy 4 stopped granting this by default: its own migration drops the
+  # membership unless the controller or ydotool installer asked for it. What is
+  # left here is either deliberate or an Omarchy 3 leftover, and either way it
+  # lets any process running as this user read and synthesize raw input.
   [[ "$groups" == *' input '* ]] \
-    && report_item WARN "input-group membership can bypass Wayland input isolation; retained by choice"
+    && report_item WARN "input-group membership allows unprivileged keylogging; Omarchy no longer grants it (drop with: sudo gpasswd -d $(id -un) input)"
 
-  for service in avahi-daemon.service cups-browsed.service bluetooth.service; do
+  # cups-browsed ran as root and acted on printer announcements from the
+  # network. Omarchy 4 removed it, so a machine still running it kept a daemon
+  # the distribution has withdrawn rather than one it ships.
+  service_enabled_or_active cups-browsed.service \
+    && report_item WARN "cups-browsed is still enabled; Omarchy removed automatic printer discovery"
+
+  for service in avahi-daemon.service bluetooth.service; do
     service_enabled_or_active "$service" \
       && report_item INFO "$service remains available by choice"
   done
