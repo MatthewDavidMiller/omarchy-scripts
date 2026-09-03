@@ -333,6 +333,6 @@ assert_eq "" "$shape_report" "baseline rule problems"
 
 it "ships the full baseline: system essentials, maintenance, repo and project workflows"
 baseline_count="$(find "$REPO_ROOT/config/opensnitch/rules" -name 'omarchy-shared-*.json' | wc -l)"
-assert_eq "15" "$baseline_count" "baseline rule count"
+assert_eq "17" "$baseline_count" "baseline rule count"
 
 finish

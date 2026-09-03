@@ -1,0 +1,39 @@
+{
+  "action": "allow",
+  "created": "2026-09-02T00:00:00Z",
+  "description": "mise resolving tool versions and downloading releases. mise-versions.jdx.dev serves the version manifest; the GitHub hosts serve the release metadata and assets. Read this as what it is: mise may reach all of GitHub. That is inherent to fetching arbitrary tool releases, and the alternative -- a process-wide mise allow -- would be worse. release-assets.githubusercontent.com is pinned exactly rather than reusing the broader [a-z0-9-]+.githubusercontent.com alternation of 062/082, so an asset served from another subdomain raises a prompt instead of passing silently.",
+  "duration": "always",
+  "enabled": true,
+  "name": "084-omarchy-allow-mise-tool-downloads",
+  "operator": {
+    "data": "",
+    "list": [
+      {
+        "data": "/usr/bin/mise",
+        "list": null,
+        "operand": "process.path",
+        "sensitive": false,
+        "type": "simple"
+      },
+      {
+        "data": "^(mise-versions\\.jdx\\.dev|api\\.github\\.com|github\\.com|release-assets\\.githubusercontent\\.com)$",
+        "list": null,
+        "operand": "dest.host",
+        "sensitive": false,
+        "type": "regexp"
+      },
+      {
+        "data": "443",
+        "list": null,
+        "operand": "dest.port",
+        "sensitive": false,
+        "type": "simple"
+      }
+    ],
+    "operand": "list",
+    "sensitive": false,
+    "type": "list"
+  },
+  "precedence": true,
+  "updated": "2026-09-02T00:00:00Z"
+}

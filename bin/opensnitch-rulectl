@@ -21,6 +21,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -416,8 +417,14 @@ def select(rules: list, names: list[str]) -> list:
 
 def cmd_list(service: UIService, args) -> None:
     rules = sorted(service.rules, key=lambda rule: rule.name)
+    if args.temporary:
+        rules = [rule for rule in rules if rule.duration != "always"]
     if not rules:
-        warn("the daemon has no rules loaded")
+        if args.temporary:
+            # Not a warning. This is the state you want to be in.
+            ok("no temporary rules are loaded")
+        else:
+            warn("the daemon has no rules loaded")
         return
     width = max(len(rule.name) for rule in rules)
     for rule in rules:
@@ -459,6 +466,161 @@ def cmd_delete(service: UIService, args) -> None:
     for rule in rules:
         service.notify(ui_pb2.Notification(type=ui_pb2.DELETE_RULE, rules=[rule]))
         ok(f"deleted {rule.name}")
+
+
+# --- promotion ----------------------------------------------------------------
+
+# The bands documented in docs/setup-opensnitch.md: 000-099 is the portable
+# baseline that ships to every machine, 100-199 is machine-local.
+SHARED_BAND = range(0, 100)
+LOCAL_BAND = range(100, 200)
+VERSION_IN_PATH = re.compile(r"/\d+(\.\d+)+")
+SLUG = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+
+
+def operand_data(operator):
+    """Every (operand, data) pair in a rule's operator tree."""
+    if not isinstance(operator, dict):
+        return
+    yield str(operator.get("operand") or ""), str(operator.get("data") or "")
+    for child in operator.get("list") or []:
+        yield from operand_data(child)
+
+
+def promoted_filename(number: str, slug: str, scope: str) -> str:
+    return (
+        f"omarchy-shared-{number}-{slug}.json"
+        if scope == "shared"
+        else f"{number}-{slug}.json"
+    )
+
+
+def promote_rule(value: dict, *, number, slug, description, scope, precedence) -> dict:
+    """Turn a learned temporary rule into a curated permanent one.
+
+    Pure: no socket, no filesystem. `promote --from-file` runs exactly this
+    code path, which is what makes the whole transformation testable without a
+    daemon to talk to.
+    """
+    if not re.fullmatch(r"\d{3}", number):
+        die(f"--number must be three digits, not {number!r}")
+    if not SLUG.match(slug):
+        die(f"--slug must be lowercase words joined by hyphens, not {slug!r}")
+    if not description.strip():
+        die(
+            "--description is required: a year from now it is the only thing "
+            "separating a deliberate exception from a panicked click"
+        )
+
+    band = int(number)
+    action = str(value.get("action", ""))
+    pairs = list(operand_data(value.get("operator")))
+    operands = {operand for operand, _ in pairs}
+    machine_specific = [
+        f"{operand}={data}"
+        for operand, data in pairs
+        if data.startswith("~/") or "/home/" in data
+    ]
+    if "user.id" in operands:
+        machine_specific.append("user.id")
+
+    if scope == "shared":
+        # These are the invariants tests/test-setup-opensnitch.sh enforces on
+        # config/opensnitch/rules. Refusing them here means a rule never lands
+        # in the tree in a shape the suite will reject.
+        if band not in SHARED_BAND:
+            die(f"{number} is outside the portable band 000-099")
+        if action != "allow":
+            die("the portable baseline is allow-only; use --scope local for a deny")
+        if "process.command" in operands:
+            die("process.command cannot be portable; use --scope local")
+        if machine_specific:
+            die("machine-specific fields cannot be portable: " + ", ".join(machine_specific))
+    else:
+        if band not in LOCAL_BAND:
+            die(f"{number} is outside the machine-local band 100-199")
+        for field in machine_specific:
+            warn(f"machine-local rule keeps {field}")
+
+    for operand, data in pairs:
+        if operand.startswith("process.") and VERSION_IN_PATH.search(data):
+            warn(
+                f"{operand} looks version-pinned ({data}); match the version "
+                "component with a regexp or the rule dies at the next update"
+            )
+
+    if precedence is None:
+        # An allow has to outrank the temporary denies a timed-out prompt
+        # leaves behind. A deny is left low so a future curated allow can win
+        # without editing it -- see 190-deny-avahi-non-mdns.
+        precedence = action == "allow"
+
+    stamp = datetime.now().isoformat(timespec="microseconds") + "Z"
+    promoted = dict(value)
+    promoted.update(
+        {
+            "name": f"{number}-omarchy-{slug}" if scope == "shared" else f"{number}-{slug}",
+            "description": description.strip(),
+            "duration": "always",
+            "enabled": True,
+            "precedence": precedence,
+            "created": stamp,
+            "updated": stamp,
+        }
+    )
+    return promoted
+
+
+def cmd_promote(service, args) -> None:
+    if args.from_file:
+        source = pathlib.Path(args.from_file)
+        try:
+            raw = json.loads(source.read_text())
+        except FileNotFoundError:
+            die(f"no such file: {source}")
+        except json.JSONDecodeError as exc:
+            die(f"{source}: not valid JSON: {exc}")
+        if not isinstance(raw, dict):
+            die(f"{source}: expected one rule object, got {type(raw).__name__}")
+        # Round-tripping through the proto is the validation: anything the
+        # daemon would reject fails here instead of at apply time.
+        value = rule_to_json(rule_from_json(raw, str(source)))
+    else:
+        value = rule_to_json(select(service.rules, [args.name])[0])
+
+    temporary_name = value.get("name") or "(unnamed)"
+    if value.get("duration") == "always":
+        die(f"{temporary_name} is already permanent; promote is for temporary rules")
+
+    promoted = promote_rule(
+        value,
+        number=args.number,
+        slug=args.slug,
+        description=args.description,
+        scope=args.scope,
+        precedence=args.precedence,
+    )
+
+    target = pathlib.Path(args.output_dir).expanduser()
+    # Unlike export-opensnitch-rules, a path inside this repository is the
+    # point: a portable rule belongs in config/opensnitch/rules/.
+    target.mkdir(parents=True, exist_ok=True)
+    path = target / promoted_filename(args.number, args.slug, args.scope)
+    path.write_text(json.dumps(promoted, indent=2, sort_keys=True) + "\n")
+    ok(f"wrote {path}")
+
+    # Deliberately stops here. The safe order is install, verify, then remove
+    # (docs/setup-opensnitch.md, "Replacing a rule without losing
+    # connectivity"), and only a person can do the verifying.
+    print()
+    log("read it, then:")
+    if args.scope == "shared":
+        print("  1. commit it and run ./bin/setup-opensnitch")
+    else:
+        print(f"  1. ./bin/opensnitch-rulectl apply {path}")
+    print("  2. grep -a 'Ruleset changed due to' /var/log/opensnitchd.log | tail")
+    print("  3. exercise the traffic and confirm it still behaves")
+    print(f"  4. ./bin/opensnitch-rulectl delete {temporary_name}")
 
 
 def format_connection(connection) -> list[str]:
@@ -597,6 +759,12 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     listing = subparsers.add_parser("list", help="list the rules the daemon has loaded")
+    listing.add_argument(
+        "-t",
+        "--temporary",
+        action="store_true",
+        help="only rules whose duration is not always -- the ones a reboot loses",
+    )
     listing.set_defaults(handler=cmd_list)
 
     show = subparsers.add_parser("show", help="print rules as on-disk JSON")
@@ -611,6 +779,35 @@ def build_parser() -> argparse.ArgumentParser:
     delete = subparsers.add_parser("delete", help="delete rules by name")
     delete.add_argument("names", nargs="+", metavar="NAME")
     delete.set_defaults(handler=cmd_delete)
+
+    promote = subparsers.add_parser(
+        "promote",
+        help="stage a temporary rule as a curated permanent one; installs nothing",
+    )
+    promote.add_argument("name", nargs="?", metavar="NAME")
+    promote.add_argument(
+        "--from-file",
+        metavar="FILE",
+        help="read the rule from a file instead of the daemon; needs no socket",
+    )
+    promote.add_argument("--number", required=True, metavar="NNN", help="band number")
+    promote.add_argument("--slug", required=True, help="lowercase-hyphenated purpose")
+    promote.add_argument("--description", required=True, help="why this rule exists")
+    promote.add_argument("-o", "--output-dir", required=True, metavar="DIR")
+    promote.add_argument(
+        "--scope",
+        choices=("shared", "local"),
+        default="local",
+        help="shared: portable, band 000-099. local: machine-only, band 100-199",
+    )
+    precedence = promote.add_mutually_exclusive_group()
+    precedence.add_argument(
+        "--precedence", dest="precedence", action="store_true", default=None
+    )
+    precedence.add_argument(
+        "--no-precedence", dest="precedence", action="store_false", default=None
+    )
+    promote.set_defaults(handler=cmd_promote)
 
     watch = subparsers.add_parser(
         "watch",
@@ -631,6 +828,14 @@ def main() -> None:
         die("Run this as your normal user, not root. That is the whole point.")
     args = build_parser().parse_args()
 
+    # Checked before anything touches the socket, so a malformed promote costs
+    # nobody their GUI.
+    if args.command == "promote":
+        if bool(args.name) == bool(args.from_file):
+            die("promote takes either a rule NAME or --from-file, not both or neither")
+        if not args.description.strip():
+            die("--description must not be empty")
+
     if args.dry_run:
         # Dry run deliberately never touches the socket: taking the GUI down is
         # itself a change, and a --dry-run that does it would be lying.
@@ -641,8 +846,17 @@ def main() -> None:
         elif args.command == "delete":
             for name in args.names:
                 print(f"  dry would delete {name}")
+        elif args.command == "promote":
+            filename = promoted_filename(args.number, args.slug, args.scope)
+            print(f"  dry would write {args.output_dir}/{filename}")
         else:
             print(f"  dry would read the daemon's rules ({args.command})")
+        return
+
+    # A promote from a file is a pure transformation; stopping the GUI for it
+    # would be a change made for no reason.
+    if args.command == "promote" and args.from_file:
+        args.handler(None, args)
         return
 
     socket_path = pathlib.Path(args.socket)

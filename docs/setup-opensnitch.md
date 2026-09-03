@@ -46,6 +46,16 @@ index 6 every prompt nobody was there to answer became a twelve-hour rule. OpenS
 policy temporarily overrides the daemon policy while connected in its
 [configuration guide](https://github.com/evilsocket/opensnitch/wiki/Configurations).
 
+That index also decides whether a mis-click survives a reboot, which is the
+part that is easy to miss. Under index `6` the daemon **wrote temporary rules
+to `/etc/opensnitchd/rules`**: this machine's log shows an
+`allow-12h-list-....json` file appearing seconds after each "Added new rule"
+line, root-owned and `0600`. Under index `7` it does not — every "Added new
+rule" since the setting changed has no matching "Ruleset changed due to", and
+the rules live in the daemon's memory until it restarts. So the difference
+between the two indices is not twelve hours versus one login. It is whether an
+unanswered prompt leaves a durable file behind.
+
 The setup adds `opensnitch-ui-secure` to Omarchy's user
 `~/.config/hypr/autostart.lua`. In a live Hyprland session it validates the
 configuration, starts the UI on the private socket, and only then starts the
@@ -63,7 +73,7 @@ this" and "this repository's own workflow needs it" stays visible:
 | `000`–`039` | System essentials | localhost v4/v6; `systemd-resolved` on 53/853; `systemd-timesyncd` on UDP 123; `NetworkManager` to `ping.archlinux.org:80`; `avahi-daemon` to the mDNS multicast groups on UDP 5353 |
 | `040`–`059` | Scheduled system maintenance | `fwupd` to `fwupd.org`/`cdn.fwupd.org` for LVFS firmware metadata and images |
 | `060`–`079` | This repository's own tooling | `podman`/`docker` to Docker Hub for the `bin/lint` base image; rootless container egress to `dl-cdn.alpinelinux.org`; `curl` to the four hosts `packages/brave` downloads from |
-| `080`–`099` | Other projects' build toolchains on this machine | rootless container egress to the Rust distribution and crate registry, the Python package index, GitHub release assets and the RustSec advisory database, and the registries `trivy` pulls its vulnerability database from |
+| `080`–`099` | Other projects' build toolchains, and the tool managers that install them | rootless container egress to the Rust distribution and crate registry, the Python package index, GitHub release assets and the RustSec advisory database, and the registries `trivy` pulls its vulnerability database from; `mise` to its version manifest, GitHub releases, and the sigstore TUF root |
 
 The essentials keep login-time local IPC, name resolution, clock
 synchronization, connectivity detection, and `.local` discovery working without
@@ -121,6 +131,21 @@ Google Cloud Storage bucket to every container, and the `ghcr.io` fallback
 already completes the scan. A stall on the mirror is a prompt worth answering
 by hand rather than a hole worth opening permanently.
 
+`084` and `085` cover `mise`, which is a different shape of dependency: not a
+project's toolchain but the thing that installs everything else, including the
+tools rules `100`, `101` and `122` are written for. Two honest notes about it.
+`084` names `github.com` and `api.github.com`, so it grants mise all of GitHub
+— unavoidable when the job is fetching arbitrary release assets, and still far
+narrower than the process-wide allow it replaces. And `085` is separate on
+purpose: it is the sigstore TUF root mise checks signatures against, so if it
+is ever deleted the symptom is "mise stopped verifying what it downloads" and
+the named rule says so. Denying that host does not harden mise, it blinds it.
+
+`084` also pins `release-assets.githubusercontent.com` exactly rather than
+reusing the `[a-z0-9-]+\.githubusercontent\.com` alternation that `062`, `082`
+and `122` need. If GitHub ever serves an asset from a different subdomain the
+result is a prompt, which is the trade this baseline prefers.
+
 Something that reaches the network on a timer rather than when you ask it to
 needs a permanent rule or it will prompt when nobody is at the machine.
 `setup-security-hardening` enables `arch-audit.timer`, which fires overnight
@@ -177,7 +202,8 @@ The pair reads as "mDNS multicast, nothing else, stop asking". Written that way
 a deny is a policy; written alone it is a time bomb, because the day someone
 prunes the allows the deny keeps working and nothing explains what broke. Say
 so in the description, and give the deny a number that sorts after everything
-it must not shadow.
+it must not shadow. The denies this machine actually runs are listed under
+[The permanent denies on this machine](#the-permanent-denies-on-this-machine).
 
 Two other things reach the network on a schedule rather than when you ask them
 to, so both need permanent rules or they will prompt at an hour when nobody is
@@ -191,6 +217,100 @@ watching:
 - `arch-audit`, to `security.archlinux.org`. `setup-security-hardening` enables
   `arch-audit.timer`, which fires overnight. A vulnerability scanner that has
   quietly stopped scanning is worse than no scanner at all.
+
+### Promoting a temporary rule
+
+A rule answered at a prompt is a decision made under time pressure, with a
+30 second clock running, by someone who wanted to get on with something else.
+Left alone it evaporates at the next reboot and the same prompt comes back, so
+the machine keeps re-deciding rather than deciding once. Two commands close
+that loop:
+
+```bash
+./bin/opensnitch-rulectl list --temporary   # what a reboot is about to lose
+./bin/opensnitch-rulectl promote allow-until-restart-list-usr-bin-mise-github-com-443 \
+    --scope shared --number 084 --slug allow-mise-tool-downloads \
+    --description "why this exists" -o config/opensnitch/rules
+```
+
+`promote` writes one curated file — `duration: always`, `enabled: true`, a
+banded name, and `precedence` set to `true` for an allow and `false` for a deny
+— and then stops. It installs nothing, deliberately: the safe order is install,
+verify, remove, and only a person can do the verifying. It prints those steps
+with the temporary rule's name already filled in.
+
+It also refuses, rather than warns, on anything the committed baseline would
+reject later — a deny with `--scope shared`, a `process.command` operand, a
+home path, a number outside its band — so a bad rule never reaches the tree.
+The one thing it only warns about is a version-pinned `process.path`, because
+sometimes that really is what you mean.
+
+`promote --from-file rule.json` runs the same transformation on a file from
+`show`, and never touches the socket. Note that `-o` accepts a path inside this
+repository, which is the opposite of `export-opensnitch-rules`: export is a
+backup and belongs outside the project, while a promoted portable rule belongs
+in `config/opensnitch/rules/`.
+
+### The permanent denies on this machine
+
+Four, all machine-local, all `precedence: false`. That last part is
+deliberate: none of them is the highest-priority thing that matches, so a
+curated allow — which always carries `precedence: true` — beats them without
+anyone having to edit the deny.
+
+- **`190-deny-avahi-non-mdns`** — the complement to `030`/`031`, described
+  above.
+- **`191-deny-aur-helpers`** — `process.path` regexp `^/usr/bin/(yay|paru)$`.
+  This repository's [package-source policy](conventions.md#package-sources)
+  says nothing comes from the AUR; this is that policy stated where it cannot
+  be forgotten. The blast radius is small on this machine: `pacman -Qm` lists
+  only `brave-browser-local`, which this repository builds itself, `omarchy pkg
+  add` shells out to `pacman` directly, and nothing under
+  `/usr/share/omarchy/bin` mentions `yay`. `paru` is named although it is not
+  installed — a deny for an absent binary costs nothing. For a deliberate
+  exception, disable the rule for that session rather than deleting it.
+- **`192-deny-vscode-network`** — `process.path` simple
+  `/usr/share/code/code`, process-wide: no marketplace, no settings sync, no
+  update check. It replaces a deny this machine re-created by hand from a
+  prompt ten times. It matches the `code` binary and the children Chromium
+  re-executes through `/proc/self/exe`, but **not** the separate Node
+  processes VS Code spawns under `~/.config/Code/` — those still prompt on
+  their own, and one of them (the Claude agent SDK) carries a version-pinned
+  path, so settle it with a `regexp` rather than the literal path from the
+  prompt.
+- **`193-deny-bitwarden-breach-check`** — Bitwarden's data-breach check sends
+  the leading five characters of a password's SHA-1 to Have I Been Pwned. The
+  point of a self-hosted vault is that nothing about its contents leaves the
+  network, and a k-anonymity prefix is still a query about a password you
+  hold. It reuses `160`'s two-clause match verbatim, for the reason set out in
+  [Why an Electron rule silently misses](#why-an-electron-rule-silently-misses)
+  — `process.path` alone would be every Electron application installed:
+
+  ```
+  process.path     regexp  ^/usr/lib/electron[0-9]+/electron$
+  process.command  regexp  (^|\s)/usr/lib/bitwarden/app\.asar(\s|$)|(^|\s)--user-data-dir=/home/matthew/\.config/Bitwarden(\s|$)
+  dest.host        simple  api.pwnedpasswords.com
+  dest.port        simple  443
+  ```
+
+  Narrowing a *deny* this way is worth a sentence, because the instinct is
+  that a deny should be as broad as possible so it cannot be slipped past.
+  That instinct is wrong here, and the reason is the default action: nothing
+  allows Bitwarden to this host — `160` is scoped to the vault host, `170`
+  requires Cursor's own `process.command` — so if this match ever stops
+  fitting, the connection meets the daemon's `deny` default and prompts. A
+  narrow deny that misses does not become an allow. What it does buy is that
+  the rule denies the application named in it rather than every Electron app
+  on the machine.
+
+  `electron[0-9]+` rather than the literal `electron39` the prompt produced,
+  so an Electron major bump does not change what this matches.
+
+None is in `config/opensnitch/rules/`, because the shared baseline is
+allow-only and `tests/test-setup-opensnitch.sh` enforces that. A shared deny
+would ship to a machine whose local allows it had never seen. Back these up
+with `export-opensnitch-rules --allow-machine-specific`, and rebuild them from
+`opensnitch-rulectl apply` after a reinstall.
 
 ### Why an Electron rule silently misses
 
@@ -269,9 +389,10 @@ temporary rule expires, and nothing in the UI shows the allow as inactive. This
 machine collected a `deny-12h-simple-usr-lib-electron39-electron` that way more
 than once.
 
-So every curated `allow` in `000`–`170` carries `precedence: true`. The one
-rule that deliberately does not is `190-deny-avahi-non-mdns`: it must lose to
-`030`/`031`, and it does, for the same reason.
+So every curated `allow` in `000`–`170` carries `precedence: true`. The rules
+that deliberately do not are the denies in `190`–`193`: `190` must lose to
+`030`/`031` and does, for the same reason, and `191`–`193` are left low so a
+future curated allow can override them without an edit.
 
 A `deny` you actually want still works — it just has to be the highest
 precedence thing that matches, or the only thing that matches.
@@ -291,9 +412,11 @@ workflow needs `sudo`:
 
 ```bash
 ./bin/opensnitch-rulectl list                     # what the daemon has loaded
+./bin/opensnitch-rulectl list --temporary         # only what a reboot will lose
 ./bin/opensnitch-rulectl show -o ~/rules-backup   # every rule as on-disk JSON
 ./bin/opensnitch-rulectl apply rule.json          # install or replace
 ./bin/opensnitch-rulectl delete <rule-name>       # remove
+./bin/opensnitch-rulectl promote <rule-name> ...  # stage one as a curated rule
 ./bin/opensnitch-rulectl watch -s 60              # what the daemon decides, and why
 ```
 
@@ -411,12 +534,14 @@ systemctl status opensnitchd.service
 grep -E 'DefaultAction|ProcMonitorMethod|Firewall' /etc/opensnitchd/default-config.json
 ls -l /run/user/"$(id -u)"/opensnitch/osui.sock
 ./bin/opensnitch-rulectl list
+./bin/opensnitch-rulectl list --temporary
 sudo nft list ruleset | grep -i opensnitch
 ```
 
 If an application is unexpectedly blocked, grant the narrowest temporary rule
-first, and promote it to `always` only after the application works and the
-match fields are understood. Find the match fields with
+first, and promote it to `always` — with `opensnitch-rulectl promote`, see
+[Promoting a temporary rule](#promoting-a-temporary-rule) — only after the
+application works and the match fields are understood. Find the match fields with
 
 ```bash
 ./bin/opensnitch-rulectl watch -s 60 -f bitwarden

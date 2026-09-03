@@ -50,7 +50,7 @@ it "--help exits 0 and lists every command"
 out="$("$RULECTL" --help 2>&1)"; status=$?
 if [[ $status -eq 0 ]] \
   && [[ "$out" == *list* && "$out" == *show* && "$out" == *apply* \
-     && "$out" == *delete* && "$out" == *watch* ]]; then
+     && "$out" == *delete* && "$out" == *watch* && "$out" == *promote* ]]; then
   pass
 else
   fail "expected help listing all commands, exit 0" "exit $status" "${out:0:300}"
@@ -161,5 +161,150 @@ print("OK")
 PY
 )"
 assert_eq "OK" "$round_trip" "round trip"
+
+# --- promote ---------------------------------------------------------------
+#
+# promote turns a prompt answer into a curated rule. --from-file runs the same
+# transformation without a socket, which is what makes all of it testable here.
+
+temp_rule() {
+  cat > "$1" <<JSON
+{
+  "action": "${2:-allow}",
+  "created": "2026-09-02T21:32:00.000000Z",
+  "description": "",
+  "duration": "until restart",
+  "enabled": true,
+  "name": "learned-temporary-rule",
+  "operator": {
+    "type": "list",
+    "operand": "list",
+    "data": "",
+    "sensitive": false,
+    "list": [
+      {"type": "simple", "operand": "process.path", "data": "${3:-/usr/bin/true}", "sensitive": false, "list": []},
+      {"type": "simple", "operand": "dest.port", "data": "443", "sensitive": false, "list": []}
+    ]
+  },
+  "precedence": false
+}
+JSON
+}
+
+promote() {
+  "$RULECTL" promote --from-file "$1" --description "why this exists" \
+    -o "$WORK/promoted" "${@:2}" 2>&1
+}
+
+it "promote makes a temporary allow permanent, enabled and precedent"
+temp_rule "$WORK/temp-allow.json"
+out="$(promote "$WORK/temp-allow.json" --number 084 --slug allow-thing --scope shared)"
+status=$?
+promoted="$WORK/promoted/omarchy-shared-084-allow-thing.json"
+if [[ $status -eq 0 && -f "$promoted" ]]; then
+  verdict="$(python - "$promoted" <<'PY'
+import json, sys
+rule = json.load(open(sys.argv[1]))
+expected = {
+    "name": "084-omarchy-allow-thing",
+    "duration": "always",
+    "enabled": True,
+    "precedence": True,
+    "description": "why this exists",
+}
+print("\n".join(
+    f"FAIL {k}: {rule.get(k)!r} != {v!r}" for k, v in expected.items() if rule.get(k) != v
+) or "OK")
+PY
+)"
+  assert_eq "OK" "$verdict" "promoted rule"
+else
+  fail "expected a promoted file" "exit $status" "$out"
+fi
+
+it "a promoted deny is left at low precedence so a curated allow can win"
+temp_rule "$WORK/temp-deny.json" deny
+promote "$WORK/temp-deny.json" --number 192 --slug deny-thing >/dev/null
+assert_file_contains "$WORK/promoted/192-deny-thing.json" '"precedence": false'
+
+it "promote installs nothing; it prints the install-verify-remove order"
+out="$(promote "$WORK/temp-deny.json" --number 192 --slug deny-thing)"
+assert_contains "$out" "opensnitch-rulectl apply"
+assert_contains "$out" "opensnitch-rulectl delete learned-temporary-rule"
+
+it "refuses to promote a rule that is already permanent"
+out="$(promote "$WORK/500-test-rule.json" --number 192 --slug deny-thing)"; status=$?
+if [[ $status -ne 0 && "$out" == *"already permanent"* ]]; then
+  pass
+else
+  fail "expected an already-permanent error" "exit $status" "$out"
+fi
+
+it "an empty description fails before anything else happens"
+out="$("$RULECTL" promote --from-file "$WORK/temp-allow.json" --description '   ' \
+  --number 192 --slug deny-thing -o "$WORK/promoted" 2>&1)"; status=$?
+if [[ $status -ne 0 && "$out" == *"must not be empty"* ]]; then
+  pass
+else
+  fail "expected an empty-description error" "exit $status" "$out"
+fi
+
+it "a rule NAME and --from-file together are an error, not a socket connection"
+out="$("$RULECTL" promote some-rule --from-file "$WORK/temp-allow.json" \
+  --description d --number 192 --slug deny-thing -o "$WORK/promoted" 2>&1)"; status=$?
+if [[ $status -ne 0 && "$out" == *"not both or neither"* ]]; then
+  pass
+else
+  fail "expected a mutually-exclusive-source error" "exit $status" "$out"
+fi
+
+# The band rules and the allow-only baseline are enforced by
+# tests/test-setup-opensnitch.sh on the committed tree. Refusing them here is
+# what keeps a bad rule from reaching the tree at all.
+
+it "the portable baseline stays allow-only"
+out="$(promote "$WORK/temp-deny.json" --number 090 --slug deny-thing --scope shared)"; status=$?
+if [[ $status -ne 0 && "$out" == *"allow-only"* ]]; then
+  pass
+else
+  fail "expected a baseline-is-allow-only error" "exit $status" "$out"
+fi
+
+it "a home path cannot become a portable rule"
+temp_rule "$WORK/temp-home.json" allow "/home/someone/.local/bin/tool"
+out="$(promote "$WORK/temp-home.json" --number 084 --slug allow-thing --scope shared)"; status=$?
+if [[ $status -ne 0 && "$out" == *"cannot be portable"* ]]; then
+  pass
+else
+  fail "expected a portability refusal" "exit $status" "$out"
+fi
+
+it "a machine-local number is refused for a portable rule and vice versa"
+out="$(promote "$WORK/temp-allow.json" --number 192 --slug allow-thing --scope shared)"
+assert_contains "$out" "outside the portable band"
+out="$(promote "$WORK/temp-allow.json" --number 084 --slug allow-thing)"
+assert_contains "$out" "outside the machine-local band"
+
+it "a version-pinned path warns rather than shipping a rule with an expiry date"
+temp_rule "$WORK/temp-pinned.json" allow "/home/someone/.local/share/mise/installs/tool/2.1.251/tool"
+out="$(promote "$WORK/temp-pinned.json" --number 102 --slug allow-thing)"
+assert_contains "$out" "looks version-pinned"
+
+it "--number and --slug are checked for shape"
+out="$(promote "$WORK/temp-allow.json" --number 84 --slug allow-thing)"
+assert_contains "$out" "three digits"
+out="$(promote "$WORK/temp-allow.json" --number 102 --slug "Allow Thing")"
+assert_contains "$out" "lowercase words"
+
+it "--dry-run promote writes no file and takes no socket"
+out="$("$RULECTL" -n promote some-rule --description d --number 192 --slug dry-thing \
+  -o "$WORK/promoted" 2>&1)"; status=$?
+if [[ $status -eq 0 && "$out" == *"would write"* ]]; then
+  pass
+else
+  fail "expected a dry-run report" "exit $status" "$out"
+fi
+assert_no_file "$WORK/promoted/192-dry-thing.json"
+assert_no_file "$WORK/definitely-not-a-socket"
 
 finish

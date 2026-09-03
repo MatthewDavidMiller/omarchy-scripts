@@ -1,0 +1,39 @@
+{
+  "action": "allow",
+  "created": "2026-09-02T00:00:00Z",
+  "description": "mise fetching the sigstore TUF root so it can verify the signatures on the releases 084 lets it download. Kept separate from 084 for the same reason 083 is separate from 082: if this rule is deleted the symptom is that mise stopped verifying what it installs, and the rule that stopped it is named. Denying this host does not make mise safer -- it makes mise stop checking.",
+  "duration": "always",
+  "enabled": true,
+  "name": "085-omarchy-allow-mise-signature-verification",
+  "operator": {
+    "data": "",
+    "list": [
+      {
+        "data": "/usr/bin/mise",
+        "list": null,
+        "operand": "process.path",
+        "sensitive": false,
+        "type": "simple"
+      },
+      {
+        "data": "tuf-repo-cdn.sigstore.dev",
+        "list": null,
+        "operand": "dest.host",
+        "sensitive": false,
+        "type": "simple"
+      },
+      {
+        "data": "443",
+        "list": null,
+        "operand": "dest.port",
+        "sensitive": false,
+        "type": "simple"
+      }
+    ],
+    "operand": "list",
+    "sensitive": false,
+    "type": "list"
+  },
+  "precedence": true,
+  "updated": "2026-09-02T00:00:00Z"
+}

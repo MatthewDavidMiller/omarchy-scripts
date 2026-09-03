@@ -39,6 +39,8 @@ for path in \
   config/opensnitch/rules/omarchy-shared-060-allow-podman-registry-pulls.json \
   config/opensnitch/rules/omarchy-shared-061-allow-container-egress-to-alpine-cdn.json \
   config/opensnitch/rules/omarchy-shared-062-allow-curl-brave-release-downloads.json \
+  config/opensnitch/rules/omarchy-shared-084-allow-mise-tool-downloads.json \
+  config/opensnitch/rules/omarchy-shared-085-allow-mise-signature-verification.json \
   assets/cat-wallpaper.png \
   bin/lint bin/install-hooks \
   packages/brave/PKGBUILD.template packages/brave/brave-launcher \
