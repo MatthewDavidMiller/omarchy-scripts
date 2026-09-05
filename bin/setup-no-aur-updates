@@ -36,6 +36,16 @@ source "$SCRIPT_DIR/../lib/common.sh"
 # Overridable so the tests can point at fixtures instead of the real system.
 SHIM_DIR="${OMARCHY_SHIM_DIR:-/usr/local/bin}"
 BIN_DIR="${OMARCHY_BIN_DIR:-/usr/bin}"
+HYPR_DIR="${OMARCHY_HYPR_DIR:-$HOME/.config/hypr}"
+
+# The Hyprland override, split in two on purpose. The module is ours and is not
+# a config Omarchy ships, so `omarchy refresh hyprland` and the migrations that
+# replace a stock user file both leave it alone. Only the one require line in
+# hyprland.lua is exposed, and this script puts that back when it has gone.
+HYPR_MODULE_NAME="omarchy-scripts-path"
+HYPR_MODULE="$HYPR_DIR/$HYPR_MODULE_NAME.lua"
+HYPR_ENTRY="$HYPR_DIR/hyprland.lua"
+HYPR_REQUIRE="pcall(require, \"hypr.$HYPR_MODULE_NAME\")"
 
 # Every shim carries this line. Nothing without it is ever overwritten or
 # removed, so a file someone else put in the shim directory is reported and
@@ -87,6 +97,7 @@ Environment (primarily for tests):
                             a login shell.
   OMARCHY_MANAGER_PATH      PATH to check precedence against, instead of asking
                             the systemd user manager; empty skips that check.
+  OMARCHY_HYPR_DIR          Hyprland config directory. Default: ~/.config/hypr.
 USAGE
 }
 
@@ -347,6 +358,134 @@ remove_helper_packages() {
 }
 
 # ---------------------------------------------------------------------------
+# The Hyprland PATH override
+# ---------------------------------------------------------------------------
+# Written to stdout so the caller can compare it against what is installed.
+render_hypr_module() {
+  cat <<LUA
+-- $MARKER
+--
+-- Put $SHIM_DIR ahead of Omarchy's own bin directory for everything this
+-- Hyprland session spawns.
+--
+-- default/hypr/envs.lua prepends \$OMARCHY_PATH/bin unconditionally, and hl.env
+-- is Hyprland's \`env =\`, which applies to what Hyprland spawns rather than to
+-- Hyprland itself. That directory is a farm of symlinks into $BIN_DIR, so a
+-- shim in $SHIM_DIR is reached through it and never runs.
+--
+-- Loaded from hyprland.lua after require("default.hypr.omarchy"), so it wins.
+-- This file is not a config Omarchy ships, so \`omarchy refresh hyprland\` and
+-- the migrations that replace a stock user file both leave it alone. Only the
+-- require line in hyprland.lua is exposed; bin/setup-no-aur-updates restores it.
+--
+-- os.getenv("PATH") here is Hyprland's own PATH, which does not carry what
+-- envs.lua set for its children, so the order is rebuilt rather than edited.
+-- Omarchy's directory is re-inserted unconditionally, exactly as envs.lua does
+-- it: if it ever stops being on PATH upstream, a directory of symlinks to names
+-- already in $BIN_DIR changes nothing, and a path that does not exist is
+-- ignored.
+
+local omarchy_bin = ((os.getenv("OMARCHY_PATH") or "/usr/share/omarchy"):gsub("/\$", "")) .. "/bin"
+local shim_dir = "$SHIM_DIR"
+
+local kept = {}
+for entry in (os.getenv("PATH") or "$SHIM_DIR:$BIN_DIR"):gmatch("[^:]+") do
+  if entry ~= omarchy_bin and entry ~= shim_dir then
+    table.insert(kept, entry)
+  end
+end
+
+table.insert(kept, 1, omarchy_bin)
+table.insert(kept, 1, shim_dir)
+
+hl.env("PATH", table.concat(kept, ":"))
+LUA
+}
+
+# The require line, with the marker above it so a later run can find it whatever
+# the surrounding file has become.
+render_hypr_require() {
+  cat <<REQUIRE
+
+-- $MARKER — $SHIM_DIR must precede \$OMARCHY_PATH/bin.
+-- pcall so a missing or broken module can never stop the session starting.
+$HYPR_REQUIRE
+REQUIRE
+}
+
+hypr_present() { [[ -f "$HYPR_ENTRY" ]]; }
+
+hypr_wired() {
+  [[ -f "$HYPR_ENTRY" ]] && grep -qF -- "$HYPR_REQUIRE" "$HYPR_ENTRY"
+}
+
+install_hypr_override() {
+  local rendered
+
+  if ! hypr_present; then
+    skip "$HYPR_ENTRY does not exist — no Hyprland config to override"
+    return 0
+  fi
+
+  log "Installing the Hyprland PATH override"
+
+  # write_file backs up, skips an identical file, and honours DRY_RUN.
+  rendered="$WORK_DIR/hypr-module.lua"
+  render_hypr_module > "$rendered"
+  write_file "$HYPR_MODULE" < "$rendered"
+
+  if hypr_wired; then
+    skip "$HYPR_ENTRY already requires $HYPR_MODULE_NAME"
+    return 0
+  fi
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    printf '%s  dry%s would add the require line to %s\n' "$C_DIM" "$C_RESET" "$HYPR_ENTRY"
+    return 0
+  fi
+
+  cp -a -- "$HYPR_ENTRY" "$HYPR_ENTRY.bak.$(date +%Y%m%d%H%M%S)"
+  render_hypr_require >> "$HYPR_ENTRY"
+  ok "added the require line to $HYPR_ENTRY"
+}
+
+remove_hypr_override() {
+  log "Removing the Hyprland PATH override"
+
+  if [[ -f "$HYPR_MODULE" ]]; then
+    if ours "$HYPR_MODULE"; then
+      run rm -f -- "$HYPR_MODULE"
+      [[ "$DRY_RUN" == "1" ]] || ok "removed $HYPR_MODULE"
+    else
+      warn "$HYPR_MODULE is not ours — leaving it alone"
+    fi
+  else
+    skip "$HYPR_MODULE is already gone"
+  fi
+
+  if ! hypr_wired; then
+    skip "$HYPR_ENTRY does not require $HYPR_MODULE_NAME"
+    return 0
+  fi
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    printf '%s  dry%s would drop the require line from %s\n' "$C_DIM" "$C_RESET" "$HYPR_ENTRY"
+    return 0
+  fi
+
+  # Drop the require line and the marked comment block above it, and nothing
+  # else: this file is the user's, and everything else in it is theirs.
+  cp -a -- "$HYPR_ENTRY" "$HYPR_ENTRY.bak.$(date +%Y%m%d%H%M%S)"
+  awk -v marker="$MARKER" -v line="$HYPR_REQUIRE" '
+    $0 ~ marker { skipping = 1; next }
+    skipping && $0 == line { skipping = 0; next }
+    skipping && /^--/ { next }
+    { skipping = 0; print }
+  ' "$HYPR_ENTRY" > "$WORK_DIR/hypr-entry" && mv -- "$WORK_DIR/hypr-entry" "$HYPR_ENTRY"
+  ok "dropped the require line from $HYPR_ENTRY"
+}
+
+# ---------------------------------------------------------------------------
 # PATH precedence
 # ---------------------------------------------------------------------------
 # A shim only helps if the name resolves to it, and SHIM_DIR preceding BIN_DIR
@@ -491,6 +630,9 @@ The shims are gone, so \`omarchy update\` reaches the AUR on Omarchy's own
 terms again — including the reachability probe that takes about 129 seconds to
 fail while the AUR is blocked.
 
+The Hyprland PATH override is gone as well, so $SHIM_DIR goes back behind
+Omarchy's own bin directory for anything this session spawns.
+
 The helper package is not reinstalled. If you want it back:
   omarchy pkg add ${AUR_HELPERS[0]}
 EOF
@@ -507,10 +649,21 @@ EOF
 The shims are installed but something on PATH gets to those names first, so
 \`omarchy update\` still runs Omarchy's own AUR step and still probes
 aur.archlinux.org. The warnings above name what wins and where.
+EOF
+    if hypr_wired; then
+      cat <<EOF
+
+The Hyprland override is in place, so this is expected in a shell that was
+opened before it. Check a new terminal:
+  command -v omarchy-update-aur-pkgs
+EOF
+    else
+      cat <<EOF
 
 Until PATH is fixed the shims change nothing. Re-run this once it is:
   ./bin/setup-no-aur-updates
 EOF
+    fi
   else
     cat <<EOF
 
@@ -536,13 +689,31 @@ EOF
       printf '  %-27s %s\n' "$helper" "$(shim_state "$SHIM_DIR/$helper"), package not installed"
     fi
   done
+
+  printf '\n  hyprland config: %s\n' "$HYPR_DIR"
+  if [[ ! -e "$HYPR_MODULE" ]]; then
+    printf '  %-27s %s\n' "$HYPR_MODULE_NAME.lua" "not installed"
+  elif ours "$HYPR_MODULE"; then
+    printf '  %-27s %s\n' "$HYPR_MODULE_NAME.lua" "installed"
+  else
+    printf '  %-27s %s\n' "$HYPR_MODULE_NAME.lua" "not ours — left alone"
+  fi
+  if ! hypr_present; then
+    printf '  %-27s %s\n' "hyprland.lua" "no Hyprland config here"
+  elif hypr_wired; then
+    printf '  %-27s %s\n' "hyprland.lua" "requires the module"
+  else
+    printf '  %-27s %s\n' "hyprland.lua" "does NOT require the module"
+  fi
 }
 
 main() {
   if [[ "$REVERT" == "1" ]]; then
     remove_shims
+    remove_hypr_override
   else
     install_shims
+    install_hypr_override
     remove_helper_packages
     report_path_precedence
   fi

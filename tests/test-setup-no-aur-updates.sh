@@ -56,7 +56,16 @@ SHIMS=(omarchy-update-aur-pkgs omarchy-pkg-aur-accessible \
 # helper installed. Echoes the case directory.
 fixture() {
   local dir="$TEST_TMP/case.$RANDOM"
-  mkdir -p "$dir/shims" "$dir/bin" "$dir/db"
+  mkdir -p "$dir/shims" "$dir/bin" "$dir/db" "$dir/hypr"
+  # A stand-in for the stock entry point, down to the require this must land
+  # after.
+  cat > "$dir/hypr/hyprland.lua" <<'ENTRY'
+dofile("/usr/share/omarchy/default/hypr/bootstrap.lua")
+require("default.hypr.omarchy")
+require("hypr.bindings")
+
+-- Add any other personal Hyprland configuration below.
+ENTRY
   local name
   for name in "${SHIMS[@]}"; do
     printf '#!/bin/bash\n' > "$dir/bin/$name"
@@ -74,6 +83,7 @@ run_setup() {
   OMARCHY_BIN_DIR="$dir/bin" \
   OMARCHY_LOGIN_PATH="${OMARCHY_LOGIN_PATH-$dir/shims:$dir/bin}" \
   OMARCHY_MANAGER_PATH="${OMARCHY_MANAGER_PATH-}" \
+  OMARCHY_HYPR_DIR="$dir/hypr" \
     bash "$SCRIPT" -y "$@" 2>&1
 }
 
@@ -249,6 +259,111 @@ assert_contains "$out" "may be stale against a newer Omarchy"
 it "still installs the shim rather than dying on upstream drift"
 assert_file "$CASE/shims/omarchy-update-aur-pkgs"
 
+# --- the Hyprland PATH override ---------------------------------------------
+# Split in two so an update that rewrites a config file cannot take the whole
+# thing with it: the module is ours and is not a config Omarchy ships, so only
+# the require line in hyprland.lua is exposed.
+
+CASE="$(fixture)"
+out="$(run_setup "$CASE")"
+
+it "writes the override module"
+assert_file "$CASE/hypr/omarchy-scripts-path.lua"
+
+it "marks the module as ours"
+assert_file_contains "$CASE/hypr/omarchy-scripts-path.lua" "$MARKER"
+
+it "puts the shim directory ahead of Omarchy's bin in the module"
+assert_file_contains "$CASE/hypr/omarchy-scripts-path.lua" 'table.insert(kept, 1, shim_dir)'
+
+it "adds the require line to hyprland.lua"
+assert_file_contains "$CASE/hypr/hyprland.lua" 'pcall(require, "hypr.omarchy-scripts-path")'
+
+it "guards the require with pcall, so a broken module cannot stop the session"
+assert_file_contains "$CASE/hypr/hyprland.lua" "pcall(require"
+
+it "adds the require after Omarchy's own defaults, or it would not win"
+theirs="$(grep -n 'default.hypr.omarchy' "$CASE/hypr/hyprland.lua" | head -1 | cut -d: -f1)"
+ours_line="$(grep -n 'pcall(require, "hypr.omarchy-scripts-path")' "$CASE/hypr/hyprland.lua" | head -1 | cut -d: -f1)"
+if [[ -n "$theirs" && -n "$ours_line" && "$ours_line" -gt "$theirs" ]]; then
+  pass
+else
+  fail "expected our require (line ${ours_line:-none}) after Omarchy's (line ${theirs:-none})"
+fi
+
+it "leaves the rest of hyprland.lua alone"
+assert_file_contains "$CASE/hypr/hyprland.lua" 'require("hypr.bindings")'
+
+# An update that replaces hyprland.lua takes the require line with it. The
+# module survives, because it is not a file Omarchy ships, and a re-run rewires
+# it — this is the whole point of the split.
+
+cat > "$CASE/hypr/hyprland.lua" <<'ENTRY'
+dofile("/usr/share/omarchy/default/hypr/bootstrap.lua")
+require("default.hypr.omarchy")
+require("hypr.bindings")
+ENTRY
+out="$(run_setup "$CASE")"
+
+it "survives an update that replaces hyprland.lua: the module is still there"
+assert_file_contains "$CASE/hypr/omarchy-scripts-path.lua" "$MARKER"
+
+it "rewires the require line a config refresh removed"
+assert_file_contains "$CASE/hypr/hyprland.lua" 'pcall(require, "hypr.omarchy-scripts-path")'
+
+it "reports the module as already up to date rather than rewriting it"
+assert_contains "$out" "already up to date"
+
+# A second run with nothing changed must not append the require line twice.
+
+before="$(grep -c "omarchy-scripts-path" "$CASE/hypr/hyprland.lua")"
+run_setup "$CASE" >/dev/null
+after="$(grep -c "omarchy-scripts-path" "$CASE/hypr/hyprland.lua")"
+
+it "never adds the require line twice"
+assert_eq "$before" "$after" "occurrences of the require line"
+
+# Reversing takes both halves out and leaves the user's own file intact.
+
+out="$(run_setup "$CASE" --allow-aur-updates)"
+
+it "--allow-aur-updates removes the override module"
+assert_no_file "$CASE/hypr/omarchy-scripts-path.lua"
+
+it "--allow-aur-updates drops the require line"
+assert_not_contains "$(cat "$CASE/hypr/hyprland.lua")" "omarchy-scripts-path"
+
+it "--allow-aur-updates keeps the rest of hyprland.lua"
+assert_file_contains "$CASE/hypr/hyprland.lua" 'require("hypr.bindings")'
+
+it "--allow-aur-updates is idempotent on the override"
+out2="$(run_setup "$CASE" --allow-aur-updates)"
+assert_contains "$out2" "already gone"
+
+# A module someone else wrote is reported, never deleted.
+
+CASE="$(fixture)"
+printf -- '-- someone else\n' > "$CASE/hypr/omarchy-scripts-path.lua"
+out="$(run_setup "$CASE" --allow-aur-updates)"
+
+it "leaves an override module that is not ours alone"
+assert_file_contains "$CASE/hypr/omarchy-scripts-path.lua" "-- someone else"
+
+it "says it left a module that is not ours alone"
+assert_contains "$out" "is not ours"
+
+# A machine with no Hyprland config at all must not grow one.
+
+CASE="$(fixture)"
+rm -f "$CASE/hypr/hyprland.lua"
+out="$(run_setup "$CASE")"
+
+it "writes no Hyprland files where there is no Hyprland config"
+assert_no_file "$CASE/hypr/omarchy-scripts-path.lua"
+
+it "says why it skipped the Hyprland override"
+assert_contains "$out" "no Hyprland config to override"
+
 # --- a write that does not happen -------------------------------------------
 # `install_root_file` is called with `|| true` so a skip can pass through, and
 # that disables set -e for its whole body. A sudo failure therefore has to be
@@ -261,8 +376,8 @@ status=$?
 it "exits non-zero when a shim cannot be written"
 assert_status 1 "$status"
 
-it "does not report a write that failed as done"
-assert_not_contains "$out" "ok wrote"
+it "does not report a shim write that failed as done"
+assert_not_contains "$out" "ok wrote $CASE/shims"
 
 it "says the write failed"
 assert_contains "$out" "could not write"
