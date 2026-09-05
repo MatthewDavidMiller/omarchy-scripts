@@ -364,6 +364,56 @@ assert_no_file "$CASE/hypr/omarchy-scripts-path.lua"
 it "says why it skipped the Hyprland override"
 assert_contains "$out" "no Hyprland config to override"
 
+# --- a stale shell is not a broken install ----------------------------------
+# A process keeps the PATH it was given, so a terminal or editor started before
+# the override reports every shim as shadowed while the install is perfectly
+# correct. That is a note, not a failure: reporting it as one made setup-all
+# say a script failed when there was nothing to fix.
+
+CASE="$(fixture)"
+mkdir -p "$CASE/farm"
+for name in "${SHIMS[@]}"; do
+  ln -sf "$CASE/bin/$name" "$CASE/farm/$name"
+done
+# Login PATH stale, manager PATH clean, override installed.
+out="$(OMARCHY_LOGIN_PATH="$CASE/farm:$CASE/shims:$CASE/bin" \
+  OMARCHY_MANAGER_PATH="$CASE/shims:$CASE/bin" run_setup "$CASE")"
+status=$?
+
+it "exits 0 when only the invoking shell is stale"
+assert_status 0 "$status"
+
+it "still names what shadows the shim, so the warning is not lost"
+assert_contains "$out" "before $CASE/shims/omarchy-update-aur-pkgs"
+
+it "says the install is fine and the shell is what is old"
+assert_contains "$out" "was started before"
+
+it "does not tell the user to re-run the script"
+assert_not_contains "$out" "Re-run this once it is"
+
+# The same stale login PATH with the override missing is a real failure: nothing
+# will make a new process resolve the shims.
+
+CASE="$(fixture)"
+mkdir -p "$CASE/farm"
+for name in "${SHIMS[@]}"; do
+  ln -sf "$CASE/bin/$name" "$CASE/farm/$name"
+done
+run_setup "$CASE" >/dev/null
+rm -f "$CASE/hypr/omarchy-scripts-path.lua"
+# Re-running would reinstall it, so check the classification with the module
+# gone by pointing at a hypr dir that has an entry but no module.
+out="$(OMARCHY_LOGIN_PATH="$CASE/farm:$CASE/shims:$CASE/bin" \
+  OMARCHY_MANAGER_PATH="$CASE/farm:$CASE/shims:$CASE/bin" run_setup "$CASE")"
+status=$?
+
+it "exits non-zero when the manager PATH is shadowed too"
+assert_status 1 "$status"
+
+it "names envs.lua as the usual cause of a real failure"
+assert_contains "$out" "envs.lua"
+
 # --- a write that does not happen -------------------------------------------
 # `install_root_file` is called with `|| true` so a skip can pass through, and
 # that disables set -e for its whole body. A sudo failure therefore has to be
@@ -408,7 +458,10 @@ assert_file_contains "$CASE/shims/omarchy-update-aur-pkgs" "# changed"
 # reaches the upstream command while the shim directory still precedes the bin
 # directory. The old check compared only those two and passed.
 
+# No Hyprland config here, so there is no override to make a new session right:
+# a shadowed shim is simply broken.
 CASE="$(fixture)"
+rm -f "$CASE/hypr/hyprland.lua"
 mkdir -p "$CASE/farm"
 for name in "${SHIMS[@]}"; do
   ln -sf "$CASE/bin/$name" "$CASE/farm/$name"
@@ -442,6 +495,7 @@ assert_eq "4" "$shadowed" "shadowed shim warnings"
 # --- a PATH without the shim directory at all -------------------------------
 
 CASE="$(fixture)"
+rm -f "$CASE/hypr/hyprland.lua"
 out="$(OMARCHY_LOGIN_PATH="$CASE/bin" run_setup "$CASE")"
 status=$?
 

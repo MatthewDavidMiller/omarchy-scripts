@@ -509,8 +509,16 @@ remove_hypr_override() {
 # So walk the PATH per shim name, the way the shell does, and report whatever
 # gets there first. That catches any shadowing directory, not one named here.
 
-# Set when a shim loses on a PATH that matters, which makes the run fail.
+# Set when a shim loses somewhere that means the install is wrong, which makes
+# the run fail.
 PRECEDENCE_FAILED=0
+
+# Set when the install is right and only the shell running this is stale. A
+# process keeps the PATH it was given, so anything started before the override
+# — a terminal, an editor, a session that has been up since boot — carries the
+# old order for as long as it lives. That is not a failure to fix here, and it
+# must not be reported as one: the answer is to restart that program.
+SESSION_STALE=0
 
 # The trailing newline matters: without it `read` never returns the last entry,
 # so the final PATH directory is invisible to every check below.
@@ -547,7 +555,6 @@ check_path() {
 
   if ! path_has "$SHIM_DIR" "$path"; then
     warn "$SHIM_DIR is not on the $label PATH — the shims will not be found"
-    PRECEDENCE_FAILED=1
     return 1
   fi
 
@@ -558,11 +565,16 @@ check_path() {
     fi
   done < <(shim_names)
 
-  if [[ "$failed" == "1" ]]; then
-    PRECEDENCE_FAILED=1
-    return 1
-  fi
+  [[ "$failed" == "0" ]] || return 1
   ok "$SHIM_DIR wins every shim name on the $label PATH"
+}
+
+# True when the Hyprland override is installed as this script writes it. The
+# module is rewritten from the rendered copy on every run, so if it is ours it
+# is also current — an edited or damaged one has already been replaced by the
+# time this is asked.
+override_installed() {
+  hypr_present && hypr_wired && ours "$HYPR_MODULE"
 }
 
 login_path() {
@@ -587,13 +599,25 @@ manager_path() {
 }
 
 report_path_precedence() {
-  local manager
+  local manager login_ok=1 manager_ok=1
 
   log "Checking PATH precedence"
-  check_path login "$(login_path)" || true
+  check_path login "$(login_path)" || login_ok=0
 
   manager="$(manager_path)"
-  [[ -n "$manager" ]] && { check_path "systemd user manager" "$manager" || true; }
+  if [[ -n "$manager" ]]; then
+    check_path "systemd user manager" "$manager" || manager_ok=0
+  fi
+
+  # What a new process will get is decided by the override and by the manager
+  # environment, not by whatever this shell happens to be carrying. So a stale
+  # login PATH on an otherwise correct install is a note, and everything else
+  # is a failure.
+  if [[ "$manager_ok" == "0" ]] || ! override_installed; then
+    PRECEDENCE_FAILED=1
+  elif [[ "$login_ok" == "0" ]]; then
+    SESSION_STALE=1
+  fi
 
   [[ "$PRECEDENCE_FAILED" == "0" ]] || cat >&2 <<'CAUSE'
 
@@ -643,27 +667,29 @@ At least one shim could not be written, so \`omarchy update\` still reaches the
 AUR through whichever name is missing. The warnings above say which.
 
 EOF
+  elif [[ "$SESSION_STALE" == "1" ]]; then
+    cat <<EOF
+
+Everything is installed, and anything started from here on skips the AUR step
+without a network request. This shell is not one of those: it was started before
+the override and keeps the PATH it was given, which is what the warnings above
+are reporting.
+
+Nothing to fix here — restart whatever this is running under. A terminal opened
+from Hyprland is enough; an editor or a session that has been up since boot has
+to be restarted itself. Then:
+  command -v omarchy-update-aur-pkgs   # => $SHIM_DIR/omarchy-update-aur-pkgs
+EOF
   elif [[ "$PRECEDENCE_FAILED" == "1" ]]; then
     cat <<EOF
 
 The shims are installed but something on PATH gets to those names first, so
 \`omarchy update\` still runs Omarchy's own AUR step and still probes
 aur.archlinux.org. The warnings above name what wins and where.
-EOF
-    if hypr_wired; then
-      cat <<EOF
-
-The Hyprland override is in place, so this is expected in a shell that was
-opened before it. Check a new terminal:
-  command -v omarchy-update-aur-pkgs
-EOF
-    else
-      cat <<EOF
 
 Until PATH is fixed the shims change nothing. Re-run this once it is:
   ./bin/setup-no-aur-updates
 EOF
-    fi
   else
     cat <<EOF
 

@@ -13,6 +13,10 @@ Re-run it after any Omarchy update that resets `~/.config/hypr/hyprland.lua` —
 see [PATH precedence](#path-precedence). It is idempotent, so re-running when
 nothing has changed reports skips and writes nothing.
 
+Run it from a terminal started *after* the override went in. A shell older than
+that keeps its own PATH and the script will say so; see
+[It only reaches processes started after it](#it-only-reaches-processes-started-after-it).
+
 ## The problem
 
 `omarchy update` runs `omarchy-update-aur-pkgs` between the `post-update` hook
@@ -265,19 +269,43 @@ hyprctl dispatch 'hl.dsp.exec_cmd("sh -c \'command -v omarchy-update-aur-pkgs > 
 cat /tmp/p    # => /usr/local/bin/omarchy-update-aur-pkgs
 ```
 
+#### It only reaches processes started after it
+
+`hl.env` is applied when a process is spawned. Anything already running keeps
+the PATH it was given, and `hyprctl reload` cannot reach back into it. So after
+installing the override:
+
+| Started | Gets the new order |
+| --- | --- |
+| A terminal opened from Hyprland now | yes |
+| A systemd user unit started now | yes — Hyprland's autostart imports its environment into the manager |
+| An editor, terminal, or session that has been up since boot | **no**, until it is restarted |
+
+This is the common surprise: running `setup-all` from a long-lived VS Code
+window reports every shim as shadowed, because that window has held the
+boot-time PATH since before the override existed. Nothing is wrong with the
+install; restart the program.
+
 ### What the script checks
 
 It resolves each shim name the way the shell does, against two PATHs:
 
 | PATH | Why |
 | --- | --- |
-| A login shell's | What this session actually runs, inherited from the terminal Hyprland spawned |
+| A login shell's | What *this* shell runs, inherited from whatever spawned it |
 | The systemd user manager's | What user units get; Hyprland's autostart imports its own environment into it |
 
-Any shim that loses is named along with the file that beat it, the summary says
-so instead of claiming success, and **the script exits non-zero** — a shadowed
-shim leaves the next update reaching the AUR, which is a failure and not a
-warning. `setup-all` reports it as one.
+What a *new* process will get is decided by the override and the manager
+environment, not by whatever this shell is carrying, so the two outcomes are
+graded differently:
+
+| State | Result |
+| --- | --- |
+| Override installed, manager PATH clean, login PATH stale | **exit 0**, with a note to restart the program this ran under |
+| Manager PATH shadowed, or the override missing or not wired | **exit 1** — a new process would still reach the AUR |
+
+Any shim that loses is named along with the file that beat it either way, so the
+warning is never swallowed. `setup-all` reports only the second as a failure.
 
 A failed write is treated the same way. `install_root_file` is called with
 `|| true` so a skip can pass through, and that suppresses `set -e` for its whole
