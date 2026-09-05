@@ -15,6 +15,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=../lib/common.sh
 source "$REPO_ROOT/lib/common.sh"
+# shellcheck source=../lib/omarchy.sh
+source "$REPO_ROOT/lib/omarchy.sh"
 
 PACKAGE_DIR="$REPO_ROOT/packages/brave"
 PACKAGE_NAME="brave-browser-local"
@@ -30,6 +32,7 @@ POLICY_OWNER="${BRAVE_POLICY_OWNER:-root:root}"
 POLICY_USER="${POLICY_OWNER%%:*}"
 POLICY_GROUP="${POLICY_OWNER##*:}"
 FLAGS_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/brave-flags.conf"
+FLAGS_ONLY=0
 
 usage() {
   cat <<'USAGE'
@@ -41,9 +44,11 @@ pacman, applies Omarchy integration, and makes Brave the default. No AUR
 package, recipe, repository, or helper is used.
 
 Options:
-  -n, --dry-run   Show what would change without changing anything.
-  -y, --yes       Accepted for setup-all compatibility.
-  -h, --help      Show this help.
+  -n, --dry-run     Show what would change without changing anything.
+  -y, --yes         Accepted for setup-all compatibility.
+      --flags-only  Re-sync Brave flags from the current Omarchy Chromium
+                    template without building the package.
+  -h, --help        Show this help.
 
 Environment:
   DRY_RUN=1       Same as --dry-run.
@@ -52,25 +57,46 @@ USAGE
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -n|--dry-run) DRY_RUN=1 ;;
-    -y|--yes)     ASSUME_YES=1 ;;
-    -h|--help)    usage; exit 0 ;;
+    -n|--dry-run)    DRY_RUN=1 ;;
+    -y|--yes)        ASSUME_YES=1 ;;
+    --flags-only)    FLAGS_ONLY=1 ;;
+    -h|--help)       usage; exit 0 ;;
     *)            usage >&2; die "Unknown argument: $1" ;;
   esac
   shift
 done
 
 require_not_root
+[[ -x "$EXTENSION_FILTER" ]] \
+  || die "Chromium extension filter is missing: $EXTENSION_FILTER"
+[[ -f "$OMARCHY_ROOT/config/chromium-flags.conf" ]] \
+  || die "Omarchy Chromium flags were not found"
+
+# Reuse the repository's Chromium-extension policy so running this script by
+# itself cannot restore integrations setup-no-chromium-extensions removes.
+apply_brave_flags() {
+  local work="$1"
+  cp "$OMARCHY_ROOT/config/chromium-flags.conf" "$work/brave-flags.conf"
+  CHROMIUM_FLAGS_DIR="$work" "$EXTENSION_FILTER" --yes >/dev/null
+  write_file "$FLAGS_FILE" < "$work/brave-flags.conf"
+}
+
+if [[ "$FLAGS_ONLY" == "1" ]]; then
+  require_cmd omarchy
+  flags_dir="$(mktemp -d "${TMPDIR:-/tmp}/omarchy-brave-flags.XXXXXX")"
+  trap 'rm -rf "$flags_dir"' EXIT
+  apply_brave_flags "$flags_dir"
+  install_setup_hook post-update brave-flags
+  ok "Brave flags synced from the current Omarchy Chromium template"
+  exit 0
+fi
+
 require_cmd omarchy pacman makepkg sudo find stat
 [[ "$(uname -m)" == "x86_64" ]] \
   || die "The vetted Brave package currently supports x86_64 only"
 [[ -f "$PACKAGE_DIR/PKGBUILD.template" && -f "$PACKAGE_DIR/brave-launcher" \
    && -x "$PREPARE_LATEST" ]] \
   || die "Brave package recipe is incomplete: $PACKAGE_DIR"
-[[ -x "$EXTENSION_FILTER" ]] \
-  || die "Chromium extension filter is missing: $EXTENSION_FILTER"
-[[ -f "$OMARCHY_ROOT/config/chromium-flags.conf" ]] \
-  || die "Omarchy Chromium flags were not found"
 
 for conflicting_package in brave-bin brave-browser; do
   # pacman resolves -Q targets through provides= entries. Our package provides
@@ -108,9 +134,7 @@ fi
 
 # Reuse the repository's Chromium-extension policy so running this script by
 # itself cannot restore integrations setup-no-chromium-extensions removes.
-cp "$OMARCHY_ROOT/config/chromium-flags.conf" "$build_dir/brave-flags.conf"
-CHROMIUM_FLAGS_DIR="$build_dir" "$EXTENSION_FILTER" --yes >/dev/null
-write_file "$FLAGS_FILE" < "$build_dir/brave-flags.conf"
+apply_brave_flags "$build_dir"
 
 # Chromium-family managed policy applies to every profile on the machine, so
 # every directory on the way to it has to be root-owned: anything the user can
@@ -190,6 +214,8 @@ if [[ "$current_browser" != "brave" ]]; then
 else
   skip "Brave is already the default browser"
 fi
+
+install_setup_hook post-update brave-flags
 
 if [[ "$DRY_RUN" == "1" ]]; then
   exit 0

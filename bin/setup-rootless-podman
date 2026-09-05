@@ -44,6 +44,11 @@ DOCKER_CLI_PACKAGE=podman-docker
 # transaction rather than being left behind as a broken dependency. buildx goes
 # because it drives BuildKit inside the daemon, which podman does not provide —
 # `podman build` (buildah) is the replacement.
+#
+# Detection must use the resolved package name. `podman-docker` Provides docker,
+# so `pacman -Qq docker` stays true after the real docker package is gone, while
+# `omarchy pkg drop docker` ignores names that are not an exact install. Treating
+# the provide as docker would prompt to remove it, drop nothing, then fail.
 DOCKER_PACKAGES=(docker docker-buildx ufw-docker)
 DOCKER_UNITS=(docker.socket docker.service containerd.service)
 # Created by the daemon at runtime, not by the package, so it outlives pacman.
@@ -268,10 +273,18 @@ EOF
 # ---------------------------------------------------------------------------
 # 5. Remove Docker
 # ---------------------------------------------------------------------------
+# pacman_owns <pkg> — true when <pkg> is the installed package's real name.
+# pacman -Q resolves Provides, so a query for docker succeeds on podman-docker.
+pacman_owns() {
+  local pkg="$1" resolved
+  resolved="$(pacman -Q "$pkg" 2>/dev/null | awk 'NR == 1 { print $1 }' || true)"
+  [[ "$resolved" == "$pkg" ]]
+}
+
 installed_docker_packages() {
   local pkg
   for pkg in "${DOCKER_PACKAGES[@]}"; do
-    pacman -Qq "$pkg" >/dev/null 2>&1 && printf '%s\n' "$pkg"
+    pacman_owns "$pkg" && printf '%s\n' "$pkg"
   done
   return 0
 }
@@ -329,7 +342,7 @@ remove_docker_packages() {
   [[ "$DRY_RUN" == "1" ]] && return 0
   local pkg
   for pkg in "${installed[@]}"; do
-    pacman -Qq "$pkg" >/dev/null 2>&1 && die "$pkg is still installed"
+    pacman_owns "$pkg" && die "$pkg is still installed"
   done
   ok "removed ${installed[*]}"
 }

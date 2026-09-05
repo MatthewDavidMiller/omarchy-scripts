@@ -14,6 +14,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/common.sh
 source "$SCRIPT_DIR/../lib/common.sh"
+# shellcheck source=../lib/omarchy.sh
+source "$SCRIPT_DIR/../lib/omarchy.sh"
 
 SOURCE_IMAGE="$SCRIPT_DIR/../assets/cat-wallpaper.png"
 STATE="$HOME/.local/state/omarchy/current"
@@ -116,6 +118,7 @@ if [[ "$DRY_RUN" == "1" ]]; then
   [[ "$ACTIVATE" == "1" ]] && printf '%s  dry%s omarchy theme bg set %s\n' "$C_DIM" "$C_RESET" "$target"
   [[ "$ACTIVATE" == "1" ]] && printf '%s  dry%s omarchy plymouth set %s %s %s\n' \
     "$C_DIM" "$C_RESET" "$BACKGROUND" "$PLYMOUTH_TEXT" "$unlock_target"
+  install_setup_hook theme-set cat-background
   exit 0
 fi
 
@@ -167,3 +170,4 @@ if [[ "$ACTIVATE" == "1" ]]; then
 fi
 
 run omarchy theme bg cache || true
+install_setup_hook theme-set cat-background

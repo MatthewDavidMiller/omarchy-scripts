@@ -37,6 +37,10 @@ After package installation, the script:
    and applies the current theme.
 3. Selects Brave through `omarchy default browser brave`, which updates XDG URL
    handlers.
+4. Installs a `post-update` hook that re-syncs Brave flags from Omarchy's
+   current `chromium-flags.conf` template (`./bin/setup-brave --flags-only`)
+   without rebuilding the package. That keeps new Wayland/Ozone flags after an
+   Omarchy update without waiting for a Brave version bump.
 
 It deliberately does not install the Copy URL or video-download native
 messaging integrations. This keeps standalone Brave setup consistent with the
@@ -66,6 +70,9 @@ a separately pinned first-party artifact and checksum.
 
 Run the setup script again. It compares the installed package with Brave's
 current public stable version and builds only when the versions differ.
+`--flags-only` refreshes `~/.config/brave-flags.conf` from Omarchy's current
+Chromium template without a rebuild; `omarchy update` does that automatically
+through the post-update hook.
 If Brave rotates its checksum signing key, the pinned key digest and signer list
 must be reviewed and updated in `packages/brave/prepare-latest`.
 

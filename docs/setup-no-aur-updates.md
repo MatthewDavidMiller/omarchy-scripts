@@ -9,9 +9,9 @@ packages from, and removes the AUR helper package.
 ./bin/setup-no-aur-updates --allow-aur-updates  # put it back
 ```
 
-Re-run it after any Omarchy update that resets `~/.config/hypr/hyprland.lua` —
-see [PATH precedence](#path-precedence). It is idempotent, so re-running when
-nothing has changed reports skips and writes nothing.
+Re-run it after any Omarchy update only if the Hyprland PATH toggle has been
+removed — see [PATH precedence](#path-precedence). It is idempotent, so
+re-running when nothing has changed reports skips and writes nothing.
 
 Run it from a terminal started *after* the override went in. A shell older than
 that keeps its own PATH and the script will say so; see
@@ -149,7 +149,8 @@ anything, which is a stronger statement than the name merely being absent.
 | `OMARCHY_BIN_DIR` | Where Omarchy's commands live. Default `/usr/bin` |
 | `OMARCHY_LOGIN_PATH` | PATH to check precedence against, instead of asking a login shell |
 | `OMARCHY_MANAGER_PATH` | PATH to check precedence against, instead of asking the systemd user manager. Empty skips that check |
-| `OMARCHY_HYPR_DIR` | Hyprland config directory. Default `~/.config/hypr` |
+| `OMARCHY_HYPR_DIR` | Hyprland config directory, used only to migrate the old require line out of `hyprland.lua`. Default `~/.config/hypr` |
+| `OMARCHY_HYPR_TOGGLES_DIR` | Where the PATH override Lua is installed. Default `~/.local/state/omarchy/toggles/hypr` |
 
 ## Scope
 
@@ -157,9 +158,9 @@ This changes what `omarchy update` does on this machine, and nothing else. It
 does not:
 
 - **Change any Omarchy file.** The shims live in `/usr/local/bin` and the PATH
-  override in `~/.config/hypr`, so an Omarchy upgrade cannot undo the shims and
-  `pacman -Qkk` stays clean. An upgrade *can* reset `hyprland.lua` and take the
-  require line with it; re-running this script puts it back.
+  override in `~/.local/state/omarchy/toggles/hypr`, so an Omarchy upgrade
+  cannot undo this and `pacman -Qkk` stays clean. `omarchy refresh hyprland`
+  recopies `flags.lua` in that directory and leaves sibling toggles alone.
 - **Touch the OpenSnitch rules.** The machine-local `191-deny-aur-helpers` rule
   stays as it is. Note it is not a second line of defence for this: it matches
   `process.path` `^/usr/bin/(yay|paru)$`, so it never sees the probe, which is
@@ -215,23 +216,14 @@ unguarded, and `envs.lua` is what the Hyprland session actually uses.
 ### The fix
 
 User Hyprland config is loaded after Omarchy's defaults, so an override there
-wins. It goes in **two** pieces, because a single block appended to
-`hyprland.lua` is exactly what an update can take away:
+wins. Extra Lua in `~/.config/hypr/` is **not** auto-loaded. Extra Lua in
+`~/.local/state/omarchy/toggles/hypr/` **is**, via `require("default.hypr.toggles")`,
+which runs after `default.hypr.envs`.
 
-| Piece | Where | Exposure to updates |
-| --- | --- | --- |
-| The override itself | `~/.config/hypr/omarchy-scripts-path.lua` | **None.** Not a config Omarchy ships, so `omarchy-refresh-config` refuses it (`Not a shipped user config`), `omarchy refresh hyprland` never lists it, and the migrations that replace a stock user file only touch names under `$OMARCHY_PATH/config/hypr/`. |
-| One require line | `~/.config/hypr/hyprland.lua` | **Yes.** `omarchy refresh hyprland` overwrites this file, and migrations have rewritten it before (`1781063758`). |
-
-```lua
--- ~/.config/hypr/hyprland.lua, after require("default.hypr.omarchy")
-pcall(require, "hypr.omarchy-scripts-path")
-```
-
-`setup-no-aur-updates` owns both. It writes the module, and it re-adds the
-require line whenever it has gone — so recovering from an update that reset
-`hyprland.lua` is one `./bin/setup-no-aur-updates` away, and the precedence
-check fails loudly until then.
+`setup-no-aur-updates` writes `omarchy-scripts-path.lua` into that toggles
+directory. It does not edit shipped `hyprland.lua`. Older installs that
+appended a `pcall(require, "hypr.omarchy-scripts-path")` line are migrated off
+on the next run.
 
 The module rebuilds the order rather than editing it, because `os.getenv("PATH")`
 inside it is Hyprland's own PATH and does not carry what `envs.lua` set for
@@ -239,23 +231,6 @@ children. Omarchy's bin directory is re-inserted exactly as `envs.lua` places
 it, just behind `/usr/local/bin` — and since every entry in it is a symlink to
 the same name in `/usr/bin`, the only names whose resolution changes are the
 ones shimmed here.
-
-#### Why `pcall`
-
-Omarchy ships `require_optional`, but it only guards a *missing* module and
-depends on an internal path. `pcall` needs nothing and cannot abort config
-parsing. Both failure modes were tested against the running compositor:
-
-| State | `hyprctl configerrors` | Session | PATH |
-| --- | --- | --- | --- |
-| Module missing | clean | starts | falls back to Omarchy's order |
-| Module has a syntax error | **reports it** | starts | falls back to Omarchy's order |
-
-So a damaged override degrades to "the shims are shadowed" — which
-`setup-no-aur-updates` reports as a failure — and never to a session that will
-not start.
-
-#### Applying it
 
 ```bash
 hyprctl reload && hyprctl configerrors     # must print nothing
@@ -302,7 +277,7 @@ graded differently:
 | State | Result |
 | --- | --- |
 | Override installed, manager PATH clean, login PATH stale | **exit 0**, with a note to restart the program this ran under |
-| Manager PATH shadowed, or the override missing or not wired | **exit 1** — a new process would still reach the AUR |
+| Manager PATH shadowed, or the PATH toggle is missing | **exit 1** — a new process would still reach the AUR |
 
 Any shim that loses is named along with the file that beat it either way, so the
 warning is never swallowed. `setup-all` reports only the second as a failure.

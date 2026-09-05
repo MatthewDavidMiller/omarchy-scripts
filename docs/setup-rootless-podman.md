@@ -79,6 +79,10 @@ things carry the old interface over:
 | `DOCKER_HOST` | lazydocker, `docker compose`, testcontainers, anything else speaking the Docker API |
 | `OMARCHY_DOCKER_SOCKET` | omarchy's `omarchy-sudo-docker` |
 
+`podman-docker` Provides `docker`, so `pacman -Q docker` still succeeds after
+the real package is gone. A re-run checks the resolved package name and leaves
+the shim alone.
+
 The environment file is:
 
 ```
@@ -178,6 +182,11 @@ the whole point of omarchy's install note — and an empty group grants nothing.
 With `--keep-docker`, `DOCKER_HOST` still points at podman — that is what makes
 podman the session's engine. Reach the Docker daemon explicitly with
 `DOCKER_HOST=unix:///var/run/docker.sock docker ps`.
+
+## Omarchy update safety
+
+Packages and an `environment.d` drop-in survive `omarchy update`. Update does
+not reinstall Docker or re-run Omarchy's firewall script. No hook is needed.
 
 ## Verifying
 

@@ -131,8 +131,35 @@ assert_contains "$(cat "$ROOT_FIXTURE/etc/opensnitchd/default-config.json" "$HOM
 it "keeps GUI prompts deny-by-default with temporary decisions"
 assert_contains "$(cat "$HOME_FIXTURE/.config/opensnitch/settings.conf")" $'default_action=0\ndefault_duration=7'
 
-it "adds the Omarchy-native GUI autostart entry"
-assert_file_contains "$HOME_FIXTURE/.config/hypr/autostart.lua" 'o.launch_on_start("opensnitch-ui-secure")'
+it "adds the Omarchy-native GUI autostart toggle"
+assert_file_contains "$HOME_FIXTURE/.local/state/omarchy/toggles/hypr/omarchy-scripts-opensnitch.lua" \
+  'o.launch_on_start("opensnitch-ui-secure")'
+
+it "does not rewrite shipped autostart.lua"
+assert_no_file "$HOME_FIXTURE/.config/hypr/autostart.lua"
+
+LEGACY_HOME="$(make_fake_home)"
+LEGACY_ROOT="$TEST_TMP/legacy-root"
+make_fixture "$LEGACY_ROOT"
+mkdir -p "$LEGACY_HOME/.config/hypr"
+cat > "$LEGACY_HOME/.config/hypr/autostart.lua" <<'LUA'
+-- Extra autostart processes.
+o.launch_on_start("keep-me")
+-- BEGIN omarchy-scripts opensnitch
+o.launch_on_start("opensnitch-ui-secure")
+-- END omarchy-scripts opensnitch
+LUA
+run_setup "$LEGACY_HOME" "$LEGACY_ROOT" >/dev/null
+
+it "migrates OpenSnitch autostart out of shipped autostart.lua"
+assert_not_contains "$(cat "$LEGACY_HOME/.config/hypr/autostart.lua")" "omarchy-scripts opensnitch"
+
+it "keeps unrelated autostart entries while stripping the old marker"
+assert_file_contains "$LEGACY_HOME/.config/hypr/autostart.lua" 'o.launch_on_start("keep-me")'
+
+it "installs the toggle on a machine that still had the old autostart block"
+assert_file_contains "$LEGACY_HOME/.local/state/omarchy/toggles/hypr/omarchy-scripts-opensnitch.lua" \
+  'o.launch_on_start("opensnitch-ui-secure")'
 
 it "writes an executable private-socket UI launcher"
 if [[ -x "$HOME_FIXTURE/.local/bin/opensnitch-ui-secure" ]]; then pass; else fail "launcher is not executable"; fi
@@ -184,6 +211,9 @@ assert_eq "$config_before" "$(cat "$DRY_ROOT/etc/opensnitchd/default-config.json
 
 it "--dry-run does not create user configuration"
 assert_no_file "$DRY_HOME/.config/opensnitch/settings.conf"
+
+it "--dry-run does not install the Hyprland autostart toggle"
+assert_no_file "$DRY_HOME/.local/state/omarchy/toggles/hypr/omarchy-scripts-opensnitch.lua"
 
 it "--dry-run does not install shared rules"
 installed_count="$(find "$DRY_ROOT/etc/opensnitchd/rules" -name 'omarchy-shared-*.json' | wc -l)"

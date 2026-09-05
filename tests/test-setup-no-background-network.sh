@@ -145,6 +145,9 @@ assert_file "$SYNC_MARKER"
 it "turns off Raspberry Pi Imager telemetry"
 assert_file_contains "$RPI_SETTINGS" "telemetry=false"
 
+it "installs a post-update hook that re-disables polling widgets"
+assert_file "$HOME_DIR/.config/omarchy/hooks/post-update.d/no-background-network"
+
 it "preserves Raspberry Pi Imager cache settings"
 assert_file_contains "$RPI_SETTINGS" "lastFileName=/tmp/lastdownload.cache"
 

@@ -76,6 +76,13 @@ the summary at the end lists every script with its result:
 The exit status is non-zero if anything failed. Use `--fail-fast` when a later
 script depends on an earlier one succeeding.
 
+## Omarchy update safety
+
+Do not install `setup-all` itself as a `post-update` hook. A full run would
+rebuild Brave, prompt for SSH keys, and touch Docker or OpenSnitch during
+`omarchy update`. Scripts that can be rewound by a migration or refresh install
+their own thin hooks instead.
+
 ## Prompts
 
 Scripts may ask for confirmation, and `setup-ssh-agent` prompts for key

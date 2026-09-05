@@ -1,0 +1,35 @@
+-- omarchy-scripts:no-aur-updates
+--
+-- Put @SHIM_DIR@ ahead of Omarchy's own bin directory for everything this
+-- Hyprland session spawns.
+--
+-- default/hypr/envs.lua prepends $OMARCHY_PATH/bin unconditionally, and hl.env
+-- is Hyprland's `env =`, which applies to what Hyprland spawns rather than to
+-- Hyprland itself. That directory is a farm of symlinks into @BIN_DIR@, so a
+-- shim in @SHIM_DIR@ is reached through it and never runs.
+--
+-- Loaded from ~/.local/state/omarchy/toggles/hypr, which require("default.hypr.toggles")
+-- auto-requires after Omarchy's defaults. This file is not a config Omarchy
+-- ships, so `omarchy refresh hyprland` leaves it alone.
+--
+-- os.getenv("PATH") here is Hyprland's own PATH, which does not carry what
+-- envs.lua set for its children, so the order is rebuilt rather than edited.
+-- Omarchy's directory is re-inserted unconditionally, exactly as envs.lua does
+-- it: if it ever stops being on PATH upstream, a directory of symlinks to names
+-- already in @BIN_DIR@ changes nothing, and a path that does not exist is
+-- ignored.
+
+local omarchy_bin = ((os.getenv("OMARCHY_PATH") or "/usr/share/omarchy"):gsub("/$", "")) .. "/bin"
+local shim_dir = "@SHIM_DIR@"
+
+local kept = {}
+for entry in (os.getenv("PATH") or "@SHIM_DIR@:@BIN_DIR@"):gmatch("[^:]+") do
+  if entry ~= omarchy_bin and entry ~= shim_dir then
+    table.insert(kept, entry)
+  end
+end
+
+table.insert(kept, 1, omarchy_bin)
+table.insert(kept, 1, shim_dir)
+
+hl.env("PATH", table.concat(kept, ":"))

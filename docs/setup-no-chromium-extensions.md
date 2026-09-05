@@ -5,8 +5,11 @@ loads into Chromium-family browsers: Copy URL, Download Video, and WhatsApp
 Slim.
 
 It edits existing `~/.config/*-flags.conf` files and removes only those three
-paths from `--load-extension`. Any user-added unpacked extensions and all other
-flags remain intact. Changed files receive a timestamped backup.
+paths from `--load-extension`. Other extensions and flags remain intact. Changed
+files receive a timestamped backup. The extension names live in
+`config/chromium/omarchy-extensions`. A `post-update` hook re-runs the strip
+after `omarchy update`, so migrations that append `--load-extension=` do not
+bring the bundled extensions back.
 
 Close affected browsers first, then run:
 

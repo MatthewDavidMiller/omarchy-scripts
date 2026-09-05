@@ -46,6 +46,12 @@ pacman to reconsider an already-installed package.
 | `-y`, `--yes` | Accepted for `setup-all` compatibility |
 | `-h`, `--help` | Show usage |
 
+## Omarchy update safety
+
+The packages come from Arch Extra through `omarchy pkg add`. Nothing under
+`/usr/share/omarchy` or `~/.config` is edited, so refresh and update cannot
+undo this. No hook is needed.
+
 ## Updates and removal
 
 The package is not version-pinned; normal system updates keep it current. To

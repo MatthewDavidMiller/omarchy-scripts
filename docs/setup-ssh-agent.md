@@ -105,6 +105,11 @@ ssh -T git@github.com    # prompts once, then the key is in the agent
   makes that painless is step 4: after a reboot the first `ssh` re-adds the key
   with one passphrase prompt, and every later connection that session is free.
 
+## Omarchy update safety
+
+This setup already lives in drop-ins Omarchy does not overwrite: an
+`environment.d` file and a marked block in `~/.ssh/config`. No hook is needed.
+
 ## Undo
 
 ```bash

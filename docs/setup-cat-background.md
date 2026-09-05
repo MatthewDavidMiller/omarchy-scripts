@@ -77,8 +77,9 @@ idempotence check rather than a timestamp comparison.
 ## Switching themes
 
 The wallpaper is stored per-theme so it participates in each theme's background
-cycle, but the same full-color artwork is used everywhere. After changing the
-theme with `omarchy theme set <name>`, re-run the script to install it there.
+cycle, but the same full-color artwork is used everywhere. The setup installs a
+`theme-set` hook that re-runs this script after `omarchy theme set`, so changing
+theme does not require a manual re-run.
 
 ## Removal
 

@@ -10,14 +10,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/common.sh
 source "$SCRIPT_DIR/../lib/common.sh"
+# shellcheck source=../lib/omarchy.sh
+source "$SCRIPT_DIR/../lib/omarchy.sh"
 
 FLAGS_DIR="${CHROMIUM_FLAGS_DIR:-$HOME/.config}"
+EXTENSIONS_FILE="${OMARCHY_CHROMIUM_EXTENSIONS_FILE:-$OMARCHY_SCRIPTS_ROOT/config/chromium/omarchy-extensions}"
 BROWSERS=(
   chromium chrome google-chrome
   brave brave-beta brave-nightly brave-origin brave-origin-beta
   microsoft-edge-stable
 )
-EXTENSIONS=(copy-url yt-dlp whatsapp-slim)
+EXTENSIONS=()
 
 usage() {
   cat <<'USAGE'
@@ -34,8 +37,9 @@ Options:
   -h, --help      Show this help.
 
 Environment:
-  DRY_RUN=1                 Same as --dry-run.
-  CHROMIUM_FLAGS_DIR        Flags directory. Default: ~/.config.
+  DRY_RUN=1                         Same as --dry-run.
+  CHROMIUM_FLAGS_DIR                Flags directory. Default: ~/.config.
+  OMARCHY_CHROMIUM_EXTENSIONS_FILE  List of bundled extension directory names.
 USAGE
 }
 
@@ -50,6 +54,20 @@ while [[ $# -gt 0 ]]; do
 done
 
 require_not_root
+
+load_omarchy_extensions() {
+  local line
+  [[ -f "$EXTENSIONS_FILE" ]] || die "Missing Chromium extension list: $EXTENSIONS_FILE"
+  EXTENSIONS=()
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" && "$line" != \#* ]] || continue
+    EXTENSIONS+=("$line")
+  done < "$EXTENSIONS_FILE"
+  [[ ${#EXTENSIONS[@]} -gt 0 ]] || die "Chromium extension list is empty: $EXTENSIONS_FILE"
+}
+
+load_omarchy_extensions
+extension_pattern="$(IFS='|'; printf '%s' "${EXTENSIONS[*]}")"
 
 is_omarchy_extension() {
   local path="$1" extension
@@ -92,25 +110,24 @@ files=()
 for browser in "${BROWSERS[@]}"; do
   file="$FLAGS_DIR/$browser-flags.conf"
   [[ -f "$file" ]] || continue
-  if grep -Eq '/omarchy/default/chromium/extensions/(copy-url|yt-dlp|whatsapp-slim)(,|$)' "$file"; then
+  if grep -Eq "/omarchy/default/chromium/extensions/(${extension_pattern})(,|$)" "$file"; then
     files+=("$file")
   fi
 done
 
 if [[ ${#files[@]} -eq 0 ]]; then
   skip "Omarchy's bundled Chromium extensions are already disabled"
-  exit 0
+else
+  log "Removing Copy URL, Download Video, and WhatsApp Slim"
+  printf '  %s\n' "${files[@]}"
+  if confirm "Update ${#files[@]} browser flags file(s)?"; then
+    for file in "${files[@]}"; do
+      clean_flags "$file" || skip "$file already clean"
+    done
+    ok "bundled extensions disabled; restart affected browsers to apply"
+  else
+    skip "left browser flags unchanged"
+  fi
 fi
 
-log "Removing Copy URL, Download Video, and WhatsApp Slim"
-printf '  %s\n' "${files[@]}"
-if ! confirm "Update ${#files[@]} browser flags file(s)?"; then
-  skip "left browser flags unchanged"
-  exit 0
-fi
-
-for file in "${files[@]}"; do
-  clean_flags "$file" || skip "$file already clean"
-done
-
-ok "bundled extensions disabled; restart affected browsers to apply"
+install_setup_hook post-update no-chromium-extensions

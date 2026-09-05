@@ -9,15 +9,18 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=../lib/common.sh
-source "$REPO_ROOT/lib/common.sh"
+source "$SCRIPT_DIR/../lib/common.sh"
+# shellcheck source=../lib/omarchy.sh
+source "$SCRIPT_DIR/../lib/omarchy.sh"
 
 DAEMON_CONFIG="${OPEN_SNITCH_DAEMON_CONFIG:-/etc/opensnitchd/default-config.json}"
 RULES_DIR="${OPEN_SNITCH_RULES_DIR:-/etc/opensnitchd/rules}"
-SHARED_RULES_DIR="${OPEN_SNITCH_SHARED_RULES_DIR:-$REPO_ROOT/config/opensnitch/rules}"
+SHARED_RULES_DIR="${OPEN_SNITCH_SHARED_RULES_DIR:-$OMARCHY_SCRIPTS_ROOT/config/opensnitch/rules}"
 GUI_SETTINGS="${OPEN_SNITCH_GUI_SETTINGS:-$HOME/.config/opensnitch/settings.conf}"
 AUTOSTART_FILE="${OPEN_SNITCH_AUTOSTART_FILE:-$HOME/.config/hypr/autostart.lua}"
+HYPR_TOGGLE_NAME="omarchy-scripts-opensnitch"
+HYPR_TOGGLE_SOURCE="$OMARCHY_SCRIPTS_ROOT/config/hypr/opensnitch-autostart.lua"
 UI_LAUNCHER="${OPEN_SNITCH_UI_LAUNCHER:-$HOME/.local/bin/opensnitch-ui-secure}"
 RUNTIME_ROOT="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 RUNTIME_DIR="$RUNTIME_ROOT/opensnitch"
@@ -44,7 +47,9 @@ Environment (primarily for tests):
   OPEN_SNITCH_RULES_DIR        Installed rules directory.
   OPEN_SNITCH_SHARED_RULES_DIR Repository-managed rules directory.
   OPEN_SNITCH_GUI_SETTINGS     GUI QSettings INI path.
-  OPEN_SNITCH_AUTOSTART_FILE   Hyprland user autostart path.
+  OPEN_SNITCH_AUTOSTART_FILE   Legacy Hyprland autostart path, stripped of an
+                               older in-file marker block.
+  OMARCHY_HYPR_TOGGLES_DIR     Where the OpenSnitch autostart Lua is installed.
   OPEN_SNITCH_UI_LAUNCHER      Secure GUI launcher path.
   OPEN_SNITCH_SKIP_LIVE_UI     Set to 1 to configure without launching the GUI.
 USAGE
@@ -190,7 +195,7 @@ render_gui_settings() {
 }
 
 write_user_configuration() {
-  local launcher autostart rendered="$WORK_DIR/settings.conf"
+  local launcher rendered="$WORK_DIR/settings.conf"
   render_gui_settings "$rendered"
   write_file "$GUI_SETTINGS" < "$rendered"
 
@@ -207,17 +212,11 @@ EOF
     chmod 0755 "$UI_LAUNCHER"
   fi
 
-  autostart="$(awk '
-    /^-- BEGIN omarchy-scripts opensnitch$/ { managed=1; next }
-    /^-- END omarchy-scripts opensnitch$/   { managed=0; next }
-    !managed { print }
-  ' "$AUTOSTART_FILE" 2>/dev/null || true)"
-  autostart="${autostart%$'\n'}"
-  [[ -n "$autostart" ]] && autostart+=$'\n\n'
-  autostart+="-- BEGIN omarchy-scripts opensnitch"$'\n'
-  autostart+='o.launch_on_start("opensnitch-ui-secure")'$'\n'
-  autostart+="-- END omarchy-scripts opensnitch"
-  write_file "$AUTOSTART_FILE" <<< "$autostart"
+  log "Installing the Hyprland OpenSnitch autostart toggle"
+  write_hypr_toggle "$HYPR_TOGGLE_NAME" "$HYPR_TOGGLE_SOURCE"
+  strip_marked_block "$AUTOSTART_FILE" \
+    "-- BEGIN omarchy-scripts opensnitch" \
+    "-- END omarchy-scripts opensnitch"
 }
 
 stop_existing_ui() {
@@ -330,7 +329,7 @@ configure_daemon() {
 
 validate_hyprland() {
   [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]] || return 0
-  have hyprctl || { warn "hyprctl unavailable; validate $AUTOSTART_FILE after login"; return; }
+  have hyprctl || { warn "hyprctl unavailable; validate Hyprland config after login"; return; }
   if [[ "$DRY_RUN" == "1" ]]; then
     run hyprctl reload
     run hyprctl configerrors

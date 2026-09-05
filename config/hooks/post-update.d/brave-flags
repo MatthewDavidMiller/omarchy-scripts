@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Re-sync Brave flags from the current Omarchy Chromium template after updates.
+set -euo pipefail
+pointer="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-scripts/repo"
+[[ -f "$pointer" ]] || { printf 'omarchy-scripts: repo pointer missing (%s)\n' "$pointer" >&2; exit 1; }
+root="$(cat -- "$pointer")"
+[[ -x "$root/bin/setup-brave" ]] \
+  || { printf 'omarchy-scripts: setup-brave missing in %s\n' "$root" >&2; exit 1; }
+exec "$root/bin/setup-brave" --flags-only --yes

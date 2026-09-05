@@ -48,6 +48,10 @@ The old pacman configuration is backed up before the change. A missing,
 different, or untrusted Omarchy signing key stops the script before it changes
 anything.
 
+`omarchy refresh pacman` replaces `/etc/pacman.conf` from a channel template.
+This setup installs a `pre-refresh-pacman` hook that re-applies the `[omarchy]`
+SigLevel line after that copy (`./bin/setup-security-hardening --siglevel-only`).
+
 ### Vulnerability monitoring
 
 The script installs `arch-audit` from Arch's official Extra repository through
@@ -75,7 +79,8 @@ blocked.
 
 ### Kernel and network settings
 
-`/etc/sysctl.d/60-omarchy-security.conf` sets:
+`/etc/sysctl.d/60-omarchy-security.conf` is copied from
+`config/sysctl/60-omarchy-security.conf` and sets:
 
 - `kernel.kptr_restrict=1`, hiding kernel pointers from unprivileged users
   while retaining privileged debugging.
@@ -124,6 +129,7 @@ dropping the `input` group or a withdrawn discovery daemon is left to you.
 | --- | --- |
 | `-n`, `--dry-run` | Print changes without applying them or prompting for sudo |
 | `-y`, `--yes` | Accepted for `setup-all` compatibility; there are no prompts |
+| `--siglevel-only` | Re-apply the `[omarchy]` SigLevel line only (used by the pacman refresh hook) |
 | `-h`, `--help` | Show usage |
 
 ## Verifying

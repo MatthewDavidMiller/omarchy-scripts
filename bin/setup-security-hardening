@@ -16,15 +16,19 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/common.sh
 source "$SCRIPT_DIR/../lib/common.sh"
+# shellcheck source=../lib/omarchy.sh
+source "$SCRIPT_DIR/../lib/omarchy.sh"
 
 PACMAN_CONF="${PACMAN_CONF:-/etc/pacman.conf}"
 SYSCTL_FILE="${SYSCTL_FILE:-/etc/sysctl.d/60-omarchy-security.conf}"
+SYSCTL_SOURCE="${SYSCTL_SOURCE:-$OMARCHY_SCRIPTS_ROOT/config/sysctl/60-omarchy-security.conf}"
 SDDM_CONFIG_DIR="${SDDM_CONFIG_DIR:-/etc/sddm.conf.d}"
 STAY_AWAKE_FILE="${STAY_AWAKE_FILE:-$HOME/.local/state/omarchy/indicators/stay-awake}"
 KEYRING_DIR="${KEYRING_DIR:-$HOME/.local/share/keyrings}"
 SSH_DIR="${SSH_DIR:-$HOME/.ssh}"
 OMARCHY_KEY_FINGERPRINT="${OMARCHY_KEY_FINGERPRINT:-40DFB630FF42BCFFB047046CF0134EE680CAC571}"
 OMARCHY_SIGLEVEL='SigLevel = Required DatabaseOptional TrustedOnly'
+SIGLEVEL_ONLY=0
 
 WORK_DIR=""
 
@@ -37,9 +41,11 @@ idle-lock, hardware, discovery, or boot behavior. It also prints a read-only
 report of important risks that were deliberately left alone.
 
 Options:
-  -n, --dry-run   Show what would change without changing anything.
-  -y, --yes       Accepted for setup-all compatibility; no prompts are used.
-  -h, --help      Show this help.
+  -n, --dry-run         Show what would change without changing anything.
+  -y, --yes             Accepted for setup-all compatibility; no prompts are used.
+      --siglevel-only   Only re-apply the [omarchy] SigLevel line. Used by the
+                        pre-refresh-pacman hook after `omarchy refresh pacman`.
+  -h, --help            Show this help.
 
 Environment (primarily for tests):
   DRY_RUN                 Same as --dry-run when set to 1.
@@ -54,16 +60,21 @@ USAGE
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -n|--dry-run) DRY_RUN=1 ;;
-    -y|--yes)     ASSUME_YES=1 ;;
-    -h|--help)    usage; exit 0 ;;
+    -n|--dry-run)        DRY_RUN=1 ;;
+    -y|--yes)            ASSUME_YES=1 ;;
+    --siglevel-only)     SIGLEVEL_ONLY=1 ;;
+    -h|--help)           usage; exit 0 ;;
     *)            usage >&2; die "Unknown argument: $1" ;;
   esac
   shift
 done
 
 require_not_root
-require_cmd awk chmod cmp find grep id mktemp omarchy pacman pacman-key sudo sysctl systemctl ufw
+if [[ "$SIGLEVEL_ONLY" == "1" ]]; then
+  require_cmd awk cmp mktemp omarchy pacman-key sudo
+else
+  require_cmd awk chmod cmp find grep id mktemp omarchy pacman pacman-key sudo sysctl systemctl ufw
+fi
 
 cleanup() {
   [[ -n "$WORK_DIR" ]] && rm -rf "$WORK_DIR"
@@ -273,21 +284,8 @@ configure_firewall() {
 # ---------------------------------------------------------------------------
 
 render_sysctl() {
-  cat > "$1" <<'EOF'
-# Managed by omarchy-scripts (bin/setup-security-hardening).
-# Restrict kernel-address disclosure while retaining root debugging access.
-kernel.kptr_restrict = 1
-
-# This workstation is not a router. Do not emit or trust ICMP redirects.
-net.ipv4.conf.all.accept_redirects = 0
-net.ipv4.conf.default.accept_redirects = 0
-net.ipv4.conf.all.secure_redirects = 0
-net.ipv4.conf.default.secure_redirects = 0
-net.ipv4.conf.all.send_redirects = 0
-net.ipv4.conf.default.send_redirects = 0
-net.ipv6.conf.all.accept_redirects = 0
-net.ipv6.conf.default.accept_redirects = 0
-EOF
+  [[ -f "$SYSCTL_SOURCE" ]] || die "Missing sysctl drop-in: $SYSCTL_SOURCE"
+  cat -- "$SYSCTL_SOURCE" > "$1"
 }
 
 configure_sysctl() {
@@ -468,6 +466,12 @@ security_report() {
 
 main() {
   configure_package_signatures
+  install_setup_hook pre-refresh-pacman omarchy-siglevel
+  if [[ "$SIGLEVEL_ONLY" == "1" ]]; then
+    ok "Omarchy package signatures required"
+    return 0
+  fi
+
   configure_arch_audit
   configure_firewall
   configure_sysctl

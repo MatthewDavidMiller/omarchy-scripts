@@ -154,6 +154,9 @@ assert_eq "brave" "$(cat "$HOME_ONE/.default-browser")" "default browser"
 it "reports the complete vetted setup"
 assert_contains "$out" "Vetted Brave installed with Omarchy integration"
 
+it "installs a post-update hook that re-syncs Brave flags"
+assert_file "$HOME_ONE/.config/omarchy/hooks/post-update.d/brave-flags"
+
 before_builds="$(wc -l < "$STUBS/makepkg.log")"
 before_writes="$(grep -c '^default browser brave$' "$STUBS/omarchy.log")"
 out2="$(brave_setup "$HOME_ONE" "$POLICY_ONE" "$DB_ONE" --yes)"
@@ -327,6 +330,31 @@ assert_file_contains "$REPO_ROOT/packages/brave/PKGBUILD.template" "chmod 4755"
 it "the recipe removes the vendor RPM updater"
 # shellcheck disable=SC2016 # $pkgdir must remain literal in the expected text.
 assert_file_contains "$REPO_ROOT/packages/brave/PKGBUILD.template" 'rm -rf "$pkgdir/etc/cron.daily"'
+
+# --- flags-only re-sync ----------------------------------------------------
+
+FLAGS_HOME="$(make_fake_home)"
+before_makepkg="$(wc -l < "$STUBS/makepkg.log" 2>/dev/null || printf '0')"
+flags_out="$(brave_setup "$FLAGS_HOME" "$(policy_fixture flags-only)" "$TEST_TMP/flags-only-db" --flags-only --yes)"
+after_makepkg="$(wc -l < "$STUBS/makepkg.log" 2>/dev/null || printf '0')"
+
+it "--flags-only does not build a package"
+assert_eq "$before_makepkg" "$after_makepkg" "makepkg calls"
+
+it "--flags-only writes Brave flags from the current Omarchy template"
+assert_file_contains "$FLAGS_HOME/.config/brave-flags.conf" "--ozone-platform=wayland"
+
+it "--flags-only still strips bundled Chromium extensions"
+assert_not_contains "$(cat "$FLAGS_HOME/.config/brave-flags.conf")" "/extensions/copy-url"
+
+it "--flags-only does not change the default browser"
+assert_no_file "$FLAGS_HOME/.default-browser"
+
+it "--flags-only installs the post-update flags hook"
+assert_file "$FLAGS_HOME/.config/omarchy/hooks/post-update.d/brave-flags"
+
+it "--flags-only reports a flags sync"
+assert_contains "$flags_out" "Brave flags synced"
 
 # --- argument handling -----------------------------------------------------
 

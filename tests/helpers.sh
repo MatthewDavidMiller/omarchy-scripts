@@ -16,6 +16,11 @@ TEST_TMP="$(mktemp -d "${TMPDIR:-/tmp}/omarchy-tests.XXXXXX")"
 cleanup() { rm -rf "$TEST_TMP"; }
 trap cleanup EXIT
 
+# Scripts honor XDG_* when set. Drop the caller's values so a test that only
+# overrides HOME cannot write drop-ins into the real ~/.config or ~/.local/state.
+# Tests that need a specific XDG path export it after sourcing this file.
+unset XDG_CONFIG_HOME XDG_STATE_HOME XDG_CACHE_HOME XDG_DATA_HOME
+
 # Used by the test files that source this, not here.
 # shellcheck disable=SC2034
 if [[ -t 1 ]]; then

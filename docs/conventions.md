@@ -15,7 +15,8 @@ means for linting.
 
 - Named `bin/setup-<thing>` — that prefix is what `setup-all` discovers.
 - `#!/usr/bin/env bash` and `set -euo pipefail`.
-- Source `lib/common.sh` for logging, `run`, and `write_file`.
+- Source `lib/common.sh` for logging, `run`, and `write_file`. Scripts that
+  layer onto Omarchy also source `lib/omarchy.sh`.
 - Executable, no `.sh` extension — these are commands, not libraries.
 - One script per task. If two tasks are useful separately, they are two scripts.
 - A header block declaring its slot in the run:
@@ -97,6 +98,37 @@ its `pacman` stub past the pipe buffer on purpose.
 `tui_multiselect`, `tui_confirm`, `tui_title`, `tui_banner`. Each prefers `gum`
 and falls back to plain bash prompts, so gum is never a hard dependency.
 Individual scripts do not need it; they just print.
+
+## Helpers in `lib/omarchy.sh`
+
+Scripts that layer onto Omarchy also source `lib/omarchy.sh`:
+
+| Helper | Purpose |
+| --- | --- |
+| `remember_repo_root` | Write `~/.config/omarchy-scripts/repo` so hooks can find this clone |
+| `write_hypr_toggle name file` | Install Lua into `~/.local/state/omarchy/toggles/hypr/` |
+| `install_omarchy_hook type src` | Copy a hook into `~/.config/omarchy/hooks/<type>.d/` |
+| `install_setup_hook type name` | Record the repo path and install `config/hooks/<type>.d/<name>` |
+| `strip_marked_block file begin end` | Remove a legacy in-file marker block |
+
+Durable overlay lives in `config/` and is installed to those locations. Scripts
+keep generating only what must be computed (key lists, shim contents).
+
+## Omarchy update safety
+
+`omarchy update` overwrites `/usr/share/omarchy`, runs one-shot migrations, then
+user `post-update` hooks. It does not run `omarchy refresh`. Refresh commands
+do overwrite shipped files under `~/.config/`.
+
+- Never edit `/usr/share/omarchy/`.
+- Prefer drop-ins Omarchy auto-loads (`toggles/hypr`, `environment.d`,
+  `/etc/sysctl.d`, `/usr/local/bin`) over shipped files (`hyprland.lua`,
+  `autostart.lua`, `shell.json` by raw edit, `/etc/pacman.conf`).
+- Prefer the `omarchy` CLI for shell, idle, theme, and browser changes.
+- Shell plugins (`~/.config/omarchy/plugins/`) are for bar/UI components, not
+  system config, Hyprland env, or package policy.
+- Hooks re-assert only what migrations or refresh can rewind. They call
+  existing idempotent scripts; they do not run `setup-all`.
 
 ## Testing
 

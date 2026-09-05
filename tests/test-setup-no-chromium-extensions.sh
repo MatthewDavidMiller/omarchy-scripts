@@ -41,6 +41,12 @@ assert_file_contains "$FLAGS/chromium-flags.conf" "--password-store=gnome-libsec
 it "backs up the edited file"
 if compgen -G "$FLAGS/chromium-flags.conf.bak.*" >/dev/null; then pass; else fail "backup not found"; fi
 
+it "records the repo path for post-update hooks"
+assert_file_contains "$HOME_DIR/.config/omarchy-scripts/repo" "$REPO_ROOT"
+
+it "installs a post-update hook that re-strips extensions"
+assert_file "$HOME_DIR/.config/omarchy/hooks/post-update.d/no-chromium-extensions"
+
 it "a second run is a no-op"
 assert_contains "$(env HOME="$HOME_DIR" CHROMIUM_FLAGS_DIR="$FLAGS" "$SCRIPT" --yes 2>&1)" "already disabled"
 

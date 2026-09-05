@@ -268,6 +268,17 @@ assert_file_contains "$SYSCTL_FILE" "net.ipv4.conf.all.send_redirects = 0"
 it "disables IPv6 redirect acceptance"
 assert_file_contains "$SYSCTL_FILE" "net.ipv6.conf.all.accept_redirects = 0"
 
+it "installs a pre-refresh-pacman hook that re-applies SigLevel"
+assert_file "$HOME_DIR/.config/omarchy/hooks/pre-refresh-pacman.d/omarchy-siglevel"
+
+sig_out="$(run_setup --siglevel-only --yes)"
+
+it "--siglevel-only skips the rest of the security baseline"
+assert_not_contains "$sig_out" "Enabling installed-package vulnerability monitoring"
+
+it "--siglevel-only reports the signature policy as already applied"
+assert_contains "$sig_out" "already up to date"
+
 it "applies only the managed sysctl file"
 assert_contains "$(cat "$STUBS/sysctl.log")" "-p $SYSCTL_FILE"
 

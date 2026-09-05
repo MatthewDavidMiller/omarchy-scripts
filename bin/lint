@@ -38,7 +38,7 @@ usage() {
 Usage: lint [options] [file...]
 
 Runs shellcheck over the repo's shell scripts. With no files given, lints
-everything tracked in bin/, lib/, and githooks/.
+everything tracked in bin/, lib/, githooks/, and config/hooks/.
 
 Options:
       --fmt           Also check formatting with shfmt.
@@ -163,6 +163,7 @@ discover_files() {
   local file line
   shopt -s nullglob
   for file in "$REPO_ROOT"/bin/* "$REPO_ROOT"/lib/*.sh "$REPO_ROOT"/githooks/* \
+              "$REPO_ROOT"/config/hooks/*/* \
               "$REPO_ROOT"/tests/run "$REPO_ROOT"/tests/*.sh; do
     [[ -f "$file" ]] || continue
     [[ "$file" == *.bak.* ]] && continue

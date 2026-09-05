@@ -79,6 +79,11 @@ Claude Code sessions started as you, here. It does not touch:
   `disableRemoteControl` in managed settings would win regardless, which is how
   an administrator pins it.
 
+## Omarchy update safety
+
+Claude Code's user settings file is not Omarchy-owned. `omarchy update` does
+not rewrite `~/.claude/settings.json`. No hook is needed.
+
 ## Verifying
 
 ```bash

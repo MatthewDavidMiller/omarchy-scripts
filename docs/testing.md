@@ -19,7 +19,9 @@ under test. `tests/helpers.sh` provides the handful of assertions needed.
 Nothing touches your real system. Every test that could write runs against:
 
 - **A throwaway `HOME`** (`make_fake_home`) with its own `XDG_RUNTIME_DIR`,
-  removed on exit.
+  removed on exit. The suite also unsets `XDG_CONFIG_HOME` and
+  `XDG_STATE_HOME`, so scripts that honor those variables still write inside
+  the fake home rather than the developer's real config.
 - **Stubbed system commands** (`stub_bin`) — a fake `systemctl`, `ssh-agent`,
   and `ssh-add` that log how they were called, so tests can assert on
   *"did it try to mask gpg-agent-ssh.socket?"* without a real systemd anywhere
@@ -38,15 +40,16 @@ would test the mock.
 | `tests/run` | Harness: discovers `test-*.sh`, aggregates results |
 | `tests/helpers.sh` | Assertions and fixtures |
 | `tests/test-common.sh` | `lib/common.sh` — dry-run, idempotent writes, backups |
+| `tests/test-omarchy.sh` | `lib/omarchy.sh` — repo pointer, hypr toggles, hooks, marked-block strip |
 | `tests/test-setup-all.sh` | Discovery, ordering, `--only`/`--skip`, failure reporting |
 | `tests/test-setup-ssh-agent.sh` | Full run against a fake HOME, and idempotence |
 | `tests/test-setup-no-idle.sh` | Idle and screensaver toggles against a stubbed `omarchy` |
-| `tests/test-setup-no-background-network.sh` | Omarchy polling widgets, VS Code/RPi settings, and exact OpenSnitch deny cleanup |
-| `tests/test-setup-no-aur-updates.sh` | Shim install and content, helper removal, the marker that stops it clobbering files it does not own, and idempotence |
+| `tests/test-setup-no-background-network.sh` | Omarchy polling widgets, VS Code/RPi settings, exact OpenSnitch deny cleanup, and the post-update hook |
+| `tests/test-setup-no-aur-updates.sh` | Shim install and content, helper removal, Hyprland PATH toggle, legacy require-line migration, and idempotence |
 | `tests/test-setup-no-localsend.sh` | ufw rule deletion against fixture rules files, and package removal |
-| `tests/test-setup-opensnitch.sh` | package provenance, fail-closed configuration, shared rules, and service state |
+| `tests/test-setup-opensnitch.sh` | package provenance, fail-closed configuration, shared rules, hypr toggle autostart, and service state |
 | `tests/test-export-opensnitch-rules.sh` | rule eligibility, portability checks, stable export, and dry-run safety |
-| `tests/test-setup-cat-background.sh` | The approved generated cat asset, deterministic rendering, live refresh, and idempotence |
+| `tests/test-setup-cat-background.sh` | The approved generated cat asset, deterministic rendering, live refresh, theme-set hook, and idempotence |
 | `tests/test-tui.sh` | `lib/tui.sh` fallback menu parsing |
 | `tests/test-lint.sh` | `bin/lint` CLI, exit codes, image policy |
 | `tests/test-repo.sh` | `.gitignore` — secrets excluded, sources not |

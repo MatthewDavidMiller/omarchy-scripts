@@ -45,7 +45,17 @@ for path in \
   bin/lint bin/install-hooks \
   packages/brave/PKGBUILD.template packages/brave/brave-launcher \
   packages/brave/prepare-latest \
-  lib/common.sh lib/tui.sh \
+  lib/common.sh lib/tui.sh lib/omarchy.sh \
+  config/chromium/omarchy-extensions \
+  config/hypr/omarchy-scripts-path.lua.in \
+  config/hypr/opensnitch-autostart.lua \
+  config/sysctl/60-omarchy-security.conf \
+  config/hooks/post-update.d/no-chromium-extensions \
+  config/hooks/post-update.d/no-background-network \
+  config/hooks/post-update.d/brave-flags \
+  config/hooks/theme-set.d/cat-background \
+  config/hooks/pre-refresh-pacman.d/omarchy-siglevel \
+  tests/test-omarchy.sh \
   githooks/pre-commit docker/lint.Dockerfile \
   tests/run tests/helpers.sh tests/test-repo.sh \
   docs/ci.md docs/testing.md docs/setup-cat-background.md \
@@ -74,5 +84,16 @@ aur_calls="$(grep -REn \
   '(^|[[:space:]])(yay|paru|omarchy +pkg +aur +add|omarchy-pkg-aur-add)([[:space:]]|$)' \
   "$REPO_ROOT"/bin/setup-* || true)"
 assert_eq "" "$aur_calls" "AUR installer references"
+
+# Shipped Hyprland files are replaced by `omarchy refresh hyprland`. The only
+# allowed mention of those names is migration: assign the legacy path, then
+# strip_marked_block. write_file / appends to them must not come back.
+it "setup scripts do not write shipped hyprland.lua or autostart.lua except to strip old markers"
+hypr_hits="$(grep -nE '(^|[^[:alnum:]-])(hyprland\.lua|autostart\.lua)' \
+  "$REPO_ROOT"/bin/setup-* || true)"
+hypr_writes="$(printf '%s\n' "$hypr_hits" \
+  | grep -vE '(:[0-9]+:[[:space:]]*(#|HYPR_ENTRY=|AUTOSTART_FILE=)|strip_marked_block |old require line out of hyprland\.lua|appended a require line|shipped hyprland\.lua|Legacy Hyprland autostart)' \
+  || true)"
+assert_eq "" "$hypr_writes" "unexpected hyprland.lua/autostart.lua writes"
 
 finish

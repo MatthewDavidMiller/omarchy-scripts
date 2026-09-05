@@ -69,6 +69,12 @@ sleep inhibitor: on a laptop, systemd may still suspend the machine on battery,
 and it will lock on the way down. `logind`'s own `IdleAction` is `ignore` on a
 stock Omarchy install, so it is not a second source of idle locking.
 
+## Omarchy update safety
+
+Stay-awake and screensaver-off are official `omarchy toggle` APIs writing state
+files under `~/.local/state/omarchy/`. Those survive `omarchy update` and
+`omarchy refresh shell`. No hook is needed.
+
 ## Verifying
 
 ```bash

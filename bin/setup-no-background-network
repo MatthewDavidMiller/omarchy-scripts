@@ -10,6 +10,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib/common.sh
 source "$SCRIPT_DIR/../lib/common.sh"
+# shellcheck source=../lib/omarchy.sh
+source "$SCRIPT_DIR/../lib/omarchy.sh"
 
 SHELL_CONFIG="${OMARCHY_SHELL_CONFIG:-$HOME/.config/omarchy/shell.json}"
 CODE_SETTINGS="${VSCODE_SETTINGS_FILE:-$HOME/.config/Code/User/settings.json}"
@@ -323,6 +325,7 @@ main() {
   disable_vscode_background_network
   disable_rpi_telemetry
   remove_legacy_denies
+  install_setup_hook post-update no-background-network
   ok "background polling and telemetry disabled"
 }
 

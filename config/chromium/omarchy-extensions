@@ -1,0 +1,6 @@
+# Bundled Omarchy Chromium extensions stripped from --load-extension flags.
+# One directory name per line. Paths matching
+# */omarchy/default/chromium/extensions/<name> are removed; everything else is kept.
+copy-url
+yt-dlp
+whatsapp-slim

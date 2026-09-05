@@ -103,6 +103,9 @@ assert_file_contains "$STUBS/omarchy.log" "theme bg cache"
 it "sets the corrected cat as the Plymouth disk-encryption image"
 assert_file_contains "$STUBS/omarchy.log" "plymouth set #77797c #ffffff $UNLOCK_TARGET"
 
+it "installs a theme-set hook so a later theme switch re-applies the wallpaper"
+assert_file "$FAKE_HOME/.config/omarchy/hooks/theme-set.d/cat-background"
+
 # --- idempotence -----------------------------------------------------------
 
 before="$(grep -c '^theme bg set' "$STUBS/omarchy.log")"

@@ -23,6 +23,10 @@ The OpenSnitch cleanup is intentionally exact. It does not delete arbitrary
 deny rules, and it does not touch any allow rule. The daemon's global default
 remains `deny`, so a new unmatched connection is still blocked or prompted.
 
+A `post-update` hook re-runs this setup after `omarchy update`, so migrations
+that rewrite `shell.json` cannot silently put the weather and agents widgets
+back.
+
 ## Why remove the broad denies?
 
 The `curl` and Python rules were caused by Omarchy's built-in weather and AI

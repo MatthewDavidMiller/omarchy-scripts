@@ -25,7 +25,7 @@ keeps its name.
 
 ## What gets linted
 
-`bin/*`, `lib/*.sh`, `githooks/*`, `tests/run`, and `tests/*.sh`, minus
+`bin/*`, `lib/*.sh`, `githooks/*`, `config/hooks/**`, `tests/run`, and `tests/*.sh`, minus
 `.bak.*` copies — and minus anything whose shebang is not a shell. `bin/` holds
 commands rather than shell scripts specifically, and shellcheck refuses a
 language it cannot parse with `SC1071 (error)`, which fails the run rather than

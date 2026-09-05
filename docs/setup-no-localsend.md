@@ -88,7 +88,7 @@ stops working for the same reason.
 Nothing re-adds the firewall rules on update: they are written once by the
 installer, and no migration touches port 53317. LocalSend is an explicitly
 installed package with no reverse dependencies, so `omarchy update` will not
-pull it back in either.
+pull it back in either. No hook is needed.
 
 ## Verifying
 

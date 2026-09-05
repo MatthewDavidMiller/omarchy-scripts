@@ -56,7 +56,7 @@ SHIMS=(omarchy-update-aur-pkgs omarchy-pkg-aur-accessible \
 # helper installed. Echoes the case directory.
 fixture() {
   local dir="$TEST_TMP/case.$RANDOM"
-  mkdir -p "$dir/shims" "$dir/bin" "$dir/db" "$dir/hypr"
+  mkdir -p "$dir/shims" "$dir/bin" "$dir/db" "$dir/hypr" "$dir/toggles"
   # A stand-in for the stock entry point, down to the require this must land
   # after.
   cat > "$dir/hypr/hyprland.lua" <<'ENTRY'
@@ -84,6 +84,7 @@ run_setup() {
   OMARCHY_LOGIN_PATH="${OMARCHY_LOGIN_PATH-$dir/shims:$dir/bin}" \
   OMARCHY_MANAGER_PATH="${OMARCHY_MANAGER_PATH-}" \
   OMARCHY_HYPR_DIR="$dir/hypr" \
+  OMARCHY_HYPR_TOGGLES_DIR="$dir/toggles" \
     bash "$SCRIPT" -y "$@" 2>&1
 }
 
@@ -260,43 +261,28 @@ it "still installs the shim rather than dying on upstream drift"
 assert_file "$CASE/shims/omarchy-update-aur-pkgs"
 
 # --- the Hyprland PATH override ---------------------------------------------
-# Split in two so an update that rewrites a config file cannot take the whole
-# thing with it: the module is ours and is not a config Omarchy ships, so only
-# the require line in hyprland.lua is exposed.
+# A Lua drop-in in Omarchy's hypr toggles directory is auto-loaded after
+# defaults. hyprland.lua is a shipped file and is not edited.
 
 CASE="$(fixture)"
 out="$(run_setup "$CASE")"
 
-it "writes the override module"
-assert_file "$CASE/hypr/omarchy-scripts-path.lua"
+it "writes the override toggle"
+assert_file "$CASE/toggles/omarchy-scripts-path.lua"
 
-it "marks the module as ours"
-assert_file_contains "$CASE/hypr/omarchy-scripts-path.lua" "$MARKER"
+it "marks the toggle as ours"
+assert_file_contains "$CASE/toggles/omarchy-scripts-path.lua" "$MARKER"
 
-it "puts the shim directory ahead of Omarchy's bin in the module"
-assert_file_contains "$CASE/hypr/omarchy-scripts-path.lua" 'table.insert(kept, 1, shim_dir)'
+it "puts the shim directory ahead of Omarchy's bin in the toggle"
+assert_file_contains "$CASE/toggles/omarchy-scripts-path.lua" 'table.insert(kept, 1, shim_dir)'
 
-it "adds the require line to hyprland.lua"
-assert_file_contains "$CASE/hypr/hyprland.lua" 'pcall(require, "hypr.omarchy-scripts-path")'
-
-it "guards the require with pcall, so a broken module cannot stop the session"
-assert_file_contains "$CASE/hypr/hyprland.lua" "pcall(require"
-
-it "adds the require after Omarchy's own defaults, or it would not win"
-theirs="$(grep -n 'default.hypr.omarchy' "$CASE/hypr/hyprland.lua" | head -1 | cut -d: -f1)"
-ours_line="$(grep -n 'pcall(require, "hypr.omarchy-scripts-path")' "$CASE/hypr/hyprland.lua" | head -1 | cut -d: -f1)"
-if [[ -n "$theirs" && -n "$ours_line" && "$ours_line" -gt "$theirs" ]]; then
-  pass
-else
-  fail "expected our require (line ${ours_line:-none}) after Omarchy's (line ${theirs:-none})"
-fi
+it "does not edit shipped hyprland.lua"
+assert_not_contains "$(cat "$CASE/hypr/hyprland.lua")" "omarchy-scripts-path"
 
 it "leaves the rest of hyprland.lua alone"
 assert_file_contains "$CASE/hypr/hyprland.lua" 'require("hypr.bindings")'
 
-# An update that replaces hyprland.lua takes the require line with it. The
-# module survives, because it is not a file Omarchy ships, and a re-run rewires
-# it — this is the whole point of the split.
+# An update that replaces hyprland.lua cannot take the toggle with it.
 
 cat > "$CASE/hypr/hyprland.lua" <<'ENTRY'
 dofile("/usr/share/omarchy/default/hypr/bootstrap.lua")
@@ -305,33 +291,45 @@ require("hypr.bindings")
 ENTRY
 out="$(run_setup "$CASE")"
 
-it "survives an update that replaces hyprland.lua: the module is still there"
-assert_file_contains "$CASE/hypr/omarchy-scripts-path.lua" "$MARKER"
+it "survives an update that replaces hyprland.lua: the toggle is still there"
+assert_file_contains "$CASE/toggles/omarchy-scripts-path.lua" "$MARKER"
 
-it "rewires the require line a config refresh removed"
-assert_file_contains "$CASE/hypr/hyprland.lua" 'pcall(require, "hypr.omarchy-scripts-path")'
+it "does not reintroduce a require line after hyprland.lua is reset"
+assert_not_contains "$(cat "$CASE/hypr/hyprland.lua")" "omarchy-scripts-path"
 
-it "reports the module as already up to date rather than rewriting it"
+it "reports the toggle as already up to date rather than rewriting it"
 assert_contains "$out" "already up to date"
 
-# A second run with nothing changed must not append the require line twice.
+# Older installs appended a require line to hyprland.lua and kept a sibling
+# module. A run must migrate those off.
 
-before="$(grep -c "omarchy-scripts-path" "$CASE/hypr/hyprland.lua")"
-run_setup "$CASE" >/dev/null
-after="$(grep -c "omarchy-scripts-path" "$CASE/hypr/hyprland.lua")"
+CASE="$(fixture)"
+printf -- '-- %s\n' "$MARKER" > "$CASE/hypr/omarchy-scripts-path.lua"
+cat >> "$CASE/hypr/hyprland.lua" <<ENTRY
 
-it "never adds the require line twice"
-assert_eq "$before" "$after" "occurrences of the require line"
+-- $MARKER — /usr/local/bin must precede \$OMARCHY_PATH/bin.
+pcall(require, "hypr.omarchy-scripts-path")
+ENTRY
+out="$(run_setup "$CASE")"
 
-# Reversing takes both halves out and leaves the user's own file intact.
+it "migrates the PATH override into the toggles directory"
+assert_file_contains "$CASE/toggles/omarchy-scripts-path.lua" "$MARKER"
+
+it "removes the legacy sibling module from ~/.config/hypr"
+assert_no_file "$CASE/hypr/omarchy-scripts-path.lua"
+
+it "strips the legacy require line from hyprland.lua"
+assert_not_contains "$(cat "$CASE/hypr/hyprland.lua")" "omarchy-scripts-path"
+
+it "keeps the rest of hyprland.lua while stripping the require"
+assert_file_contains "$CASE/hypr/hyprland.lua" 'require("hypr.bindings")'
+
+# Reversing takes the toggle out and leaves the user's own file intact.
 
 out="$(run_setup "$CASE" --allow-aur-updates)"
 
-it "--allow-aur-updates removes the override module"
-assert_no_file "$CASE/hypr/omarchy-scripts-path.lua"
-
-it "--allow-aur-updates drops the require line"
-assert_not_contains "$(cat "$CASE/hypr/hyprland.lua")" "omarchy-scripts-path"
+it "--allow-aur-updates removes the override toggle"
+assert_no_file "$CASE/toggles/omarchy-scripts-path.lua"
 
 it "--allow-aur-updates keeps the rest of hyprland.lua"
 assert_file_contains "$CASE/hypr/hyprland.lua" 'require("hypr.bindings")'
@@ -340,29 +338,29 @@ it "--allow-aur-updates is idempotent on the override"
 out2="$(run_setup "$CASE" --allow-aur-updates)"
 assert_contains "$out2" "already gone"
 
-# A module someone else wrote is reported, never deleted.
+# A toggle someone else wrote is reported, never deleted.
 
 CASE="$(fixture)"
-printf -- '-- someone else\n' > "$CASE/hypr/omarchy-scripts-path.lua"
+printf -- '-- someone else\n' > "$CASE/toggles/omarchy-scripts-path.lua"
 out="$(run_setup "$CASE" --allow-aur-updates)"
 
-it "leaves an override module that is not ours alone"
-assert_file_contains "$CASE/hypr/omarchy-scripts-path.lua" "-- someone else"
+it "leaves an override toggle that is not ours alone"
+assert_file_contains "$CASE/toggles/omarchy-scripts-path.lua" "-- someone else"
 
-it "says it left a module that is not ours alone"
+it "says it left a toggle that is not ours alone"
 assert_contains "$out" "is not ours"
 
-# A machine with no Hyprland config at all must not grow one.
+# A machine with no hyprland.lua still gets the toggle: Omarchy auto-loads it.
 
 CASE="$(fixture)"
 rm -f "$CASE/hypr/hyprland.lua"
 out="$(run_setup "$CASE")"
 
-it "writes no Hyprland files where there is no Hyprland config"
-assert_no_file "$CASE/hypr/omarchy-scripts-path.lua"
+it "installs the PATH toggle even when hyprland.lua is missing"
+assert_file "$CASE/toggles/omarchy-scripts-path.lua"
 
-it "says why it skipped the Hyprland override"
-assert_contains "$out" "no Hyprland config to override"
+it "does not create a hyprland.lua just to wire the override"
+assert_no_file "$CASE/hypr/hyprland.lua"
 
 # --- a stale shell is not a broken install ----------------------------------
 # A process keeps the PATH it was given, so a terminal or editor started before
@@ -401,9 +399,7 @@ for name in "${SHIMS[@]}"; do
   ln -sf "$CASE/bin/$name" "$CASE/farm/$name"
 done
 run_setup "$CASE" >/dev/null
-rm -f "$CASE/hypr/omarchy-scripts-path.lua"
-# Re-running would reinstall it, so check the classification with the module
-# gone by pointing at a hypr dir that has an entry but no module.
+# Re-running reinstalls the toggle; manager PATH shadowed is still a failure.
 out="$(OMARCHY_LOGIN_PATH="$CASE/farm:$CASE/shims:$CASE/bin" \
   OMARCHY_MANAGER_PATH="$CASE/farm:$CASE/shims:$CASE/bin" run_setup "$CASE")"
 status=$?
@@ -458,8 +454,8 @@ assert_file_contains "$CASE/shims/omarchy-update-aur-pkgs" "# changed"
 # reaches the upstream command while the shim directory still precedes the bin
 # directory. The old check compared only those two and passed.
 
-# No Hyprland config here, so there is no override to make a new session right:
-# a shadowed shim is simply broken.
+# The toggle is installed even without hyprland.lua, so a shadowed login PATH
+# is a stale invoking shell rather than a broken install.
 CASE="$(fixture)"
 rm -f "$CASE/hypr/hyprland.lua"
 mkdir -p "$CASE/farm"
@@ -472,13 +468,13 @@ status=$?
 it "names the file that shadows a shim on the login PATH"
 assert_contains "$out" "$CASE/farm/omarchy-update-aur-pkgs before $CASE/shims/omarchy-update-aur-pkgs"
 
-it "does not claim success when a shim is shadowed"
+it "treats a shadowed login PATH as a stale shell when the toggle is installed"
+assert_status 0 "$status"
+
+it "does not claim the AUR step is skipped from this stale shell"
 assert_not_contains "$out" "now skips the AUR step"
 
-it "exits non-zero when a shim is shadowed"
-assert_status 1 "$status"
-
-it "still installs the shims, so fixing PATH is all that is left"
+it "still installs the shims, so restarting the shell is all that is left"
 assert_file_contains "$CASE/shims/omarchy-update-aur-pkgs" "$MARKER"
 
 # A directory that shadows only the helper name is still a shadowed shim: that
@@ -502,8 +498,8 @@ status=$?
 it "reports a login PATH that cannot reach the shim directory"
 assert_contains "$out" "is not on the login PATH"
 
-it "exits non-zero when the shim directory is not on PATH"
-assert_status 1 "$status"
+it "treats a login PATH without the shim directory as stale when the toggle is installed"
+assert_status 0 "$status"
 
 # --- the systemd user manager's PATH is checked too -------------------------
 # It holds the session PATH under a uwsm login and outlives a logout, so a

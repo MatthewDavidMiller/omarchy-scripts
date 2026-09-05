@@ -56,8 +56,12 @@ the rules live in the daemon's memory until it restarts. So the difference
 between the two indices is not twelve hours versus one login. It is whether an
 unanswered prompt leaves a durable file behind.
 
-The setup adds `opensnitch-ui-secure` to Omarchy's user
-`~/.config/hypr/autostart.lua`. In a live Hyprland session it validates the
+The setup adds `opensnitch-ui-secure` as a Hyprland toggle drop-in
+(`~/.local/state/omarchy/toggles/hypr/omarchy-scripts-opensnitch.lua`). That
+directory is auto-loaded after Omarchy's defaults, so `omarchy refresh hyprland`
+cannot take the autostart with it. Older installs that wrote a marked block
+into shipped `~/.config/hypr/autostart.lua` are migrated off on the next run.
+In a live Hyprland session it validates the
 configuration, starts the UI on the private socket, and only then starts the
 daemon. Outside a graphical session it enables the daemon for boot but does
 not cut off the current session without a UI.

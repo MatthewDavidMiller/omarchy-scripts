@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Re-strip Omarchy's bundled Chromium extensions after migrations or refresh.
+set -euo pipefail
+pointer="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-scripts/repo"
+[[ -f "$pointer" ]] || { printf 'omarchy-scripts: repo pointer missing (%s)\n' "$pointer" >&2; exit 1; }
+root="$(cat -- "$pointer")"
+[[ -x "$root/bin/setup-no-chromium-extensions" ]] \
+  || { printf 'omarchy-scripts: setup-no-chromium-extensions missing in %s\n' "$root" >&2; exit 1; }
+exec "$root/bin/setup-no-chromium-extensions" --yes

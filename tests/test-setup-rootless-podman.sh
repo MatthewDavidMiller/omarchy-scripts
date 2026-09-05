@@ -29,8 +29,19 @@ esac'
 # shellcheck disable=SC2016
 stub_bin "$STUBS" pacman '
 db="${FAKE_PKG_DB:?}"
+# pacman -Q resolves Provides: podman-docker satisfies a query for docker.
+resolved=""
+if [[ -f "$db/${2:-}" ]]; then
+  resolved="$2"
+elif [[ "${2:-}" == docker && -f "$db/podman-docker" ]]; then
+  resolved=podman-docker
+fi
 case "$1" in
-  -Qq) [[ -f "$db/$2" ]] ;;
+  -Qq) [[ -n "$resolved" ]] ;;
+  -Q)
+    [[ -n "$resolved" ]] || exit 1
+    printf "%s 1.0-1\n" "$resolved"
+    ;;
   -Rs) shift 2
        for p in "$@"; do printf "%s-1.0-1\n" "$p"; done
        printf "containerd-2.3.4-1\n" ;;
@@ -293,6 +304,34 @@ assert_contains "$out2" "already closed"
 it "a second run exits successfully"
 podman_setup --yes >/dev/null 2>&1
 assert_status 0 $?
+
+# --- already migrated: podman-docker Provides docker ----------------------
+# A machine that already swapped engines has no `docker` package, but
+# `pacman -Q docker` still succeeds because podman-docker Provides it.
+# The script must not prompt to remove that provide, then fail when drop
+# (which matches exact names) leaves it in place.
+
+read -r HOME_DIR PKGDB UNITS SUBUID SUBGID UFWDIR <<< "$(make_machine)"
+ENV_FILE="$HOME_DIR/.config/environment.d/20-podman.conf"
+rm -f "$PKGDB/docker" "$PKGDB/docker-buildx" "$PKGDB/ufw-docker"
+: > "$PKGDB/podman" "$PKGDB/crun" "$PKGDB/podman-docker"
+: > "$UNITS/user-podman.socket"
+printf 'tester:100000:65536\n' > "$SUBUID"
+printf 'tester:100000:65536\n' > "$SUBGID"
+migrated_out="$(podman_setup --yes)"
+migrated_status=$?
+
+it "does not treat podman-docker as the docker package to remove"
+assert_contains "$migrated_out" "Docker is not installed"
+
+it "does not claim docker is still installed after a no-op drop"
+assert_not_contains "$migrated_out" "still installed"
+
+it "leaves the docker CLI shim in place on an already-migrated machine"
+assert_file "$PKGDB/podman-docker"
+
+it "an already-migrated machine completes successfully"
+assert_status 0 "$migrated_status"
 
 # --- declining the removal -------------------------------------------------
 
