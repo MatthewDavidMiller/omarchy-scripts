@@ -51,6 +51,7 @@ touching the system.
 | `bin/setup-rpi-imager` | Install Raspberry Pi Imager from Arch Extra | [docs/setup-rpi-imager.md](docs/setup-rpi-imager.md) |
 | `bin/setup-cat-background` | Set a pixel-art cat desktop and disk-unlock background | [docs/setup-cat-background.md](docs/setup-cat-background.md) |
 | `bin/setup-no-chromium-extensions` | Remove Omarchy's bundled Chromium extensions | [docs/setup-no-chromium-extensions.md](docs/setup-no-chromium-extensions.md) |
+| `bin/setup-no-aur-updates` | Stop `omarchy update` from reaching the AUR | [docs/setup-no-aur-updates.md](docs/setup-no-aur-updates.md) |
 | `bin/setup-no-claude-remote-control` | Turn off Claude Code Remote Control | [docs/setup-no-claude-remote-control.md](docs/setup-no-claude-remote-control.md) |
 | `bin/setup-no-background-network` | Stop optional polling and application telemetry | [docs/setup-no-background-network.md](docs/setup-no-background-network.md) |
 | `bin/setup-no-localsend` | Remove LocalSend and the ufw rules that expose it | [docs/setup-no-localsend.md](docs/setup-no-localsend.md) |

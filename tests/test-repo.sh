@@ -55,6 +55,8 @@ for path in \
   docs/setup-no-background-network.md tests/test-setup-no-background-network.sh \
   bin/setup-no-claude-remote-control docs/setup-no-claude-remote-control.md \
   tests/test-setup-no-claude-remote-control.sh \
+  bin/setup-no-aur-updates docs/setup-no-aur-updates.md \
+  tests/test-setup-no-aur-updates.sh \
   tests/test-export-opensnitch-rules.sh tests/test-opensnitch-rulectl.sh
 do
   it "keeps $path tracked"

@@ -1,0 +1,444 @@
+#!/usr/bin/env bash
+#
+# setup-no-aur-updates — keep `omarchy update` away from the AUR.
+#
+# order: 35
+# description: Stop omarchy update from reaching the AUR
+#
+# `omarchy update` runs omarchy-update-aur-pkgs between the post-update hook
+# and the mise step. That script opens on `pacman -Qem`, which lists exactly
+# one foreign package here: brave-browser-local, the package this repository
+# builds itself from Brave's signed first-party release. Not an AUR package,
+# but foreign, so the gate opens and omarchy-pkg-aur-accessible runs:
+#
+#   curl -sf --connect-timeout 30 --retry 3 --retry-delay 3 ... aur.archlinux.org
+#
+# OpenSnitch drops that, so it costs 30 + 3 + 30 + 3 + 30 + 3 + 30 ~= 129s to
+# fail before the update continues. Two minutes per update spent rediscovering
+# something the package-source policy already settled.
+#
+# The fix is a set of shims in /usr/local/bin, which precedes /usr/bin on the
+# default PATH and which pacman never writes to. Editing /usr/share/omarchy
+# would not survive: omarchy-update-system-pkgs runs pacman -Syu with
+# --overwrite '/usr/share/omarchy/*' on every update.
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+# Overridable so the tests can point at fixtures instead of the real system.
+SHIM_DIR="${OMARCHY_SHIM_DIR:-/usr/local/bin}"
+BIN_DIR="${OMARCHY_BIN_DIR:-/usr/bin}"
+
+# Every shim carries this line. Nothing without it is ever overwritten or
+# removed, so a file someone else put in the shim directory is reported and
+# left alone.
+MARKER='omarchy-scripts:no-aur-updates'
+
+# The upstream commands that reach the AUR, in the order they matter.
+OMARCHY_SHIMS=(
+  "omarchy-update-aur-pkgs"
+  "omarchy-pkg-aur-accessible"
+  "omarchy-pkg-aur-add"
+  "omarchy-pkg-aur-install"
+)
+
+# Helper package names. Quoted deliberately: tests/test-repo.sh greps bin/setup-*
+# for a bare helper invocation, and these are pacman removal targets, never
+# commands this script runs.
+AUR_HELPERS=("yay" "paru")
+
+WORK_DIR=""
+
+# --allow-aur-updates puts the machine back the way Omarchy ships it.
+REVERT=0
+
+usage() {
+  cat <<'USAGE'
+Usage: setup-no-aur-updates [options]
+
+Stops `omarchy update` from contacting the AUR, which on this machine can only
+time out against the OpenSnitch policy — about 129 seconds per update. Installs
+no-op shims into /usr/local/bin, which precedes /usr/bin on the default PATH,
+and removes the AUR helper package.
+
+Options:
+  -n, --dry-run             Show what would change without changing anything.
+  -y, --yes                 Do not prompt for confirmation.
+      --allow-aur-updates   Reverse: remove the shims. Does not reinstall the
+                            helper package.
+  -h, --help                Show this help.
+
+Environment (primarily for tests):
+  DRY_RUN=1                 Same as --dry-run.
+  OMARCHY_SHIM_DIR          Where shims are installed. Default: /usr/local/bin.
+  OMARCHY_BIN_DIR           Where Omarchy's own commands live. Default: /usr/bin.
+  OMARCHY_LOGIN_PATH        PATH to check precedence against, instead of asking
+                            a login shell.
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--dry-run)          DRY_RUN=1 ;;
+    -y|--yes)              ASSUME_YES=1 ;;
+    --allow-aur-updates)   REVERT=1 ;;
+    -h|--help)             usage; exit 0 ;;
+    *)                     usage >&2; die "Unknown argument: $1" ;;
+  esac
+  shift
+done
+
+require_not_root
+require_cmd mktemp omarchy pacman sudo install cmp
+
+cleanup() {
+  [[ -n "$WORK_DIR" ]] && rm -rf -- "$WORK_DIR"
+}
+trap cleanup EXIT
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/omarchy-no-aur-updates.XXXXXX")"
+
+# ---------------------------------------------------------------------------
+# Shim contents
+# ---------------------------------------------------------------------------
+# Written to stdout so the caller can compare them against what is installed
+# and skip an identical file. Each one is standalone: it must keep working
+# after this repository is deleted.
+render_shim() {
+  local name="$1"
+  printf '#!/usr/bin/env bash\n#\n# %s\n' "$MARKER"
+
+  case "$name" in
+    omarchy-update-aur-pkgs)
+      cat <<'SHIM'
+#
+# Shadows the update step of the same name. Nothing on this machine comes from
+# the AUR, so there is never anything for it to update. Upstream would spend
+# about 129 seconds on a blocked reachability probe to reach the same answer.
+#
+# Reverse with: setup-no-aur-updates --allow-aur-updates
+printf '\n\033[32mAUR updates disabled by omarchy-scripts\033[0m\n\n'
+exit 0
+SHIM
+      ;;
+    omarchy-pkg-aur-accessible)
+      cat <<'SHIM'
+#
+# Shadows the reachability probe of the same name, which curls aur.archlinux.org
+# with --connect-timeout 30 --retry 3 --retry-delay 3. That connection is denied
+# here, so the probe takes about 129 seconds to return the answer this returns
+# immediately. Reporting the AUR as unreachable is also what it is.
+exit 1
+SHIM
+      ;;
+    omarchy-pkg-aur-add|omarchy-pkg-aur-install)
+      cat <<'SHIM'
+#
+# Shadows the AUR installer of the same name. This machine takes packages from
+# the official Arch and Omarchy repositories, or from a recipe vetted in
+# omarchy-scripts, and nothing from the AUR.
+printf '%s: refusing, this machine installs nothing from the AUR.\n' "${0##*/}" >&2
+printf 'Use `omarchy pkg add NAME` for a repository package, or add a vetted\n' >&2
+printf 'recipe under packages/ in omarchy-scripts.\n' >&2
+exit 1
+SHIM
+      ;;
+    *)
+      cat <<'SHIM'
+#
+# Shadows the AUR helper of the same name, which omarchy-scripts removed.
+#
+# Read-only local queries are forwarded to pacman, because omarchy-pkg-remove —
+# the `omarchy pkg remove` picker, which has nothing to do with the AUR — runs
+# `-Qqe` and `-Qi` through this name and would otherwise stop working. Anything
+# that could install or sync is refused.
+case "${1:-}" in
+  -Q*) exec pacman "$@" ;;
+esac
+printf '%s: refusing, this machine installs nothing from the AUR.\n' "${0##*/}" >&2
+printf 'Use `omarchy pkg add NAME` for a repository package, or add a vetted\n' >&2
+printf 'recipe under packages/ in omarchy-scripts.\n' >&2
+exit 1
+SHIM
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
+ours() {
+  local path="$1"
+  [[ -f "$path" ]] && grep -qF -- "$MARKER" "$path"
+}
+
+helper_installed() {
+  pacman -Qq "$1" >/dev/null 2>&1
+}
+
+# The helper names this run should shim: the ones still installed, plus the
+# ones already carrying our shim. That second half is what keeps a second run
+# idempotent once the package itself is gone.
+helper_shims() {
+  local helper
+  for helper in "${AUR_HELPERS[@]}"; do
+    if helper_installed "$helper" || ours "$SHIM_DIR/$helper"; then
+      printf '%s\n' "$helper"
+    fi
+  done
+}
+
+shim_names() {
+  printf '%s\n' "${OMARCHY_SHIMS[@]}"
+  helper_shims
+}
+
+# ---------------------------------------------------------------------------
+# Installing
+# ---------------------------------------------------------------------------
+# Compare, back up, and install a root-owned file. Tests point SHIM_DIR at a
+# fixture and stub sudo, so no test reaches the real system.
+install_root_file() {
+  local source="$1" destination="$2" mode="${3:-0644}" backup
+  if [[ -f "$destination" ]] && cmp -s "$source" "$destination"; then
+    skip "$destination already up to date"
+    return 1
+  fi
+  if [[ "$DRY_RUN" == "1" ]]; then
+    printf '%s  dry%s would write %s\n' "$C_DIM" "$C_RESET" "$destination"
+    return 0
+  fi
+  if [[ -f "$destination" ]]; then
+    backup="$destination.bak.$(date +%Y%m%d%H%M%S)"
+    sudo cp -a -- "$destination" "$backup"
+    ok "backed up $destination to $backup"
+  fi
+  sudo install -D -m "$mode" -- "$source" "$destination"
+  ok "wrote $destination"
+}
+
+install_shims() {
+  local name destination source upstream
+
+  log "Installing AUR shims into $SHIM_DIR"
+  while IFS= read -r name; do
+    destination="$SHIM_DIR/$name"
+
+    if [[ -e "$destination" ]] && ! ours "$destination"; then
+      warn "$destination exists and is not ours — leaving it alone"
+      continue
+    fi
+
+    # Only the Omarchy commands are expected upstream; a helper's own binary is
+    # gone once this script has removed the package.
+    case "$name" in
+      omarchy-*)
+        upstream="$BIN_DIR/$name"
+        [[ -e "$upstream" ]] \
+          || warn "$upstream is gone — this shim may be stale against a newer Omarchy"
+        ;;
+    esac
+
+    source="$WORK_DIR/$name"
+    render_shim "$name" > "$source"
+    install_root_file "$source" "$destination" 0755 || true
+  done < <(shim_names)
+}
+
+remove_shims() {
+  local name destination removed=0
+
+  log "Removing AUR shims from $SHIM_DIR"
+  while IFS= read -r name; do
+    destination="$SHIM_DIR/$name"
+
+    if [[ ! -e "$destination" ]]; then
+      skip "$destination is already gone"
+      continue
+    fi
+    if ! ours "$destination"; then
+      warn "$destination is not ours — leaving it alone"
+      continue
+    fi
+
+    run sudo rm -f -- "$destination"
+    [[ "$DRY_RUN" == "1" ]] || ok "removed $destination"
+    removed=$((removed + 1))
+  done < <(printf '%s\n' "${OMARCHY_SHIMS[@]}" "${AUR_HELPERS[@]}")
+
+  [[ "$removed" -gt 0 ]] || skip "no shims to remove"
+}
+
+# ---------------------------------------------------------------------------
+# The helper package
+# ---------------------------------------------------------------------------
+remove_helper_packages() {
+  local helper
+  local -a installed=() targets=()
+
+  log "Removing the AUR helper package"
+  for helper in "${AUR_HELPERS[@]}"; do
+    if helper_installed "$helper"; then
+      installed+=("$helper")
+    else
+      skip "$helper is not installed"
+    fi
+  done
+
+  if [[ ${#installed[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  # `pacman -Rs --print` asks pacman for the full removal set without root and
+  # without changing anything, so the confirmation is informed. Note -n and
+  # --print are mutually exclusive, which is why the preview drops the -n the
+  # removal itself uses.
+  mapfile -t targets < <(pacman -Rs --print "${installed[@]}" 2>/dev/null \
+    || printf '%s\n' "${installed[@]}")
+
+  local target
+  for target in "${targets[@]}"; do
+    printf '  %s-%s %s\n' "$C_DIM" "$C_RESET" "$target"
+  done
+
+  if ! confirm "Remove ${#targets[@]} package(s)?"; then
+    skip "left ${installed[*]} installed"
+    return 0
+  fi
+
+  # `omarchy pkg drop` is pacman -Rns --noconfirm over whatever subset is
+  # actually installed, which is exactly what this needs.
+  run omarchy pkg drop "${installed[@]}"
+
+  [[ "$DRY_RUN" == "1" ]] && return 0
+  local pkg
+  for pkg in "${installed[@]}"; do
+    if helper_installed "$pkg"; then
+      die "$pkg is still installed"
+    fi
+  done
+  ok "removed ${installed[*]}"
+}
+
+# ---------------------------------------------------------------------------
+# PATH precedence
+# ---------------------------------------------------------------------------
+# A shim only works if its directory is searched before Omarchy's. Report on
+# the PATH a *new* login shell gets, not this one: on a packaged install
+# /usr/share/omarchy/bin is not on PATH at all, but a session started before an
+# upgrade can still carry a stale copy of it ahead of /usr/local/bin.
+path_rank() {
+  local dir="$1" path="$2" position=0 entry
+  while IFS= read -r entry; do
+    position=$((position + 1))
+    if [[ "$entry" == "$dir" ]]; then
+      printf '%s' "$position"
+      return 0
+    fi
+  done < <(printf '%s' "$path" | tr ':' '\n')
+  printf '0'
+}
+
+login_path() {
+  if [[ -n "${OMARCHY_LOGIN_PATH:-}" ]]; then
+    printf '%s' "$OMARCHY_LOGIN_PATH"
+    return 0
+  fi
+  bash -lc 'printf "%s" "$PATH"' 2>/dev/null || printf '%s' "$PATH"
+}
+
+report_path_precedence() {
+  local path shim_rank bin_rank stale_rank
+
+  path="$(login_path)"
+  shim_rank="$(path_rank "$SHIM_DIR" "$path")"
+  bin_rank="$(path_rank "$BIN_DIR" "$path")"
+
+  if [[ "$shim_rank" == "0" ]]; then
+    warn "$SHIM_DIR is not on a login shell's PATH — the shims will not be found"
+  elif [[ "$bin_rank" != "0" ]] && [[ "$shim_rank" -gt "$bin_rank" ]]; then
+    warn "$BIN_DIR precedes $SHIM_DIR on a login shell's PATH — the shims will not win"
+  else
+    ok "$SHIM_DIR precedes $BIN_DIR on a login shell's PATH"
+  fi
+
+  # This shell only. Harmless, but it explains a shim that looks inert until
+  # the next login.
+  stale_rank="$(path_rank /usr/share/omarchy/bin "$PATH")"
+  if [[ "$stale_rank" != "0" ]]; then
+    shim_rank="$(path_rank "$SHIM_DIR" "$PATH")"
+    if [[ "$shim_rank" == "0" ]] || [[ "$stale_rank" -lt "$shim_rank" ]]; then
+      warn "this shell has a stale /usr/share/omarchy/bin ahead of $SHIM_DIR — the shims apply to new sessions"
+    fi
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
+shim_state() {
+  local path="$1"
+  if [[ ! -e "$path" ]]; then
+    printf 'no shim'
+  elif ours "$path"; then
+    printf 'shim installed'
+  else
+    printf 'not ours — left alone'
+  fi
+}
+
+summary() {
+  local name helper
+
+  log "Done"
+  if [[ "$REVERT" == "1" ]]; then
+    cat <<EOF
+
+The shims are gone, so \`omarchy update\` reaches the AUR on Omarchy's own
+terms again — including the reachability probe that takes about 129 seconds to
+fail while the AUR is blocked.
+
+The helper package is not reinstalled. If you want it back:
+  omarchy pkg add ${AUR_HELPERS[0]}
+EOF
+  else
+    cat <<EOF
+
+\`omarchy update\` now skips the AUR step without a network request, saving
+about two minutes per update. Nothing under /usr/share/omarchy was touched, so
+an Omarchy upgrade cannot undo this.
+
+Reverse it with:
+  ./bin/setup-no-aur-updates --allow-aur-updates
+EOF
+  fi
+
+  printf '\n'
+  log "Current state"
+  printf '  shim directory: %s\n' "$SHIM_DIR"
+  for name in "${OMARCHY_SHIMS[@]}"; do
+    printf '  %-27s %s\n' "$name" "$(shim_state "$SHIM_DIR/$name")"
+  done
+  for helper in "${AUR_HELPERS[@]}"; do
+    if helper_installed "$helper"; then
+      printf '  %-27s %s\n' "$helper" "$(shim_state "$SHIM_DIR/$helper"), package still installed"
+    else
+      printf '  %-27s %s\n' "$helper" "$(shim_state "$SHIM_DIR/$helper"), package not installed"
+    fi
+  done
+}
+
+main() {
+  if [[ "$REVERT" == "1" ]]; then
+    remove_shims
+  else
+    install_shims
+    remove_helper_packages
+    report_path_precedence
+  fi
+  summary
+}
+
+main "$@"
