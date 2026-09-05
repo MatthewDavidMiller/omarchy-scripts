@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+#
+# setup-no-claude-remote-control — keep Claude Code sessions local to this box.
+#
+# order: 70
+# description: Turn off Claude Code Remote Control
+#
+# Remote Control bridges a local Claude Code session to claude.ai/code so it
+# can be driven from a phone or another machine. That is a standing outbound
+# connection and a remote path into a shell on this box, which is not something
+# to leave on by default. The `disableRemoteControl` setting in
+# ~/.claude/settings.json closes every entry point at once — claude.ai/code,
+# `claude remote-control`, `--remote-control`/`--rc`, the auto-start at session
+# launch, and the in-session toggle.
+#
+# The narrower `remoteControlAtStartup: false` only stops the auto-start and
+# leaves the feature one keystroke away, so this uses the hard switch and
+# --allow-remote-control to take it back.
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+# Overridable so the tests can point at a fixture instead of the real ~/.claude.
+SETTINGS="${CLAUDE_SETTINGS_FILE:-$HOME/.claude/settings.json}"
+KEY=disableRemoteControl
+WORK_DIR=""
+
+# --allow-remote-control puts the setting back the way Claude Code ships it.
+REVERT=0
+
+usage() {
+  cat <<'USAGE'
+Usage: setup-no-claude-remote-control [options]
+
+Sets "disableRemoteControl": true in the Claude Code user settings, which turns
+off Remote Control everywhere: claude.ai/code, `claude remote-control`, the
+--remote-control/--rc flags, auto-start, and the in-session toggle.
+
+Options:
+  -n, --dry-run               Show what would change without changing anything.
+  -y, --yes                   Do not prompt for confirmation.
+      --allow-remote-control  Reverse: drop the setting and allow Remote
+                              Control again.
+  -h, --help                  Show this help.
+
+Environment:
+  DRY_RUN=1                   Same as --dry-run.
+  CLAUDE_SETTINGS_FILE        Claude Code user settings JSON path.
+                              Default: ~/.claude/settings.json.
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--dry-run)             DRY_RUN=1 ;;
+    -y|--yes)                 ASSUME_YES=1 ;;
+    --allow-remote-control)   REVERT=1 ;;
+    -h|--help)                usage; exit 0 ;;
+    *)                        usage >&2; die "Unknown argument: $1" ;;
+  esac
+  shift
+done
+
+require_not_root
+require_cmd mktemp python
+
+cleanup() {
+  [[ -n "$WORK_DIR" ]] && rm -rf -- "$WORK_DIR"
+}
+trap cleanup EXIT
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/omarchy-claude-remote-control.XXXXXX")"
+
+# ---------------------------------------------------------------------------
+# Reading the current setting
+# ---------------------------------------------------------------------------
+# Prints `absent` when the key is not set, otherwise the JSON value, so a key
+# someone set to false is distinguishable from one that was never written.
+# Exits non-zero on a file this script must not overwrite blindly.
+current_value() {
+  [[ -f "$SETTINGS" ]] || { printf 'absent'; return 0; }
+  python - "$SETTINGS" "$KEY" <<'PY'
+import json
+import sys
+
+path, key = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as handle:
+        settings = json.load(handle)
+except ValueError as error:
+    sys.exit(f"{path} is not valid JSON: {error}")
+if not isinstance(settings, dict):
+    sys.exit(f"{path} does not hold a JSON object")
+
+value = settings.get(key, "absent")
+print(value if value == "absent" else json.dumps(value))
+PY
+}
+
+# Merges the key into whatever is already there, preserving every other setting
+# and the order they are written in — the file is hand-edited, so a rewrite
+# that reshuffles it would read as noise in the backup diff.
+render_settings() {
+  local output="$1" action="$2" input="$SETTINGS"
+  [[ -f "$input" ]] || input=/dev/null
+  python - "$input" "$output" "$KEY" "$action" <<'PY'
+import json
+import sys
+
+source, destination, key, action = sys.argv[1:]
+if source == "/dev/null":
+    settings = {}
+else:
+    with open(source, encoding="utf-8") as handle:
+        settings = json.load(handle)
+
+if action == "disable":
+    settings[key] = True
+else:
+    settings.pop(key, None)
+
+with open(destination, "w", encoding="utf-8") as handle:
+    json.dump(settings, handle, indent=2)
+    handle.write("\n")
+PY
+}
+
+configure_remote_control() {
+  local value rendered="$WORK_DIR/settings.json"
+  value="$(current_value)" || die "Fix or move $SETTINGS, then re-run."
+
+  if [[ "$REVERT" == "1" ]]; then
+    log "Allowing Claude Code Remote Control again"
+    if [[ "$value" == "absent" ]]; then
+      skip "$KEY already unset — Claude Code's own default applies"
+      return 0
+    fi
+    render_settings "$rendered" allow
+    write_file "$SETTINGS" < "$rendered"
+    return 0
+  fi
+
+  log "Disabling Claude Code Remote Control"
+  if [[ "$value" == "true" ]]; then
+    skip "Remote Control already disabled"
+    return 0
+  fi
+  render_settings "$rendered" disable
+  write_file "$SETTINGS" < "$rendered"
+}
+
+summary() {
+  log "Done"
+  if [[ "$REVERT" == "1" ]]; then
+    cat <<EOF
+
+The $KEY setting is gone, so Remote Control is available
+again on Claude Code's own terms. It is still off until you start it — with
+\`claude remote-control\`, the --rc flag, or the in-session toggle — unless
+"remoteControlAtStartup": true is also set.
+EOF
+  else
+    cat <<EOF
+
+New Claude Code sessions start with Remote Control off and no way to turn it
+on; a session already running keeps whatever it started with, so restart it.
+Nothing else in the settings file changed, and the previous version is beside
+it as a .bak.<timestamp> copy.
+
+Reverse it with:
+  ./bin/setup-no-claude-remote-control --allow-remote-control
+EOF
+  fi
+
+  local value state
+  value="$(current_value)" || return 0
+  case "$value" in
+    true)   state="disabled ($KEY: true)" ;;
+    absent) state="allowed (no $KEY setting)" ;;
+    *)      state="allowed ($KEY: $value)" ;;
+  esac
+
+  printf '\n'
+  log "Current state"
+  printf '  settings:       %s\n' "$SETTINGS"
+  printf '  remote control: %s\n' "$state"
+}
+
+main() {
+  configure_remote_control
+  summary
+}
+
+main "$@"

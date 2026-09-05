@@ -53,6 +53,8 @@ for path in \
   docs/setup-security-hardening.md tests/test-setup-security-hardening.sh \
   docs/setup-opensnitch.md tests/test-setup-opensnitch.sh \
   docs/setup-no-background-network.md tests/test-setup-no-background-network.sh \
+  bin/setup-no-claude-remote-control docs/setup-no-claude-remote-control.md \
+  tests/test-setup-no-claude-remote-control.sh \
   tests/test-export-opensnitch-rules.sh tests/test-opensnitch-rulectl.sh
 do
   it "keeps $path tracked"
