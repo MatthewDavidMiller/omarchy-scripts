@@ -40,6 +40,8 @@ esac'
 # makes the script refuse to write a session environment, and this stub catches
 # anything that still tries.
 stub_bin "$STUBS" systemctl 'exit 0'
+# Nothing in the script writes a session environment any more; the stub is here
+# so a regression that reintroduces one is caught rather than run for real.
 
 export PATH="$STUBS:$PATH"
 
@@ -72,7 +74,6 @@ run_setup() {
   OMARCHY_BIN_DIR="$dir/bin" \
   OMARCHY_LOGIN_PATH="${OMARCHY_LOGIN_PATH-$dir/shims:$dir/bin}" \
   OMARCHY_MANAGER_PATH="${OMARCHY_MANAGER_PATH-}" \
-  OMARCHY_DEV_CONF="$dir/omarchy.conf" \
     bash "$SCRIPT" -y "$@" 2>&1
 }
 
@@ -351,14 +352,14 @@ assert_contains "$out" "systemd user manager PATH reaches"
 it "exits non-zero when only the manager PATH shadows a shim"
 assert_status 1 "$status"
 
-it "never writes the real session environment from a test"
+it "never writes a session environment, even when a shim is shadowed"
 : > "$STUBS/systemctl.log"
 CASE="$(fixture)"
 out="$(OMARCHY_MANAGER_PATH="$CASE/bin:$CASE/shims" run_setup "$CASE")"
 assert_eq "" "$(cat "$STUBS/systemctl.log")" "systemctl invocations"
 
-it "says why it left the session environment alone"
-assert_contains "$out" "not touching the real session environment"
+it "names the cause a shadowed shim usually has"
+assert_contains "$out" "envs.lua"
 
 it "an empty manager PATH skips that check rather than failing"
 CASE="$(fixture)"

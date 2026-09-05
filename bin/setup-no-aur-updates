@@ -87,9 +87,6 @@ Environment (primarily for tests):
                             a login shell.
   OMARCHY_MANAGER_PATH      PATH to check precedence against, instead of asking
                             the systemd user manager; empty skips that check.
-                            Setting it also stops this script from writing the
-                            real session environment.
-  OMARCHY_DEV_CONF          The dev-link marker. Default: /etc/omarchy.conf.
 USAGE
 }
 
@@ -352,27 +349,29 @@ remove_helper_packages() {
 # ---------------------------------------------------------------------------
 # PATH precedence
 # ---------------------------------------------------------------------------
-# A shim only helps if the name resolves to it. The first version of this
-# compared SHIM_DIR against BIN_DIR and reported success on a machine where
-# every omarchy-* shim was inert: /usr/share/omarchy/bin is a farm of symlinks
-# pointing back into /usr/bin, so a PATH carrying it ahead of SHIM_DIR reaches
-# the upstream command without BIN_DIR ever appearing earlier. The helper shim
-# was the one that did run, because that directory has no counterpart to it.
+# A shim only helps if the name resolves to it, and SHIM_DIR preceding BIN_DIR
+# does not settle that. In an Omarchy Hyprland session it is normally false:
+#
+#   /usr/share/omarchy/default/hypr/envs.lua
+#     table.insert(kept, 1, bin_dir)      -- bin_dir = $OMARCHY_PATH/bin
+#     hl.env("PATH", table.concat(kept, ":"))
+#
+# That prepend is unconditional, and hl.env is Hyprland's `env =`, which applies
+# to what Hyprland spawns rather than to Hyprland itself — so every terminal
+# gets $OMARCHY_PATH/bin first. It is a farm of symlinks into /usr/bin, so the
+# upstream command is reached without BIN_DIR appearing earlier at all, and a
+# check phrased in terms of SHIM_DIR and BIN_DIR cannot see it. Only the helper
+# shim ran, because that directory has no counterpart to shadow it.
+#
+# It is applied fresh on every boot, so there is nothing here to repair: the fix
+# belongs in the user's own Hyprland config, which loads after Omarchy's
+# defaults. docs/setup-no-aur-updates.md carries the block.
 #
 # So walk the PATH per shim name, the way the shell does, and report whatever
 # gets there first. That catches any shadowing directory, not one named here.
 
-# Where the dev-link marker lives. Overridable so the tests can point at a
-# fixture instead of the real /etc.
-OMARCHY_DEV_CONF="${OMARCHY_DEV_CONF:-/etc/omarchy.conf}"
-
-# Set when a shim loses on a PATH that matters, which makes the run fail. The
-# two are tracked apart because they have different fixes: the manager PATH is
-# what a fresh session starts from and can be repaired here, while a login
-# shell's is this session's own and only a new session replaces it.
+# Set when a shim loses on a PATH that matters, which makes the run fail.
 PRECEDENCE_FAILED=0
-MANAGER_CHECKED=0
-MANAGER_FAILED=0
 
 # The trailing newline matters: without it `read` never returns the last entry,
 # so the final PATH directory is invisible to every check below.
@@ -384,16 +383,6 @@ path_has() {
     [[ "$entry" == "$dir" ]] && return 0
   done < <(split_path "$2")
   return 1
-}
-
-# path_without <dir> <path> — <path> with every occurrence of <dir> dropped.
-path_without() {
-  local dir="$1" entry out=""
-  while IFS= read -r entry; do
-    [[ "$entry" == "$dir" ]] && continue
-    out+="${out:+:}$entry"
-  done < <(split_path "$2")
-  printf '%s' "$out"
 }
 
 # shim_shadow <name> <path> — prints what <path> reaches before our shim and
@@ -458,70 +447,23 @@ manager_path() {
   systemctl --user show-environment 2>/dev/null | sed -n 's/^PATH=//p' | head -n 1
 }
 
-# The packaged Omarchy bin directory, when having it on PATH is stale state
-# rather than something in use. env-bootstrap prepends it only under
-# `omarchy dev link`; on a production install it says the directory "would just
-# be noise" and leaves it off. But env-bootstrap only ever adds, so a copy
-# inherited from a dev link that has since been undone — or from an older
-# bootstrap that prepended unconditionally — is never taken back out.
-stale_omarchy_bin() {
-  local base="${OMARCHY_PATH:-/usr/share/omarchy}"
-  [[ -f "$OMARCHY_DEV_CONF" ]] && return 1
-  printf '%s/bin' "${base%/}"
-}
-
-# Drop the stale entry from the systemd user manager, so processes it starts
-# from here on resolve the shims. Shells that are already running keep the PATH
-# they were given; only a fresh session clears those.
-repair_manager_path() {
-  local stale="$1" path cleaned
-
-  # Only ever repair a PATH actually read from systemd. When OMARCHY_MANAGER_PATH
-  # supplies one, this is a test or a what-if and the real session environment is
-  # not ours to write. Without this a suite that forgets to stub systemctl edits
-  # the PATH of the session running it, which is how this guard got written.
-  if [[ -n "${OMARCHY_MANAGER_PATH+x}" ]]; then
-    skip "OMARCHY_MANAGER_PATH is set — not touching the real session environment"
-    return 1
-  fi
-
-  path="$(manager_path)"
-  [[ -n "$path" ]] || return 1
-  path_has "$stale" "$path" || return 1
-
-  cleaned="$(path_without "$stale" "$path")"
-  log "Repairing the session PATH"
-  printf '  %s-%s dropping %s, which env-bootstrap only adds under a dev link\n' \
-    "$C_DIM" "$C_RESET" "$stale"
-
-  if ! confirm "Drop it from the systemd user environment?"; then
-    skip "left $stale on the session PATH"
-    return 1
-  fi
-
-  run systemctl --user set-environment "PATH=$cleaned"
-  [[ "$DRY_RUN" == "1" ]] || ok "dropped $stale from the systemd user environment"
-}
-
 report_path_precedence() {
-  local stale manager
+  local manager
 
   log "Checking PATH precedence"
   check_path login "$(login_path)" || true
 
   manager="$(manager_path)"
-  if [[ -n "$manager" ]]; then
-    MANAGER_CHECKED=1
-    check_path "systemd user manager" "$manager" || MANAGER_FAILED=1
-  fi
+  [[ -n "$manager" ]] && { check_path "systemd user manager" "$manager" || true; }
 
-  [[ "$PRECEDENCE_FAILED" == "1" ]] || return 0
+  [[ "$PRECEDENCE_FAILED" == "0" ]] || cat >&2 <<'CAUSE'
 
-  # One shadowing directory has a known, reversible cause. Anything else is
-  # this machine's own PATH and only the person who arranged it can say why.
-  if stale="$(stale_omarchy_bin)"; then
-    repair_manager_path "$stale" || true
-  fi
+  In an Omarchy Hyprland session the usual cause is default/hypr/envs.lua,
+  which prepends $OMARCHY_PATH/bin to PATH for everything Hyprland spawns.
+  It is re-applied on every boot, so it cannot be repaired from here — see
+  docs/setup-no-aur-updates.md for the ~/.config/hypr block that overrides it.
+
+CAUSE
 }
 
 # ---------------------------------------------------------------------------
@@ -558,17 +500,6 @@ EOF
 At least one shim could not be written, so \`omarchy update\` still reaches the
 AUR through whichever name is missing. The warnings above say which.
 
-EOF
-  elif [[ "$PRECEDENCE_FAILED" == "1" ]] &&
-       [[ "$MANAGER_CHECKED" == "1" ]] && [[ "$MANAGER_FAILED" == "0" ]]; then
-    cat <<EOF
-
-The shims are installed and a new session will resolve them, but this one still
-reaches what the warnings above name, so \`omarchy update\` run from a terminal
-started before now still probes aur.archlinux.org.
-
-Log out and back in, then check with:
-  command -v omarchy-update-aur-pkgs
 EOF
   elif [[ "$PRECEDENCE_FAILED" == "1" ]]; then
     cat <<EOF

@@ -95,6 +95,10 @@ The alternatives were all worse:
 - **A shim in `~/.local/bin`** cannot work. Omarchy's `env-bootstrap`
   *appends* that directory, so a login shell orders it `/usr/local/bin`,
   `/usr/bin`, `~/.local/bin` — it can never shadow `/usr/bin`.
+- **Shimming `/usr/share/omarchy/bin` itself**, which would win outright, has
+  the same problem as editing anything else under `/usr/share/omarchy`: it is
+  pacman-owned and `--overwrite '/usr/share/omarchy/*'` restores it on every
+  update. The PATH override above gets the same result without touching it.
 - **An `omarchy-hook post-update` entry** runs one line *before* the AUR step
   and cannot cancel it.
 - **Blackholing `aur.archlinux.org` in `/etc/hosts`** still leaves curl's
@@ -136,8 +140,7 @@ anything, which is a stronger statement than the name merely being absent.
 | `OMARCHY_SHIM_DIR` | Where shims go. Default `/usr/local/bin` |
 | `OMARCHY_BIN_DIR` | Where Omarchy's commands live. Default `/usr/bin` |
 | `OMARCHY_LOGIN_PATH` | PATH to check precedence against, instead of asking a login shell |
-| `OMARCHY_MANAGER_PATH` | PATH to check precedence against, instead of asking the systemd user manager. Setting it also stops the script writing the real session environment |
-| `OMARCHY_DEV_CONF` | The dev-link marker. Default `/etc/omarchy.conf` |
+| `OMARCHY_MANAGER_PATH` | PATH to check precedence against, instead of asking the systemd user manager. Empty skips that check |
 
 ## Scope
 
@@ -162,36 +165,82 @@ does not:
 ## PATH precedence
 
 A shim is only worth something if the name resolves to it, and
-`/usr/local/bin` preceding `/usr/bin` does not settle that. The first version
-of this script compared only those two directories and reported success on a
-machine where every `omarchy-*` shim was inert:
+`/usr/local/bin` preceding `/usr/bin` does not settle that. In an Omarchy
+Hyprland session it is normally false:
 
 ```
 $ command -v omarchy-update-aur-pkgs
 /usr/share/omarchy/bin/omarchy-update-aur-pkgs
 ```
 
-`/usr/share/omarchy/bin` is a farm of symlinks pointing back into `/usr/bin`.
-A PATH carrying it ahead of `/usr/local/bin` therefore reaches the upstream
-command *without `/usr/bin` appearing earlier at all*, so a check phrased in
-terms of those two directories cannot see it. Only the helper shim ran, because
+`/usr/share/omarchy/default/hypr/envs.lua` prepends `$OMARCHY_PATH/bin`
+unconditionally:
+
+```lua
+local bin_dir = paths.omarchy_path .. "/bin"
+local kept = {}
+for entry in (os.getenv("PATH") or "/usr/local/bin:/usr/bin"):gmatch("[^:]+") do
+  if entry ~= bin_dir then table.insert(kept, entry) end
+end
+table.insert(kept, 1, bin_dir)
+hl.env("PATH", table.concat(kept, ":"))
+```
+
+`hl.env` is Hyprland's `env =`, which applies to what Hyprland **spawns** rather
+than to Hyprland itself — which is why `/proc/<hyprland>/environ` looks clean
+while every terminal it opens does not. That directory is a farm of symlinks
+into `/usr/bin` (all 428 of them), so the upstream command is reached *without
+`/usr/bin` appearing earlier at all*, and a check phrased in terms of
+`/usr/local/bin` and `/usr/bin` cannot see it. Only the helper shim ran, because
 that directory has no counterpart to shadow it — which is why
 `/tmp/omarchy-update.log` showed the helper's refusal while the probe before it
 had already gone out to the network.
 
-`env-bootstrap` puts that directory on PATH only under `omarchy dev link`; on a
-production install it says the directory "would just be noise" and leaves it
-off. But it only ever *adds*, so a copy inherited from a dev link that has since
-been undone is never taken back out. Under a uwsm login the systemd user manager
-holds the session PATH and outlives a logout, so the stale entry survives
-logging out and back in.
+It is applied fresh on every boot, so there is nothing to repair at runtime.
+Note this is not dev-link leftovers: `env-bootstrap` deliberately skips the
+prepend on a production install ("would just be noise"), but `envs.lua` does it
+unguarded, and `envs.lua` is what the Hyprland session actually uses.
 
-So the script resolves each shim name the way the shell does, against two PATHs:
+### The fix
 
-| PATH | Why | If a shim loses |
-| --- | --- | --- |
-| A login shell's | What this session actually runs | Only a new session replaces it — log out and back in |
-| The systemd user manager's | What a fresh session starts from | Offers to drop a stale `${OMARCHY_PATH}/bin`, when no dev link is active |
+User Hyprland config is loaded after Omarchy's defaults, so an override there
+wins and survives package updates. Appended to `~/.config/hypr/hyprland.lua`,
+below `require("default.hypr.omarchy")`:
+
+```lua
+local omarchy_bin = (os.getenv("OMARCHY_PATH") or "/usr/share/omarchy") .. "/bin"
+local kept = {}
+for entry in (os.getenv("PATH") or "/usr/local/bin:/usr/bin"):gmatch("[^:]+") do
+  if entry ~= omarchy_bin and entry ~= "/usr/local/bin" then
+    table.insert(kept, entry)
+  end
+end
+table.insert(kept, 1, omarchy_bin)
+table.insert(kept, 1, "/usr/local/bin")
+hl.env("PATH", table.concat(kept, ":"))
+```
+
+Omarchy's bin directory stays where Omarchy put it, just behind
+`/usr/local/bin`. Because every entry in it is a symlink to the same name in
+`/usr/bin`, the only names whose resolution changes are the ones shimmed here.
+
+Apply and check with `hyprctl reload && hyprctl configerrors`, then confirm what
+a freshly spawned process actually gets — a shell you already had open keeps the
+PATH it was given:
+
+```bash
+hyprctl dispatch 'hl.dsp.exec_cmd("sh -c \'command -v omarchy-update-aur-pkgs > /tmp/p\'")'
+cat /tmp/p    # => /usr/local/bin/omarchy-update-aur-pkgs
+```
+
+### What the script checks
+
+It resolves each shim name the way the shell does, against two PATHs:
+
+| PATH | Why |
+| --- | --- |
+| A login shell's | What this session actually runs, inherited from the terminal Hyprland spawned |
+| The systemd user manager's | What user units get; Hyprland's autostart imports its own environment into it |
 
 Any shim that loses is named along with the file that beat it, the summary says
 so instead of claiming success, and **the script exits non-zero** — a shadowed
