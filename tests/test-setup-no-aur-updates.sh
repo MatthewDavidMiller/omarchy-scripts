@@ -7,7 +7,12 @@ source "$(dirname "${BASH_SOURCE[0]}")/helpers.sh"
 STUBS="$TEST_TMP/stubs"
 
 # sudo just runs the command; the stub records that sudo was used at all.
-stub_bin "$STUBS" sudo 'exec "$@"'
+# FAKE_SUDO_FAIL=1 makes it refuse, standing in for a sudo that cannot read a
+# password — the case that once printed "ok wrote" over an untouched file.
+# shellcheck disable=SC2016
+stub_bin "$STUBS" sudo '
+[[ -n "${FAKE_SUDO_FAIL:-}" ]] && exit 1
+exec "$@"'
 
 # A one-file-per-package fake database, so the script sees the truth its own
 # removal just created rather than a stub that always agrees.
@@ -30,6 +35,11 @@ case "$verb" in
   "pkg drop") for p in "$@"; do rm -f "$db/$p"; done ;;
   *) echo "unexpected: $verb $*" >&2; exit 1 ;;
 esac'
+
+# Never reaches the real user manager: run_setup sets OMARCHY_MANAGER_PATH, which
+# makes the script refuse to write a session environment, and this stub catches
+# anything that still tries.
+stub_bin "$STUBS" systemctl 'exit 0'
 
 export PATH="$STUBS:$PATH"
 
@@ -60,7 +70,9 @@ run_setup() {
   FAKE_PKG_DB="$dir/db" \
   OMARCHY_SHIM_DIR="$dir/shims" \
   OMARCHY_BIN_DIR="$dir/bin" \
-  OMARCHY_LOGIN_PATH="$dir/shims:$dir/bin" \
+  OMARCHY_LOGIN_PATH="${OMARCHY_LOGIN_PATH-$dir/shims:$dir/bin}" \
+  OMARCHY_MANAGER_PATH="${OMARCHY_MANAGER_PATH-}" \
+  OMARCHY_DEV_CONF="$dir/omarchy.conf" \
     bash "$SCRIPT" -y "$@" 2>&1
 }
 
@@ -105,7 +117,7 @@ it "skips a helper that is not installed"
 assert_contains "$out" "paru is not installed"
 
 it "reports the shim directory winning on a login PATH"
-assert_contains "$out" "precedes"
+assert_contains "$out" "wins every shim name on the login PATH"
 
 # --- the shims do what they claim ------------------------------------------
 
@@ -235,6 +247,123 @@ assert_contains "$out" "may be stale against a newer Omarchy"
 
 it "still installs the shim rather than dying on upstream drift"
 assert_file "$CASE/shims/omarchy-update-aur-pkgs"
+
+# --- a write that does not happen -------------------------------------------
+# `install_root_file` is called with `|| true` so a skip can pass through, and
+# that disables set -e for its whole body. A sudo failure therefore has to be
+# checked by hand or the run reports shims it never installed.
+
+CASE="$(fixture)"
+out="$(FAKE_SUDO_FAIL=1 run_setup "$CASE")"
+status=$?
+
+it "exits non-zero when a shim cannot be written"
+assert_status 1 "$status"
+
+it "does not report a write that failed as done"
+assert_not_contains "$out" "ok wrote"
+
+it "says the write failed"
+assert_contains "$out" "could not write"
+
+it "leaves no shim behind when the write failed"
+assert_no_file "$CASE/shims/omarchy-update-aur-pkgs"
+
+it "does not claim the AUR step is skipped when nothing was written"
+assert_not_contains "$out" "now skips the AUR step"
+
+# A failing backup must stop that shim too, rather than overwriting a file whose
+# previous contents were never saved.
+
+CASE="$(fixture)"
+run_setup "$CASE" >/dev/null
+printf '#!/bin/bash\n# %s\n# changed\n' "$MARKER" > "$CASE/shims/omarchy-update-aur-pkgs"
+out="$(FAKE_SUDO_FAIL=1 run_setup "$CASE")"
+
+it "does not report a backup that failed as done"
+assert_not_contains "$out" "ok backed up"
+
+it "leaves the file alone when its backup could not be taken"
+assert_file_contains "$CASE/shims/omarchy-update-aur-pkgs" "# changed"
+
+# --- a PATH that shadows the shims ------------------------------------------
+# The failure this section exists to catch: /usr/share/omarchy/bin is a farm of
+# symlinks into /usr/bin, so a PATH carrying it ahead of the shim directory
+# reaches the upstream command while the shim directory still precedes the bin
+# directory. The old check compared only those two and passed.
+
+CASE="$(fixture)"
+mkdir -p "$CASE/farm"
+for name in "${SHIMS[@]}"; do
+  ln -sf "$CASE/bin/$name" "$CASE/farm/$name"
+done
+out="$(OMARCHY_LOGIN_PATH="$CASE/farm:$CASE/shims:$CASE/bin" run_setup "$CASE")"
+status=$?
+
+it "names the file that shadows a shim on the login PATH"
+assert_contains "$out" "$CASE/farm/omarchy-update-aur-pkgs before $CASE/shims/omarchy-update-aur-pkgs"
+
+it "does not claim success when a shim is shadowed"
+assert_not_contains "$out" "now skips the AUR step"
+
+it "exits non-zero when a shim is shadowed"
+assert_status 1 "$status"
+
+it "still installs the shims, so fixing PATH is all that is left"
+assert_file_contains "$CASE/shims/omarchy-update-aur-pkgs" "$MARKER"
+
+# A directory that shadows only the helper name is still a shadowed shim: that
+# is the half of this machine's PATH that did work, and it must not mask the
+# half that did not.
+
+CASE="$(fixture)"
+out="$(OMARCHY_LOGIN_PATH="$CASE/bin:$CASE/shims" run_setup "$CASE")"
+
+it "reports every shadowed name, not just the first"
+shadowed="$(grep -c "before $CASE/shims/" <<< "$out")"
+assert_eq "4" "$shadowed" "shadowed shim warnings"
+
+# --- a PATH without the shim directory at all -------------------------------
+
+CASE="$(fixture)"
+out="$(OMARCHY_LOGIN_PATH="$CASE/bin" run_setup "$CASE")"
+status=$?
+
+it "reports a login PATH that cannot reach the shim directory"
+assert_contains "$out" "is not on the login PATH"
+
+it "exits non-zero when the shim directory is not on PATH"
+assert_status 1 "$status"
+
+# --- the systemd user manager's PATH is checked too -------------------------
+# It holds the session PATH under a uwsm login and outlives a logout, so a
+# stale entry there is not cleared by opening a new shell.
+
+CASE="$(fixture)"
+mkdir -p "$CASE/farm"
+ln -sf "$CASE/bin/omarchy-pkg-aur-accessible" "$CASE/farm/omarchy-pkg-aur-accessible"
+out="$(OMARCHY_MANAGER_PATH="$CASE/farm:$CASE/shims:$CASE/bin" run_setup "$CASE")"
+status=$?
+
+it "checks the systemd user manager PATH as well as a login shell's"
+assert_contains "$out" "systemd user manager PATH reaches"
+
+it "exits non-zero when only the manager PATH shadows a shim"
+assert_status 1 "$status"
+
+it "never writes the real session environment from a test"
+: > "$STUBS/systemctl.log"
+CASE="$(fixture)"
+out="$(OMARCHY_MANAGER_PATH="$CASE/bin:$CASE/shims" run_setup "$CASE")"
+assert_eq "" "$(cat "$STUBS/systemctl.log")" "systemctl invocations"
+
+it "says why it left the session environment alone"
+assert_contains "$out" "not touching the real session environment"
+
+it "an empty manager PATH skips that check rather than failing"
+CASE="$(fixture)"
+out="$(run_setup "$CASE")"
+assert_not_contains "$out" "systemd user manager PATH"
 
 # --- the repository's own package-source policy ----------------------------
 

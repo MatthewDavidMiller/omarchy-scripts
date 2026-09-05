@@ -1,7 +1,7 @@
 # setup-no-aur-updates
 
-Stops `omarchy update` from reaching the AUR, which on this machine can only
-time out, and removes the AUR helper package.
+Stops `omarchy update` from reaching the AUR, which this machine takes no
+packages from, and removes the AUR helper package.
 
 ```bash
 ./bin/setup-no-aur-updates            # install the shims, remove the helper
@@ -38,18 +38,21 @@ curl -sf --connect-timeout 30 --retry 3 --retry-delay 3 -A "omarchy-update" \
   "https://aur.archlinux.org/rpc/?v=5&type=info&arg=base" >/dev/null
 ```
 
-[OpenSnitch](setup-opensnitch.md) is deny-by-default, so that connection is
-dropped rather than refused, and curl waits out the full budget:
+What that costs depends on the [OpenSnitch](setup-opensnitch.md) verdict of the
+moment, and neither outcome is wanted:
 
-```
-30s connect + 3s + 30s + 3s + 30s + 3s + 30s  ≈  129 seconds
-```
+- **Dropped.** OpenSnitch is deny-by-default and drops rather than refuses, so
+  curl waits out its whole retry budget — `30s connect + 3s + 30s + 3s + 30s +
+  3s + 30s ≈ 129 seconds` — before the update prints "AUR is unavailable (so
+  skipping updates)" and carries on. The correct outcome, reached the slowest
+  possible way, once per update.
+- **Allowed.** A process-wide `allow /usr/bin/curl` answered at some prompt
+  outranks the narrower rules, the probe succeeds, and the update goes on to
+  run an AUR helper this machine deliberately does not have.
 
-Every `omarchy update` therefore spends about two minutes rediscovering
-something the [package-source policy](conventions.md#package-sources) settled
-long ago: nothing on this machine comes from the AUR. The update then prints
-"AUR is unavailable (so skipping updates)" and carries on, which is the correct
-outcome reached the slowest possible way.
+Either way it is a question the
+[package-source policy](conventions.md#package-sources) settled long ago:
+nothing on this machine comes from the AUR.
 
 ## What it does
 
@@ -78,6 +81,10 @@ a **login** shell's PATH, and reports what it found.
 PATH, and `/usr/local/bin` precedes `/usr/bin` on the default Arch PATH.
 Pacman never writes to `/usr/local`, so nothing here is at risk from a package
 upgrade.
+
+Preceding `/usr/bin` is not the same as winning, though — see
+[PATH precedence](#path-precedence) below, which is the check that turns a shim
+into a shim that actually runs.
 
 The alternatives were all worse:
 
@@ -129,6 +136,8 @@ anything, which is a stronger statement than the name merely being absent.
 | `OMARCHY_SHIM_DIR` | Where shims go. Default `/usr/local/bin` |
 | `OMARCHY_BIN_DIR` | Where Omarchy's commands live. Default `/usr/bin` |
 | `OMARCHY_LOGIN_PATH` | PATH to check precedence against, instead of asking a login shell |
+| `OMARCHY_MANAGER_PATH` | PATH to check precedence against, instead of asking the systemd user manager. Setting it also stops the script writing the real session environment |
+| `OMARCHY_DEV_CONF` | The dev-link marker. Default `/etc/omarchy.conf` |
 
 ## Scope
 
@@ -138,22 +147,66 @@ does not:
 - **Change any Omarchy file.** Everything lives in `/usr/local/bin`, so an
   Omarchy upgrade cannot undo it and `pacman -Qkk` stays clean.
 - **Touch the OpenSnitch rules.** The machine-local `191-deny-aur-helpers` rule
-  is the network-layer statement of the same policy and stays as it is; this is
-  the same policy stated where the update tool reads it, so the block is never
-  reached rather than being reached slowly.
+  stays as it is. Note it is not a second line of defence for this: it matches
+  `process.path` `^/usr/bin/(yay|paru)$`, so it never sees the probe, which is
+  `curl`. Nothing at the network layer denies `curl` reaching
+  `aur.archlinux.org`, and a process-wide `allow /usr/bin/curl` answered at a
+  prompt would outrank `191` anyway, since curated denies are deliberately
+  `precedence: false`. PATH is the only thing stopping the probe, which is why
+  the precedence check above is not optional.
 - **Affect `pacman` or `omarchy pkg add`.** Repository packages install exactly
   as before.
 - **Cover other machines or other users.** `/usr/local/bin` is machine-wide but
   each machine gets its own run.
 
-A session started **before** the shims were installed keeps its old PATH. On a
-packaged install `/usr/share/omarchy/bin` is not on PATH at all, but a shell
-that predates an upgrade can still carry a stale copy of it ahead of
-`/usr/local/bin`; the script warns when it sees that. New sessions are fine.
+## PATH precedence
+
+A shim is only worth something if the name resolves to it, and
+`/usr/local/bin` preceding `/usr/bin` does not settle that. The first version
+of this script compared only those two directories and reported success on a
+machine where every `omarchy-*` shim was inert:
+
+```
+$ command -v omarchy-update-aur-pkgs
+/usr/share/omarchy/bin/omarchy-update-aur-pkgs
+```
+
+`/usr/share/omarchy/bin` is a farm of symlinks pointing back into `/usr/bin`.
+A PATH carrying it ahead of `/usr/local/bin` therefore reaches the upstream
+command *without `/usr/bin` appearing earlier at all*, so a check phrased in
+terms of those two directories cannot see it. Only the helper shim ran, because
+that directory has no counterpart to shadow it — which is why
+`/tmp/omarchy-update.log` showed the helper's refusal while the probe before it
+had already gone out to the network.
+
+`env-bootstrap` puts that directory on PATH only under `omarchy dev link`; on a
+production install it says the directory "would just be noise" and leaves it
+off. But it only ever *adds*, so a copy inherited from a dev link that has since
+been undone is never taken back out. Under a uwsm login the systemd user manager
+holds the session PATH and outlives a logout, so the stale entry survives
+logging out and back in.
+
+So the script resolves each shim name the way the shell does, against two PATHs:
+
+| PATH | Why | If a shim loses |
+| --- | --- | --- |
+| A login shell's | What this session actually runs | Only a new session replaces it — log out and back in |
+| The systemd user manager's | What a fresh session starts from | Offers to drop a stale `${OMARCHY_PATH}/bin`, when no dev link is active |
+
+Any shim that loses is named along with the file that beat it, the summary says
+so instead of claiming success, and **the script exits non-zero** — a shadowed
+shim leaves the next update reaching the AUR, which is a failure and not a
+warning. `setup-all` reports it as one.
+
+A failed write is treated the same way. `install_root_file` is called with
+`|| true` so a skip can pass through, and that suppresses `set -e` for its whole
+body, so every `sudo` in it is checked by hand; without that a `sudo` that could
+not read a password printed `ok wrote` over a file it never touched.
 
 ## Verifying
 
-In a new shell, so the PATH is not a stale one:
+In a new shell, so the PATH is not a stale one. The first line is the one that
+matters — a shim that is not what the name resolves to changes nothing:
 
 ```bash
 command -v omarchy-update-aur-pkgs   # => /usr/local/bin/omarchy-update-aur-pkgs
@@ -168,10 +221,17 @@ time omarchy update
 grep -i aur /tmp/omarchy-update.log
 ```
 
-The AUR line should be the shim's own, with no probe and no helper run, and the
-update should be about two minutes shorter. The OpenSnitch event list should
-show no denied `curl` connection to `aur.archlinux.org` for that run, where
-previously there was one per update.
+The AUR line should be the shim's own — `AUR updates disabled by
+omarchy-scripts` — with no probe and no helper run. Two lines that mean it did
+**not** work, both seen on this machine:
+
+- `AUR is unavailable (so skipping updates)` — upstream's probe ran and was
+  blocked. The shim was shadowed.
+- `Update AUR packages` followed by the helper shim's refusal — upstream's probe
+  ran and *succeeded*. The shim was shadowed and the curl was allowed.
+
+The OpenSnitch event list should show no `curl` connection to
+`aur.archlinux.org` for that run at all, allowed or denied.
 
 ## Undo
 

@@ -13,14 +13,19 @@
 #
 #   curl -sf --connect-timeout 30 --retry 3 --retry-delay 3 ... aur.archlinux.org
 #
-# OpenSnitch drops that, so it costs 30 + 3 + 30 + 3 + 30 + 3 + 30 ~= 129s to
-# fail before the update continues. Two minutes per update spent rediscovering
-# something the package-source policy already settled.
+# What that probe costs depends on the OpenSnitch verdict of the moment. A drop
+# costs 30 + 3 + 30 + 3 + 30 + 3 + 30 ~= 129s of retry budget before the update
+# continues; a process-wide `allow curl` answered at some prompt lets it
+# through and the AUR step runs for real. Either way it is a question the
+# package-source policy already settled.
 #
-# The fix is a set of shims in /usr/local/bin, which precedes /usr/bin on the
-# default PATH and which pacman never writes to. Editing /usr/share/omarchy
-# would not survive: omarchy-update-system-pkgs runs pacman -Syu with
-# --overwrite '/usr/share/omarchy/*' on every update.
+# The fix is a set of shims in /usr/local/bin, a directory pacman never writes
+# to. Editing /usr/share/omarchy would not survive: omarchy-update-system-pkgs
+# runs pacman -Syu with --overwrite '/usr/share/omarchy/*' on every update.
+#
+# A shim is only worth anything if the name resolves to it, and /usr/local/bin
+# preceding /usr/bin is not enough to guarantee that — see the PATH precedence
+# section below. This checks, and fails when it does not hold.
 #
 set -euo pipefail
 
@@ -52,6 +57,10 @@ AUR_HELPERS=("yay" "paru")
 
 WORK_DIR=""
 
+# Set when a shim could not be written. A run that installed nothing must not
+# report success, whatever the reason sudo gave.
+WRITE_FAILED=0
+
 # --allow-aur-updates puts the machine back the way Omarchy ships it.
 REVERT=0
 
@@ -59,10 +68,9 @@ usage() {
   cat <<'USAGE'
 Usage: setup-no-aur-updates [options]
 
-Stops `omarchy update` from contacting the AUR, which on this machine can only
-time out against the OpenSnitch policy — about 129 seconds per update. Installs
-no-op shims into /usr/local/bin, which precedes /usr/bin on the default PATH,
-and removes the AUR helper package.
+Stops `omarchy update` from contacting the AUR, which this machine takes no
+packages from. Installs no-op shims into /usr/local/bin, removes the AUR helper
+package, and checks that the shimmed names actually resolve to the shims.
 
 Options:
   -n, --dry-run             Show what would change without changing anything.
@@ -77,6 +85,11 @@ Environment (primarily for tests):
   OMARCHY_BIN_DIR           Where Omarchy's own commands live. Default: /usr/bin.
   OMARCHY_LOGIN_PATH        PATH to check precedence against, instead of asking
                             a login shell.
+  OMARCHY_MANAGER_PATH      PATH to check precedence against, instead of asking
+                            the systemd user manager; empty skips that check.
+                            Setting it also stops this script from writing the
+                            real session environment.
+  OMARCHY_DEV_CONF          The dev-link marker. Default: /etc/omarchy.conf.
 USAGE
 }
 
@@ -115,8 +128,8 @@ render_shim() {
       cat <<'SHIM'
 #
 # Shadows the update step of the same name. Nothing on this machine comes from
-# the AUR, so there is never anything for it to update. Upstream would spend
-# about 129 seconds on a blocked reachability probe to reach the same answer.
+# the AUR, so there is never anything for it to update. Upstream reaches the
+# same answer only after a reachability probe over the network.
 #
 # Reverse with: setup-no-aur-updates --allow-aur-updates
 printf '\n\033[32mAUR updates disabled by omarchy-scripts\033[0m\n\n'
@@ -127,9 +140,11 @@ SHIM
       cat <<'SHIM'
 #
 # Shadows the reachability probe of the same name, which curls aur.archlinux.org
-# with --connect-timeout 30 --retry 3 --retry-delay 3. That connection is denied
-# here, so the probe takes about 129 seconds to return the answer this returns
-# immediately. Reporting the AUR as unreachable is also what it is.
+# with --connect-timeout 30 --retry 3 --retry-delay 3. Blocked, that probe burns
+# about 129 seconds of retry budget; allowed, it reports the AUR as up and the
+# update goes on to run a helper this machine does not have. Neither is wanted,
+# and unreachable is the honest answer for a machine that takes nothing from
+# there.
 exit 1
 SHIM
       ;;
@@ -210,12 +225,24 @@ install_root_file() {
     printf '%s  dry%s would write %s\n' "$C_DIM" "$C_RESET" "$destination"
     return 0
   fi
+  # Checked rather than left to set -e: the caller ends in `|| true` to let a
+  # skip through, and that suppresses set -e for this whole body. Without these
+  # tests a sudo that could not read a password printed "ok wrote" over a file
+  # it never touched.
   if [[ -f "$destination" ]]; then
     backup="$destination.bak.$(date +%Y%m%d%H%M%S)"
-    sudo cp -a -- "$destination" "$backup"
+    if ! sudo cp -a -- "$destination" "$backup"; then
+      warn "could not back up $destination — leaving it as it is"
+      WRITE_FAILED=1
+      return 1
+    fi
     ok "backed up $destination to $backup"
   fi
-  sudo install -D -m "$mode" -- "$source" "$destination"
+  if ! sudo install -D -m "$mode" -- "$source" "$destination"; then
+    warn "could not write $destination"
+    WRITE_FAILED=1
+    return 1
+  fi
   ok "wrote $destination"
 }
 
@@ -325,20 +352,89 @@ remove_helper_packages() {
 # ---------------------------------------------------------------------------
 # PATH precedence
 # ---------------------------------------------------------------------------
-# A shim only works if its directory is searched before Omarchy's. Report on
-# the PATH a *new* login shell gets, not this one: on a packaged install
-# /usr/share/omarchy/bin is not on PATH at all, but a session started before an
-# upgrade can still carry a stale copy of it ahead of /usr/local/bin.
-path_rank() {
-  local dir="$1" path="$2" position=0 entry
+# A shim only helps if the name resolves to it. The first version of this
+# compared SHIM_DIR against BIN_DIR and reported success on a machine where
+# every omarchy-* shim was inert: /usr/share/omarchy/bin is a farm of symlinks
+# pointing back into /usr/bin, so a PATH carrying it ahead of SHIM_DIR reaches
+# the upstream command without BIN_DIR ever appearing earlier. The helper shim
+# was the one that did run, because that directory has no counterpart to it.
+#
+# So walk the PATH per shim name, the way the shell does, and report whatever
+# gets there first. That catches any shadowing directory, not one named here.
+
+# Where the dev-link marker lives. Overridable so the tests can point at a
+# fixture instead of the real /etc.
+OMARCHY_DEV_CONF="${OMARCHY_DEV_CONF:-/etc/omarchy.conf}"
+
+# Set when a shim loses on a PATH that matters, which makes the run fail. The
+# two are tracked apart because they have different fixes: the manager PATH is
+# what a fresh session starts from and can be repaired here, while a login
+# shell's is this session's own and only a new session replaces it.
+PRECEDENCE_FAILED=0
+MANAGER_CHECKED=0
+MANAGER_FAILED=0
+
+# The trailing newline matters: without it `read` never returns the last entry,
+# so the final PATH directory is invisible to every check below.
+split_path() { printf '%s\n' "$1" | tr ':' '\n'; }
+
+path_has() {
+  local dir="$1" entry
   while IFS= read -r entry; do
-    position=$((position + 1))
-    if [[ "$entry" == "$dir" ]]; then
-      printf '%s' "$position"
+    [[ "$entry" == "$dir" ]] && return 0
+  done < <(split_path "$2")
+  return 1
+}
+
+# path_without <dir> <path> — <path> with every occurrence of <dir> dropped.
+path_without() {
+  local dir="$1" entry out=""
+  while IFS= read -r entry; do
+    [[ "$entry" == "$dir" ]] && continue
+    out+="${out:+:}$entry"
+  done < <(split_path "$2")
+  printf '%s' "$out"
+}
+
+# shim_shadow <name> <path> — prints what <path> reaches before our shim and
+# returns 0 when the shim loses; returns 1 when it wins. Compares directories
+# rather than files so a --dry-run, which has installed nothing yet, still
+# reports what the PATH will do.
+shim_shadow() {
+  local name="$1" entry
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] || continue
+    [[ "$entry" == "$SHIM_DIR" ]] && return 1
+    if [[ -f "$entry/$name" && -x "$entry/$name" ]]; then
+      printf '%s' "$entry/$name"
       return 0
     fi
-  done < <(printf '%s' "$path" | tr ':' '\n')
-  printf '0'
+  done < <(split_path "$2")
+  return 1
+}
+
+# check_path <label> <path> — report how <path> resolves every shim name.
+check_path() {
+  local label="$1" path="$2" name winner failed=0
+
+  if ! path_has "$SHIM_DIR" "$path"; then
+    warn "$SHIM_DIR is not on the $label PATH — the shims will not be found"
+    PRECEDENCE_FAILED=1
+    return 1
+  fi
+
+  while IFS= read -r name; do
+    if winner="$(shim_shadow "$name" "$path")"; then
+      warn "$label PATH reaches $winner before $SHIM_DIR/$name"
+      failed=1
+    fi
+  done < <(shim_names)
+
+  if [[ "$failed" == "1" ]]; then
+    PRECEDENCE_FAILED=1
+    return 1
+  fi
+  ok "$SHIM_DIR wins every shim name on the $label PATH"
 }
 
 login_path() {
@@ -349,29 +445,82 @@ login_path() {
   bash -lc 'printf "%s" "$PATH"' 2>/dev/null || printf '%s' "$PATH"
 }
 
-report_path_precedence() {
-  local path shim_rank bin_rank stale_rank
+# The PATH the systemd user manager hands to what it starts. Worth its own
+# check: under a uwsm/Hyprland login that manager holds the session PATH and
+# outlives a logout, so a stale entry baked in there is not cleared by opening
+# a new shell. Empty when there is no user manager, which is the test's case.
+manager_path() {
+  if [[ -n "${OMARCHY_MANAGER_PATH+x}" ]]; then
+    printf '%s' "$OMARCHY_MANAGER_PATH"
+    return 0
+  fi
+  have systemctl || return 0
+  systemctl --user show-environment 2>/dev/null | sed -n 's/^PATH=//p' | head -n 1
+}
 
-  path="$(login_path)"
-  shim_rank="$(path_rank "$SHIM_DIR" "$path")"
-  bin_rank="$(path_rank "$BIN_DIR" "$path")"
+# The packaged Omarchy bin directory, when having it on PATH is stale state
+# rather than something in use. env-bootstrap prepends it only under
+# `omarchy dev link`; on a production install it says the directory "would just
+# be noise" and leaves it off. But env-bootstrap only ever adds, so a copy
+# inherited from a dev link that has since been undone — or from an older
+# bootstrap that prepended unconditionally — is never taken back out.
+stale_omarchy_bin() {
+  local base="${OMARCHY_PATH:-/usr/share/omarchy}"
+  [[ -f "$OMARCHY_DEV_CONF" ]] && return 1
+  printf '%s/bin' "${base%/}"
+}
 
-  if [[ "$shim_rank" == "0" ]]; then
-    warn "$SHIM_DIR is not on a login shell's PATH — the shims will not be found"
-  elif [[ "$bin_rank" != "0" ]] && [[ "$shim_rank" -gt "$bin_rank" ]]; then
-    warn "$BIN_DIR precedes $SHIM_DIR on a login shell's PATH — the shims will not win"
-  else
-    ok "$SHIM_DIR precedes $BIN_DIR on a login shell's PATH"
+# Drop the stale entry from the systemd user manager, so processes it starts
+# from here on resolve the shims. Shells that are already running keep the PATH
+# they were given; only a fresh session clears those.
+repair_manager_path() {
+  local stale="$1" path cleaned
+
+  # Only ever repair a PATH actually read from systemd. When OMARCHY_MANAGER_PATH
+  # supplies one, this is a test or a what-if and the real session environment is
+  # not ours to write. Without this a suite that forgets to stub systemctl edits
+  # the PATH of the session running it, which is how this guard got written.
+  if [[ -n "${OMARCHY_MANAGER_PATH+x}" ]]; then
+    skip "OMARCHY_MANAGER_PATH is set — not touching the real session environment"
+    return 1
   fi
 
-  # This shell only. Harmless, but it explains a shim that looks inert until
-  # the next login.
-  stale_rank="$(path_rank /usr/share/omarchy/bin "$PATH")"
-  if [[ "$stale_rank" != "0" ]]; then
-    shim_rank="$(path_rank "$SHIM_DIR" "$PATH")"
-    if [[ "$shim_rank" == "0" ]] || [[ "$stale_rank" -lt "$shim_rank" ]]; then
-      warn "this shell has a stale /usr/share/omarchy/bin ahead of $SHIM_DIR — the shims apply to new sessions"
-    fi
+  path="$(manager_path)"
+  [[ -n "$path" ]] || return 1
+  path_has "$stale" "$path" || return 1
+
+  cleaned="$(path_without "$stale" "$path")"
+  log "Repairing the session PATH"
+  printf '  %s-%s dropping %s, which env-bootstrap only adds under a dev link\n' \
+    "$C_DIM" "$C_RESET" "$stale"
+
+  if ! confirm "Drop it from the systemd user environment?"; then
+    skip "left $stale on the session PATH"
+    return 1
+  fi
+
+  run systemctl --user set-environment "PATH=$cleaned"
+  [[ "$DRY_RUN" == "1" ]] || ok "dropped $stale from the systemd user environment"
+}
+
+report_path_precedence() {
+  local stale manager
+
+  log "Checking PATH precedence"
+  check_path login "$(login_path)" || true
+
+  manager="$(manager_path)"
+  if [[ -n "$manager" ]]; then
+    MANAGER_CHECKED=1
+    check_path "systemd user manager" "$manager" || MANAGER_FAILED=1
+  fi
+
+  [[ "$PRECEDENCE_FAILED" == "1" ]] || return 0
+
+  # One shadowing directory has a known, reversible cause. Anything else is
+  # this machine's own PATH and only the person who arranged it can say why.
+  if stale="$(stale_omarchy_bin)"; then
+    repair_manager_path "$stale" || true
   fi
 }
 
@@ -402,6 +551,34 @@ fail while the AUR is blocked.
 
 The helper package is not reinstalled. If you want it back:
   omarchy pkg add ${AUR_HELPERS[0]}
+EOF
+  elif [[ "$WRITE_FAILED" == "1" ]]; then
+    cat <<EOF
+
+At least one shim could not be written, so \`omarchy update\` still reaches the
+AUR through whichever name is missing. The warnings above say which.
+
+EOF
+  elif [[ "$PRECEDENCE_FAILED" == "1" ]] &&
+       [[ "$MANAGER_CHECKED" == "1" ]] && [[ "$MANAGER_FAILED" == "0" ]]; then
+    cat <<EOF
+
+The shims are installed and a new session will resolve them, but this one still
+reaches what the warnings above name, so \`omarchy update\` run from a terminal
+started before now still probes aur.archlinux.org.
+
+Log out and back in, then check with:
+  command -v omarchy-update-aur-pkgs
+EOF
+  elif [[ "$PRECEDENCE_FAILED" == "1" ]]; then
+    cat <<EOF
+
+The shims are installed but something on PATH gets to those names first, so
+\`omarchy update\` still runs Omarchy's own AUR step and still probes
+aur.archlinux.org. The warnings above name what wins and where.
+
+Until PATH is fixed the shims change nothing. Re-run this once it is:
+  ./bin/setup-no-aur-updates
 EOF
   else
     cat <<EOF
@@ -439,6 +616,11 @@ main() {
     report_path_precedence
   fi
   summary
+
+  # A shim that was never written, or one that is shadowed, leaves the next
+  # update reaching the AUR anyway. Neither is a warning. setup-all collects it.
+  [[ "$WRITE_FAILED" == "0" ]] || exit 1
+  [[ "$PRECEDENCE_FAILED" == "0" ]] || exit 1
 }
 
 main "$@"
