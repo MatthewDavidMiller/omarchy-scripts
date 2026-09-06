@@ -1,0 +1,301 @@
+#!/usr/bin/env bash
+#
+# setup-desktop-cpu-priority — keep the desktop scheduled ahead of container
+# builds.
+#
+# order: 45
+# description: Keep the desktop ahead of container builds for CPU
+#
+# A saturated CPU does not just make an editor slow, it makes it die. Electron
+# watches its own renderers and kills one that fails to answer a ping inside a
+# fixed window — Cursor's default is 15 seconds — on the assumption that a
+# renderer silent for that long has wedged. A renderer that is merely waiting
+# for a timeslice looks exactly the same from the outside, so a machine with
+# more runnable compilers than cores loses editor windows to SIGKILL while
+# nothing is actually wrong. Nothing is out of memory when this happens, which
+# is why systemd-oomd never fires and the journal shows no OOM kill.
+#
+# There is nothing to fix in the applications: their timeout is a reasonable
+# guess about a machine that schedules them within a second or two. The fix is
+# to make that guess true again, by making the desktop win the scheduler
+# against background builds instead of tying with them.
+#
+# Rootless Podman gives us the seam to do it. It runs containers as transient
+# scopes under the *user manager's* user.slice:
+#
+#   user@1000.service/user.slice/libpod-<id>.scope     containers
+#   user@1000.service/app.slice/app-cursor-<pid>.scope editors, terminals
+#   user@1000.service/session.slice/...                Hyprland
+#
+# Three sibling slices, all at the default CPUWeight of 100, so a container
+# population competes with the compositor on equal terms and wins by outnumbering
+# it. Lowering user.slice alone separates every container from everything else
+# in one place. Weight is proportional, not a cap: builds still get the whole
+# machine when the desktop is idle, and yield within a scheduling quantum when
+# it is not. That is the property the watchdog needs, and a fixed quota would
+# not give it.
+#
+# Only `cpu` and `memory` are delegated to a user manager, so `io` is not a knob
+# available here — the drop-in is CPU alone, and heavy build I/O can still stall
+# a renderer. If that turns out to matter, the escalation is a scheduler built
+# for the problem (scx_lavd, from the official scx-scheds package) rather than
+# more cgroup attributes.
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+# Where the user manager reads drop-ins from. user.slice has no fragment file
+# of its own — systemd creates it implicitly — but drop-ins for it are still
+# loaded, and daemon-reload applies them to the live cgroup.
+SYSTEMD_USER_DIR="${SYSTEMD_USER_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user}"
+DROP_IN="$SYSTEMD_USER_DIR/user.slice.d/10-cpu-weight.conf"
+
+# The user manager's own cgroup, where the delegated controllers and the
+# resulting cpu.weight can be read back. Overridable so tests can point at a
+# fixture instead of /sys.
+USER_CGROUP="${USER_CGROUP:-/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service}"
+
+# 20 against the 100 that systemd ships in the app.slice and session.slice unit
+# files leaves the desktop roughly five times the share of every container put
+# together: decisive without being punitive, since a build alone on the machine
+# still gets all of it. Calibrated against a shipped reference rather than
+# picked out of the air — systemd's own background.slice is CPUWeight=30, so
+# this sits just below what systemd already calls background work. Range is
+# systemd's: 1-10000.
+CPU_WEIGHT="${CPU_WEIGHT:-20}"
+
+# --revert removes the drop-in and puts user.slice back to the default weight.
+REVERT=0
+
+usage() {
+  cat <<'USAGE'
+Usage: setup-desktop-cpu-priority [options]
+
+Lowers the CPU weight of the user manager's user.slice, where rootless Podman
+runs containers, so compositor and editor scopes outrank background builds.
+Stops an editor renderer from being killed by its own watchdog when a build
+saturates every core.
+
+Options:
+  -n, --dry-run       Show what would change without changing anything.
+  -y, --yes           Do not prompt for confirmation.
+  -w, --weight N      CPU weight for container scopes, 1-10000. Default: 20.
+                      Lower yields more to the desktop; 100 is the default
+                      systemd gives every other slice.
+      --revert        Remove the drop-in and restore the default weight.
+  -h, --help          Show this help.
+
+Environment:
+  DRY_RUN=1           Same as --dry-run.
+  CPU_WEIGHT=N        Same as --weight.
+  SYSTEMD_USER_DIR    Where user unit drop-ins are written.
+  USER_CGROUP         The user manager's cgroup directory, read to verify.
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--dry-run)  DRY_RUN=1 ;;
+    -y|--yes)      ASSUME_YES=1 ;;
+    -w|--weight)   CPU_WEIGHT="${2:?--weight needs a value}"; shift ;;
+    --revert)      REVERT=1 ;;
+    -h|--help)     usage; exit 0 ;;
+    *)             usage >&2; die "Unknown argument: $1" ;;
+  esac
+  shift
+done
+
+require_not_root
+require_cmd systemctl
+
+# systemd's own range for CPUWeight. Checked here rather than left to the unit
+# file, where a bad value fails at daemon-reload with the drop-in already on
+# disk — visible only in the user manager's journal.
+valid_weight() {
+  [[ "$1" =~ ^[0-9]+$ ]] || return 1
+  (( $1 >= 1 && $1 <= 10000 ))
+}
+
+if ! valid_weight "$CPU_WEIGHT"; then
+  die "--weight must be an integer from 1 to 10000, not: $CPU_WEIGHT"
+fi
+
+# ---------------------------------------------------------------------------
+# 1. Is the knob even connected?
+# ---------------------------------------------------------------------------
+# systemd delegates a subset of controllers to the user manager. Without `cpu`
+# in that set there is no cpu.weight below user@.service and the drop-in is
+# inert — worth saying out loud, because everything else still reports success.
+cpu_is_delegated() {
+  local controllers="$USER_CGROUP/cgroup.controllers"
+  [[ -r "$controllers" ]] || return 1
+  grep -qw cpu "$controllers"
+}
+
+check_delegation() {
+  if cpu_is_delegated; then
+    ok "the cpu controller is delegated to the user manager"
+    return 0
+  fi
+  if [[ ! -r "$USER_CGROUP/cgroup.controllers" ]]; then
+    warn "cannot read $USER_CGROUP/cgroup.controllers — skipping the delegation check"
+    return 0
+  fi
+  warn "the cpu controller is NOT delegated to this user manager."
+  warn "The drop-in will be written but has nothing to act on until it is:"
+  printf '  %s-%s systemctl show user@%s.service -p Delegate\n' \
+    "$C_DIM" "$C_RESET" "$(id -u)"
+}
+
+# ---------------------------------------------------------------------------
+# 2. The drop-in
+# ---------------------------------------------------------------------------
+drop_in_content() {
+  cat <<EOF
+# Managed by omarchy-scripts (bin/setup-desktop-cpu-priority).
+#
+# Rootless Podman runs containers as transient scopes under this slice, while
+# editors and the compositor live in app.slice and session.slice at the
+# CPUWeight=100 systemd ships them with. Lowering it here is what stops a build
+# from starving an editor renderer badly enough for its own watchdog to kill it.
+#
+# Proportional, not a cap: with the desktop idle a build still gets every core.
+[Slice]
+CPUWeight=$CPU_WEIGHT
+EOF
+}
+
+# A reload is what pushes the new value into the running cgroup, so it belongs
+# with a write and not with a skip — a second run must be silent.
+reload_user_manager() {
+  run systemctl --user daemon-reload
+}
+
+configure_weight() {
+  log "Setting the CPU weight of user.slice to $CPU_WEIGHT"
+
+  if [[ -f "$DROP_IN" ]] && [[ "$(cat "$DROP_IN")" == "$(drop_in_content)" ]]; then
+    skip "$DROP_IN already up to date"
+    return 0
+  fi
+
+  drop_in_content | write_file "$DROP_IN"
+  reload_user_manager
+}
+
+revert_weight() {
+  log "Restoring the default CPU weight for user.slice"
+
+  if [[ ! -f "$DROP_IN" ]]; then
+    skip "$DROP_IN is not installed"
+    return 0
+  fi
+
+  run rm -f -- "$DROP_IN"
+  # Leaves the directory only if something else put a drop-in there too.
+  run rmdir --ignore-fail-on-non-empty -- "$(dirname -- "$DROP_IN")"
+  ok "removed $DROP_IN"
+  reload_user_manager
+}
+
+# ---------------------------------------------------------------------------
+# 3. Read the result back out of the kernel
+# ---------------------------------------------------------------------------
+# The unit property and the cgroup attribute can disagree — systemd accepting a
+# value is not the same as the kernel having applied it — so check the one that
+# actually schedules.
+verify() {
+  [[ "$DRY_RUN" == "1" ]] && return 0
+
+  local live_weight="$USER_CGROUP/user.slice/cpu.weight" actual expected
+  expected="$CPU_WEIGHT"
+  [[ "$REVERT" == "1" ]] && expected=100
+
+  if [[ ! -r "$live_weight" ]]; then
+    warn "cannot read $live_weight — not verifying the applied weight"
+    return 0
+  fi
+
+  actual="$(cat "$live_weight")"
+  if [[ "$actual" == "$expected" ]]; then
+    ok "user.slice is running at cpu.weight $actual"
+    return 0
+  fi
+  warn "expected cpu.weight $expected under user.slice, found $actual"
+  warn "check it with: systemctl --user show user.slice -p CPUWeight"
+}
+
+# ---------------------------------------------------------------------------
+# 4. What this does and does not cover
+# ---------------------------------------------------------------------------
+# The slice only catches work that lands in it. Two common cases do not, and
+# both fail silently — the build simply keeps its old share — so name them.
+report_uncovered() {
+  [[ "$REVERT" == "1" ]] && return 0
+
+  if have podman; then
+    local manager
+    manager="$(podman info --format '{{.Host.CgroupManager}}' 2>/dev/null || true)"
+    if [[ -n "$manager" && "$manager" != "systemd" ]]; then
+      warn "podman's cgroup manager is '$manager', not systemd, so its containers"
+      warn "may not land in user.slice. Switch it in ~/.config/containers/containers.conf."
+    fi
+  fi
+
+  if systemctl is-active --quiet docker.service 2>/dev/null; then
+    warn "the Docker daemon is running. Its containers are in the system manager's"
+    warn "system.slice and are not covered by this. bin/setup-rootless-podman replaces it."
+  fi
+}
+
+summary() {
+  log "Done"
+
+  if [[ "$REVERT" == "1" ]]; then
+    cat <<'EOF'
+
+user.slice is back to the default weight of 100, tied with app.slice and
+session.slice — a build can once again take as much of the CPU as it has
+runnable processes to ask with.
+EOF
+    return 0
+  fi
+
+  cat <<EOF
+
+Container scopes now carry $CPU_WEIGHT against the 100 that app.slice (editors,
+terminals) and session.slice (Hyprland) each get, so the desktop is scheduled
+first whenever both want the CPU. A build alone on the machine is unaffected.
+
+This is live already — no logout, no reboot. It applies to every container from
+every project, however many run at once.
+
+A build run straight on the host lands in app.slice next to your editor, where
+this does not separate them. Put one under the same budget with:
+  systemd-run --user --scope --slice=user.slice -- cargo build
+
+Check what it is worth under load:
+  systemd-cgtop --order=cpu
+  cat $USER_CGROUP/user.slice/cpu.weight
+
+Reverse it with:
+  ./bin/setup-desktop-cpu-priority --revert
+EOF
+}
+
+main() {
+  check_delegation
+  if [[ "$REVERT" == "1" ]]; then
+    revert_weight
+  else
+    configure_weight
+  fi
+  verify
+  report_uncovered
+  summary
+}
+
+main "$@"

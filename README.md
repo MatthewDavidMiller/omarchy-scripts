@@ -56,6 +56,7 @@ touching the system.
 | `bin/setup-no-background-network` | Stop optional polling and application telemetry | [docs/setup-no-background-network.md](docs/setup-no-background-network.md) |
 | `bin/setup-no-localsend` | Remove LocalSend and the ufw rules that expose it | [docs/setup-no-localsend.md](docs/setup-no-localsend.md) |
 | `bin/setup-rootless-podman` | Swap Docker for rootless Podman, keeping the docker CLI | [docs/setup-rootless-podman.md](docs/setup-rootless-podman.md) |
+| `bin/setup-desktop-cpu-priority` | Keep the desktop ahead of container builds for CPU | [docs/setup-desktop-cpu-priority.md](docs/setup-desktop-cpu-priority.md) |
 | `bin/setup-security-hardening` | Enforce a safe package, firewall, kernel, and credential-file baseline | [docs/setup-security-hardening.md](docs/setup-security-hardening.md) |
 | `bin/setup-opensnitch` | Opt-in deny-by-default outbound application firewall | [docs/setup-opensnitch.md](docs/setup-opensnitch.md) |
 | `bin/export-opensnitch-rules` | Export reviewed permanent allows for reuse across machines | [docs/setup-opensnitch.md](docs/setup-opensnitch.md) |

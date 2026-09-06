@@ -67,6 +67,8 @@ for path in \
   tests/test-setup-no-claude-remote-control.sh \
   bin/setup-no-aur-updates docs/setup-no-aur-updates.md \
   tests/test-setup-no-aur-updates.sh \
+  bin/setup-desktop-cpu-priority docs/setup-desktop-cpu-priority.md \
+  tests/test-setup-desktop-cpu-priority.sh \
   tests/test-export-opensnitch-rules.sh tests/test-opensnitch-rulectl.sh
 do
   it "keeps $path tracked"
