@@ -3,8 +3,7 @@
 # setup-opensnitch — install a maintainable outbound application firewall.
 #
 # order: 95
-# default: no
-# description: Opt-in deny-by-default outbound application firewall
+# description: Deny-by-default outbound application firewall
 #
 set -euo pipefail
 
@@ -34,8 +33,11 @@ Usage: setup-opensnitch [options]
 
 Installs OpenSnitch from Arch Extra, imports this repository's shared rules,
 and enables deny-by-default outbound application control. UFW remains the
-inbound firewall. This script is opt-in; setup-all runs it only when selected
-with --only opensnitch.
+inbound firewall.
+
+Enforcement starts immediately and unanswered prompts apply the default action,
+so hold it back with `setup-all --skip opensnitch` on a machine you are not
+ready to answer prompts on.
 
 Options:
   -n, --dry-run   Show what would change without changing anything.

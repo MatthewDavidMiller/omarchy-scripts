@@ -59,7 +59,7 @@ nothing needs elevating and nothing needs a group that is root by another name.
    `docker`, `docker-buildx` and `ufw-docker` (plus `containerd`, which nothing
    else needs). The full list `pacman -Rs` would take is printed before the
    confirmation, so nothing goes unseen.
-6. **Deletes the docker DNS firewall rules** — see below.
+6. **Closes the docker DNS exposure** — the ufw rules and the resolved drop-in that bound the stub resolver to the bridge. See below.
 7. **Installs `podman-docker`**, which provides `/usr/bin/docker`. This has to
    come last: the package `Conflicts With docker`, so pacman will not accept it
    until the real Docker is gone.
@@ -144,6 +144,34 @@ declares its own `DOCKER-USER` chain (`:DOCKER-USER - [0:0]`), so it is
 self-contained and inert without Docker, and editing ufw's after.rules to
 remove something that does nothing is the riskier of the two options.
 
+## The resolver drop-in
+
+Deleting the ufw rules is only half of undoing Omarchy's docker networking. An
+older Omarchy also wrote `/etc/systemd/resolved.conf.d/20-docker-dns.conf`:
+
+```ini
+[Resolve]
+DNSStubListenerExtra=172.17.0.1
+```
+
+systemd-resolved freebinds that listener, so it survives `docker0` and keeps
+showing up in `ss -tlpn` long after the bridge is gone — an address no interface
+holds is still bound. That is the part the ufw cleanup does not reach, and the
+part that matters: with the allow rules deleted the listener is waiting for an
+address that does not exist *yet*. If any interface later acquires one in
+`172.17.0.0/16` — a VPN, a bridge, a foreign LAN handing out that range — the
+stub resolver is reachable on it with no rule in the way.
+
+The script removes the file, backs it up first, and restarts `systemd-resolved`
+only when it actually removed something, since a restart drops the DNS cache.
+It removes the file only when the active content is exactly those two settings,
+ignoring comments and spacing; anything else — a second key, a different
+address — is reported and left alone. `--keep-firewall-rules` covers this too.
+
+Nothing recreates it: `grep -r DNSStubListenerExtra /usr/share/omarchy` finds
+nothing in Omarchy 4, so it is an orphan from an install predating the version
+on the machine rather than something an update writes back.
+
 ## What is not carried over
 
 Images, containers and volumes. Podman keeps its own store under
@@ -170,7 +198,7 @@ the whole point of omarchy's install note — and an empty group grants nothing.
 | `-n`, `--dry-run` | Print actions, change nothing |
 | `-y`, `--yes` | Skip confirmation prompts |
 | `--keep-docker` | Set up Podman only; leave Docker installed and running |
-| `--keep-firewall-rules` | Leave the `allow-docker-dns` ufw rules in place |
+| `--keep-firewall-rules` | Leave the docker DNS exposure alone: both the `allow-docker-dns` ufw rules and the resolved drop-in |
 | `-h`, `--help` | Usage |
 
 | Variable | Effect |
@@ -178,6 +206,7 @@ the whole point of omarchy's install note — and an empty group grants nothing.
 | `SUBUID_FILE`, `SUBGID_FILE` | Where the subordinate ranges live. Default `/etc/subuid`, `/etc/subgid`; the tests point them at fixtures |
 | `UFW_RULES_DIR` | Where `user.rules` lives. Default `/etc/ufw` |
 | `DOCKER_DATA_DIR` | The daemon's data directory to report. Default `/var/lib/docker` |
+| `DOCKER_RESOLVED_DROPIN` | The resolved drop-in to remove. Default `/etc/systemd/resolved.conf.d/20-docker-dns.conf` |
 
 With `--keep-docker`, `DOCKER_HOST` still points at podman — that is what makes
 podman the session's engine. Reach the Docker daemon explicitly with
@@ -197,6 +226,7 @@ systemctl --user status podman.socket
 echo $DOCKER_HOST                                    # .../podman/podman.sock
 docker run --rm docker.io/library/alpine echo ok     # through the shim
 sudo ufw status | grep 172.17.0.1                    # no output
+ss -tlpn | grep 172.17                               # no output
 ```
 
 `DOCKER_HOST` reaches a process only after the systemd user manager has read

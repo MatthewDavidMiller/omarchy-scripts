@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+#
+# setup-no-discovery-services — stop the CUPS and Avahi daemons on a machine
+# that does not print and does not need mDNS.
+#
+# order: 82
+# description: Disable the CUPS and Avahi network discovery daemons
+#
+# Omarchy enables both at install time (install/config/enable-services.sh):
+#
+#   systemctl enable cups.service
+#   systemctl enable avahi-daemon.service
+#
+# Neither is a live hole on a machine with this repository's baseline applied.
+# UFW's default-deny-incoming means avahi's 0.0.0.0:5353 and [::]:5353 sockets
+# receive nothing from the network, and CUPS only listens on loopback. This is
+# defence in depth against the *local* attack surface, not the closing of an
+# open door -- so on a machine that prints, skipping it costs little.
+#
+# What it buys: cups.service is the worst-scoring unit on a stock Omarchy
+# install -- `systemd-analyze security` rates it 9.6 UNSAFE -- and it runs as
+# root with a print-job parser, a config parser, and a filter pipeline behind
+# it. Avahi is a root-adjacent daemon parsing multicast packet formats. Neither
+# does anything for a laptop that has never printed.
+#
+# Update safety: enable-services.sh runs during installation, not on update, so
+# `omarchy update` will not re-enable these. No post-update hook is needed, and
+# adding one speculatively would only make an update slower.
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+# Order matters on the way down. cups.socket and cups.path both activate
+# cups.service on demand, so stopping the service first would just have it
+# started again by the next print-queue access. Take the activators away first.
+CUPS_UNITS=(cups.path cups.socket cups.service)
+AVAHI_UNITS=(avahi-daemon.socket avahi-daemon.service)
+
+# Read on the way back up, in the reverse order.
+REVERT=0
+# --keep-cups / --keep-avahi narrow the run to one of the two daemons.
+DISABLE_CUPS=1
+DISABLE_AVAHI=1
+
+PRINT_APPLET="${PRINT_APPLET:-$HOME/.config/autostart/print-applet.desktop}"
+NSSWITCH_CONF="${NSSWITCH_CONF:-/etc/nsswitch.conf}"
+
+usage() {
+  cat <<'USAGE'
+Usage: setup-no-discovery-services [options]
+
+Disables the CUPS printing daemon and the Avahi mDNS daemon, along with the
+socket and path units that would otherwise start them on demand. Packages are
+never removed, so the change is a `--revert` away.
+
+`setup-all` runs this like every other script. On a machine that prints, hold
+it back with `setup-all --skip no-discovery-services`.
+
+Options:
+  -n, --dry-run      Show what would change without changing anything.
+  -y, --yes          Accepted for setup-all compatibility; no prompts are used.
+      --keep-cups    Leave CUPS alone; only disable Avahi.
+      --keep-avahi   Leave Avahi alone; only disable CUPS.
+      --revert       Reverse: re-enable and start both daemons.
+  -h, --help         Show this help.
+
+Environment (primarily for tests):
+  DRY_RUN=1          Same as --dry-run.
+  PRINT_APPLET       Autostart entry for the printer tray applet.
+  NSSWITCH_CONF      Name service switch configuration to report on.
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--dry-run)   DRY_RUN=1 ;;
+    -y|--yes)       ASSUME_YES=1 ;;
+    --keep-cups)    DISABLE_CUPS=0 ;;
+    --keep-avahi)   DISABLE_AVAHI=0 ;;
+    --revert)       REVERT=1 ;;
+    -h|--help)      usage; exit 0 ;;
+    *)              usage >&2; die "Unknown argument: $1" ;;
+  esac
+  shift
+done
+
+require_not_root
+require_cmd systemctl sudo
+
+# ---------------------------------------------------------------------------
+# 1. Units
+# ---------------------------------------------------------------------------
+
+# A unit the machine does not have is not a failure. Omarchy 4 already dropped
+# cups-browsed, and a machine that never installed cups has none of these.
+unit_exists() {
+  local listing
+  # Captured rather than piped into `grep -q`. grep closes the pipe on its
+  # first match, systemctl takes SIGPIPE, and pipefail reports the pipeline as
+  # failed -- so a unit that is installed intermittently reads as missing and
+  # gets silently skipped. See docs/conventions.md.
+  listing="$(systemctl list-unit-files "$1" 2>/dev/null || true)"
+  grep -q "^$1" <<< "$listing"
+}
+
+unit_off() {
+  ! systemctl is-enabled --quiet "$1" 2>/dev/null \
+    && ! systemctl is-active --quiet "$1" 2>/dev/null
+}
+
+disable_units() {
+  local unit
+  for unit in "$@"; do
+    if ! unit_exists "$unit"; then
+      skip "$unit is not installed"
+      continue
+    fi
+    if unit_off "$unit"; then
+      skip "$unit is already stopped and disabled"
+      continue
+    fi
+    # --now stops as well as disabling, in one transaction, so there is no
+    # window where the unit is disabled but still running.
+    if run sudo systemctl disable --now "$unit"; then
+      ok "disabled and stopped $unit"
+    else
+      warn "could not disable $unit"
+    fi
+  done
+}
+
+enable_units() {
+  local unit
+  for unit in "$@"; do
+    if ! unit_exists "$unit"; then
+      skip "$unit is not installed"
+      continue
+    fi
+    if ! unit_off "$unit"; then
+      skip "$unit is already enabled"
+      continue
+    fi
+    if run sudo systemctl enable --now "$unit"; then
+      ok "enabled and started $unit"
+    else
+      warn "could not enable $unit"
+    fi
+  done
+}
+
+configure_cups() {
+  if [[ "$DISABLE_CUPS" == "0" ]]; then
+    skip "--keep-cups: leaving CUPS alone"
+    return 0
+  fi
+  if [[ "$REVERT" == "1" ]]; then
+    log "Restoring CUPS"
+    # Reverse order: the service before the units that activate it.
+    enable_units cups.service cups.socket cups.path
+    return 0
+  fi
+  log "Disabling CUPS"
+  disable_units "${CUPS_UNITS[@]}"
+}
+
+configure_avahi() {
+  if [[ "$DISABLE_AVAHI" == "0" ]]; then
+    skip "--keep-avahi: leaving Avahi alone"
+    return 0
+  fi
+  if [[ "$REVERT" == "1" ]]; then
+    log "Restoring Avahi"
+    enable_units avahi-daemon.service avahi-daemon.socket
+    return 0
+  fi
+  log "Disabling Avahi"
+  disable_units "${AVAHI_UNITS[@]}"
+}
+
+# ---------------------------------------------------------------------------
+# 2. The printer tray applet
+# ---------------------------------------------------------------------------
+# system-config-printer ships /etc/xdg/autostart/print-applet.desktop, which
+# every session starts. The supported way to suppress a system autostart entry
+# is a user-level copy carrying Hidden=true, which Omarchy already writes. Do
+# not create one here: an entry the user has not got is not this script's to
+# add, and a printer-less machine losing a tray icon is not a security finding.
+report_print_applet() {
+  [[ "$DISABLE_CUPS" == "1" && "$REVERT" == "0" ]] || return 0
+  if [[ -f "$PRINT_APPLET" ]] && grep -qi '^Hidden[[:space:]]*=[[:space:]]*true' "$PRINT_APPLET"; then
+    ok "the printer tray applet is already suppressed for this user"
+  else
+    warn "the printer tray applet still autostarts; suppress it with:"
+    printf '  %s-%s echo -e %s > %s\n' \
+      "$C_DIM" "$C_RESET" "'[Desktop Entry]\\nHidden=true'" "$PRINT_APPLET"
+  fi
+}
+
+summary() {
+  log "Done"
+
+  if [[ "$REVERT" == "1" ]]; then
+    cat <<'EOF'
+
+CUPS and Avahi are back to how Omarchy enables them: .local names resolve again,
+and network printers are discoverable.
+EOF
+    return 0
+  fi
+
+  cat <<EOF
+
+Three things change, none of which is an error:
+
+  .local names stop resolving. $NSSWITCH_CONF lists mdns_minimal ahead of
+  resolve in its hosts line. With avahi stopped, nss-mdns returns UNAVAIL
+  rather than NOTFOUND, so ordinary DNS still answers and the
+  [NOTFOUND=return] guard is never reached -- but nothing answers for .local,
+  and every lookup pays one failed socket connect on the way past. Dropping
+  mdns_minimal from that line removes the cost; this script does not edit
+  $NSSWITCH_CONF, which glibc owns.
+
+  Network audio sinks stop appearing. pipewire-pulse links avahi to discover
+  RAOP/AirPlay targets. Local audio is unaffected.
+
+  Network printers stop being discovered, and so does printing. A printer added
+  later needs --revert first.
+
+Packages are left installed -- avahi is a dependency of libcups, nss-mdns,
+passim, pipewire-pulse and tinysparql -- so this is fully reversible:
+  ./bin/setup-no-discovery-services --revert
+EOF
+}
+
+report_state() {
+  local unit state
+  printf '\n'
+  log "Current state"
+  for unit in "${CUPS_UNITS[@]}" "${AVAHI_UNITS[@]}"; do
+    if ! unit_exists "$unit"; then
+      state="not installed"
+    elif unit_off "$unit"; then
+      state="stopped and disabled"
+    else
+      state="running or enabled"
+    fi
+    printf '  %-22s %s\n' "$unit" "$state"
+  done
+}
+
+main() {
+  configure_cups
+  configure_avahi
+  report_print_applet
+  summary
+  [[ "$DRY_RUN" == "1" ]] || report_state
+}
+
+main "$@"

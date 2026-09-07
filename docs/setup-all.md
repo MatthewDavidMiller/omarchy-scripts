@@ -14,9 +14,15 @@ Safe to run any time. Every script is idempotent, so a second run reports
 ## How scripts are discovered
 
 `setup-all` globs `bin/setup-*` (excluding itself). A new script joins the run
-just by existing and being executable — there is no list to update. A script
-with `# default: no` is opt-in: ordinary runs and `--list` omit it, while
-`--only NAME` selects it explicitly.
+just by existing and being executable — there is no list to update, and there
+is no opt-in tier: every script in `bin/` is listed, shown in the menu, and run.
+
+A script that is disruptive enough to want holding back is held back with
+`--skip NAME`, at the call site. That is deliberate. `setup-all` used to honour
+a `# default: no` header, and the cost was that such a script vanished from
+`--list` and from the menu as well as from the run — leaving no way to discover
+it short of reading `bin/`. A choice you can see is worth more than a default
+you cannot.
 
 Order comes from a header comment in each script:
 
@@ -27,7 +33,6 @@ Order comes from a header comment in each script:
 #
 # order: 20
 # description: Shown in --list and in the run header
-# default: no  # optional; omit this line for normal scripts
 ```
 
 `order` defaults to `50` if absent; ties break alphabetically. Leave gaps
@@ -42,6 +47,37 @@ Order comes from a header comment in each script:
 
 A script in `bin/` that is not executable is skipped with a warning, not
 silently ignored.
+
+## One password for the whole run
+
+Eight of the setup scripts shell out to `sudo`. Left to themselves each one
+prompts separately, which is both tedious and hard to answer safely — by the
+fifth prompt nobody is reading which script is asking.
+
+`setup-all` takes the credential once, before the first script starts, and
+refreshes it every 60 seconds until the run finishes. That is the same
+credential the first script's own prompt would have cached, for the same
+duration; the refresh only stops it expiring partway through a long run, which
+a Brave build on its own can outlast.
+
+It asks only when it needs to:
+
+- never under `--dry-run`, which is documented as needing no password —
+  `setup-security-hardening` reports UFW as unavailable rather than asking;
+- never when a valid credential is already cached;
+- never when no selected script actually calls `sudo`. A script that only
+  mentions it in a comment does not count.
+
+The refresh stops when the run ends, not when the process exits, so the
+credential is not held open while the menu sits idle between runs in the TUI.
+
+If `sudo` is configured not to cache at all — `timestamp_timeout=0` in
+`/etc/sudoers` — nothing can carry one prompt to the next. `setup-all` says so
+once rather than letting the single prompt look as though it failed to work:
+
+```text
+warn sudo is configured not to cache credentials; each script will prompt
+```
 
 ## Options
 

@@ -148,20 +148,31 @@ make_ufw_fixture() {
   printf '%s' "$dir"
 }
 
+# The resolved drop-in an older omarchy left behind, byte-for-byte.
+make_resolved_dropin() {
+  local dir="$TEST_TMP/resolved.$RANDOM"
+  mkdir -p "$dir"
+  printf '[Resolve]\nDNSStubListenerExtra=172.17.0.1\n' > "$dir/20-docker-dns.conf"
+  printf '%s' "$dir/20-docker-dns.conf"
+}
+
 # A whole machine: stock omarchy, docker installed and running, no podman.
-# Echoes "HOME PKGDB UNITS SUBUID SUBGID UFW" for the caller to read apart.
+# Echoes "HOME PKGDB UNITS SUBUID SUBGID UFW RESOLVED" for the caller to read
+# apart.
 make_machine() {
-  local home pkgdb units subuid subgid ufw
+  local home pkgdb units subuid subgid ufw resolved
   home="$(make_fake_home)"
   pkgdb="$(make_pkg_db docker docker-buildx docker-compose ufw-docker lazydocker)"
   units="$(make_unit_state docker.socket docker.service)"
   subuid="$(make_subid_file)"
   subgid="$(make_subid_file)"
   ufw="$(make_ufw_fixture)"
-  printf '%s %s %s %s %s %s' "$home" "$pkgdb" "$units" "$subuid" "$subgid" "$ufw"
+  resolved="$(make_resolved_dropin)"
+  printf '%s %s %s %s %s %s %s' \
+    "$home" "$pkgdb" "$units" "$subuid" "$subgid" "$ufw" "$resolved"
 }
 
-read -r HOME_DIR PKGDB UNITS SUBUID SUBGID UFWDIR <<< "$(make_machine)"
+read -r HOME_DIR PKGDB UNITS SUBUID SUBGID UFWDIR RESOLVED_DROPIN <<< "$(make_machine)"
 
 podman_setup() {
   env HOME="$HOME_DIR" \
@@ -172,7 +183,7 @@ podman_setup() {
       FAKE_UNIT_STATE="$UNITS" \
       SUBUID_FILE="$SUBUID" \
       SUBGID_FILE="$SUBGID" \
-      UFW_RULES_DIR="$UFWDIR" \
+      UFW_RULES_DIR="$UFWDIR" DOCKER_RESOLVED_DROPIN="$RESOLVED_DROPIN" \
       DOCKER_DATA_DIR="$HOME_DIR/var-lib-docker" \
       "$REPO_ROOT/bin/setup-rootless-podman" "$@" 2>&1
 }
@@ -311,7 +322,7 @@ assert_status 0 $?
 # The script must not prompt to remove that provide, then fail when drop
 # (which matches exact names) leaves it in place.
 
-read -r HOME_DIR PKGDB UNITS SUBUID SUBGID UFWDIR <<< "$(make_machine)"
+read -r HOME_DIR PKGDB UNITS SUBUID SUBGID UFWDIR RESOLVED_DROPIN <<< "$(make_machine)"
 ENV_FILE="$HOME_DIR/.config/environment.d/20-podman.conf"
 rm -f "$PKGDB/docker" "$PKGDB/docker-buildx" "$PKGDB/ufw-docker"
 : > "$PKGDB/podman" "$PKGDB/crun" "$PKGDB/podman-docker"
@@ -335,7 +346,7 @@ assert_status 0 "$migrated_status"
 
 # --- declining the removal -------------------------------------------------
 
-read -r HOME_DIR PKGDB UNITS SUBUID SUBGID UFWDIR <<< "$(make_machine)"
+read -r HOME_DIR PKGDB UNITS SUBUID SUBGID UFWDIR RESOLVED_DROPIN <<< "$(make_machine)"
 ENV_FILE="$HOME_DIR/.config/environment.d/20-podman.conf"
 
 decline_out="$(printf 'n\n' | podman_setup)"
@@ -357,7 +368,7 @@ assert_file "$PKGDB/podman"
 
 # --- --keep-docker ---------------------------------------------------------
 
-read -r HOME_DIR PKGDB UNITS SUBUID SUBGID UFWDIR <<< "$(make_machine)"
+read -r HOME_DIR PKGDB UNITS SUBUID SUBGID UFWDIR RESOLVED_DROPIN <<< "$(make_machine)"
 ENV_FILE="$HOME_DIR/.config/environment.d/20-podman.conf"
 
 keep_out="$(podman_setup --yes --keep-docker)"
@@ -379,7 +390,7 @@ assert_contains "$keep_out" "DOCKER_HOST=unix:///var/run/docker.sock"
 
 # --- --keep-firewall-rules -------------------------------------------------
 
-read -r HOME_DIR PKGDB UNITS SUBUID SUBGID UFWDIR <<< "$(make_machine)"
+read -r HOME_DIR PKGDB UNITS SUBUID SUBGID UFWDIR RESOLVED_DROPIN <<< "$(make_machine)"
 ENV_FILE="$HOME_DIR/.config/environment.d/20-podman.conf"
 
 podman_setup --yes --keep-firewall-rules >/dev/null 2>&1
@@ -390,9 +401,69 @@ assert_no_file "$PKGDB/docker"
 it "--keep-firewall-rules leaves the docker DNS rules in place"
 assert_file_contains "$UFWDIR/user.rules" "172.16.0.0/12"
 
+# --- the resolved drop-in that bound the stub resolver to docker0 ----------
+
+read -r HOME_DIR PKGDB UNITS SUBUID SUBGID UFWDIR RESOLVED_DROPIN <<< "$(make_machine)"
+
+out="$(podman_setup --yes 2>&1)"
+
+it "removes the drop-in that binds the resolver to the docker bridge"
+assert_no_file "$RESOLVED_DROPIN"
+
+it "backs the drop-in up before removing it"
+if compgen -G "$RESOLVED_DROPIN.bak.*" >/dev/null; then
+  pass
+else
+  fail "no backup of $RESOLVED_DROPIN was made"
+fi
+
+it "restarts systemd-resolved so the listener actually goes away"
+assert_contains "$out" "restarted systemd-resolved"
+
+it "a second run reports the drop-in as already gone"
+out="$(podman_setup --yes 2>&1)"
+assert_contains "$out" "already gone"
+
+it "a second run does not restart systemd-resolved again"
+assert_not_contains "$out" "restarted systemd-resolved"
+
+# A file carrying anything else is not ours to delete: an administrator may
+# have added a listener of their own to the same drop-in.
+read -r HOME_DIR PKGDB UNITS SUBUID SUBGID UFWDIR RESOLVED_DROPIN <<< "$(make_machine)"
+printf '[Resolve]\nDNSStubListenerExtra=172.17.0.1\nDNSStubListenerExtra=10.9.9.9\n' \
+  > "$RESOLVED_DROPIN"
+out="$(podman_setup --yes 2>&1)"
+
+it "leaves a drop-in it did not write alone"
+assert_file "$RESOLVED_DROPIN"
+
+it "says why it left the drop-in alone"
+assert_contains "$out" "did not write"
+
+# Reformatting is not modification: the same two settings with different
+# spacing and a comment still compare equal.
+read -r HOME_DIR PKGDB UNITS SUBUID SUBGID UFWDIR RESOLVED_DROPIN <<< "$(make_machine)"
+printf '# docker dns\n[Resolve]\nDNSStubListenerExtra = 172.17.0.1\n\n' > "$RESOLVED_DROPIN"
+
+it "removes a reformatted copy of the same two settings"
+podman_setup --yes >/dev/null 2>&1
+assert_no_file "$RESOLVED_DROPIN"
+
+read -r HOME_DIR PKGDB UNITS SUBUID SUBGID UFWDIR RESOLVED_DROPIN <<< "$(make_machine)"
+
+it "--keep-firewall-rules leaves the resolved drop-in in place too"
+podman_setup --yes --keep-firewall-rules >/dev/null 2>&1
+assert_file "$RESOLVED_DROPIN"
+
+read -r HOME_DIR PKGDB UNITS SUBUID SUBGID UFWDIR RESOLVED_DROPIN <<< "$(make_machine)"
+
+it "--dry-run does not remove the drop-in"
+podman_setup --dry-run --yes >/dev/null 2>&1
+assert_file "$RESOLVED_DROPIN"
+
 # --- subordinate id allocation ---------------------------------------------
 
-read -r HOME_DIR PKGDB UNITS SUBUID SUBGID UFWDIR <<< "$(make_machine)"
+read -r HOME_DIR PKGDB UNITS SUBUID SUBGID UFWDIR RESOLVED_DROPIN <<< "$(make_machine)"
 ENV_FILE="$HOME_DIR/.config/environment.d/20-podman.conf"
 printf 'someone:100000:65536\n' > "$SUBUID"
 printf 'someone:100000:65536\n' > "$SUBGID"
@@ -406,16 +477,16 @@ it "does not overlap the account that was already there"
 assert_file_contains "$SUBUID" "someone:100000:65536"
 
 it "falls back to id(1) when USER is unset, rather than granting a range to nobody"
-read -r HOME_DIR PKGDB UNITS SUBUID SUBGID UFWDIR <<< "$(make_machine)"
+read -r HOME_DIR PKGDB UNITS SUBUID SUBGID UFWDIR RESOLVED_DROPIN <<< "$(make_machine)"
 env -u USER HOME="$HOME_DIR" XDG_RUNTIME_DIR="$HOME_DIR/run" PATH="$STUBS:$PATH" \
     FAKE_PKG_DB="$PKGDB" FAKE_UNIT_STATE="$UNITS" \
-    SUBUID_FILE="$SUBUID" SUBGID_FILE="$SUBGID" UFW_RULES_DIR="$UFWDIR" \
+    SUBUID_FILE="$SUBUID" SUBGID_FILE="$SUBGID" UFW_RULES_DIR="$UFWDIR" DOCKER_RESOLVED_DROPIN="$RESOLVED_DROPIN" \
     "$REPO_ROOT/bin/setup-rootless-podman" --yes >/dev/null 2>&1
 assert_file_contains "$SUBUID" "$(id -un):100000:65536"
 
 # --- migrating an existing rootless store ----------------------------------
 
-read -r HOME_DIR PKGDB UNITS SUBUID SUBGID UFWDIR <<< "$(make_machine)"
+read -r HOME_DIR PKGDB UNITS SUBUID SUBGID UFWDIR RESOLVED_DROPIN <<< "$(make_machine)"
 ENV_FILE="$HOME_DIR/.config/environment.d/20-podman.conf"
 mkdir -p "$HOME_DIR/.local/share/containers/storage"
 MIGRATED="$HOME_DIR/migrated"
@@ -424,19 +495,19 @@ it "migrates an existing rootless store onto the new id mapping"
 env FAKE_MIGRATED="$MIGRATED" HOME="$HOME_DIR" USER=tester \
     XDG_RUNTIME_DIR="$HOME_DIR/run" PATH="$STUBS:$PATH" \
     FAKE_PKG_DB="$PKGDB" FAKE_UNIT_STATE="$UNITS" \
-    SUBUID_FILE="$SUBUID" SUBGID_FILE="$SUBGID" UFW_RULES_DIR="$UFWDIR" \
+    SUBUID_FILE="$SUBUID" SUBGID_FILE="$SUBGID" UFW_RULES_DIR="$UFWDIR" DOCKER_RESOLVED_DROPIN="$RESOLVED_DROPIN" \
     "$REPO_ROOT/bin/setup-rootless-podman" --yes >/dev/null 2>&1
 if [[ -f "$MIGRATED" ]]; then pass; else fail "podman system migrate was not run"; fi
 
 # --- failure modes ---------------------------------------------------------
 
-read -r HOME_DIR PKGDB UNITS SUBUID SUBGID UFWDIR <<< "$(make_machine)"
+read -r HOME_DIR PKGDB UNITS SUBUID SUBGID UFWDIR RESOLVED_DROPIN <<< "$(make_machine)"
 
 it "fails loudly if podman ends up running as root"
 out="$(env FAKE_ROOTLESS=false HOME="$HOME_DIR" USER=tester \
     XDG_RUNTIME_DIR="$HOME_DIR/run" PATH="$STUBS:$PATH" \
     FAKE_PKG_DB="$PKGDB" FAKE_UNIT_STATE="$UNITS" \
-    SUBUID_FILE="$SUBUID" SUBGID_FILE="$SUBGID" UFW_RULES_DIR="$UFWDIR" \
+    SUBUID_FILE="$SUBUID" SUBGID_FILE="$SUBGID" UFW_RULES_DIR="$UFWDIR" DOCKER_RESOLVED_DROPIN="$RESOLVED_DROPIN" \
     "$REPO_ROOT/bin/setup-rootless-podman" --yes 2>&1)" && status=0 || status=$?
 assert_contains "$out" "podman is running as root"
 

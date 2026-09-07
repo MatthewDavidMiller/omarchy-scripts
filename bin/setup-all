@@ -7,9 +7,12 @@
 # script declares its position with an `# order: NN` header comment
 # (default 50); ties break alphabetically.
 #
-# Every script is idempotent, so this is safe to re-run any time. A script
-# declaring `# default: no` remains available through --only but is omitted
-# from ordinary "run everything" invocations.
+# Every script is idempotent, so this is safe to re-run any time, and every
+# script in bin/ runs: there is no opt-in tier. A setup that is disruptive
+# enough to want holding back is held back with --skip, at the call site, where
+# the choice is visible -- not with a header that quietly removes it from the
+# menu and from --list, where the only way to find it again is to already know
+# it exists.
 #
 # Run with no arguments in a terminal it opens a TUI; pass any flag (or pipe
 # it) and it behaves as a plain non-interactive runner.
@@ -111,7 +114,7 @@ selected() {
 }
 
 discover() {
-  local file base default
+  local file base
   shopt -s nullglob
   for file in "$SCRIPT_DIR"/setup-*; do
     base="$(basename -- "$file")"
@@ -122,10 +125,6 @@ discover() {
       continue
     fi
     selected "${base#setup-}" || continue
-    default="$(meta "$file" default yes)"
-    if [[ ${#ONLY[@]} -eq 0 && "$default" == "no" ]]; then
-      continue
-    fi
     printf '%s\t%s\t%s\n' "$(meta "$file" order 50)" "$base" "$(meta "$file" description '')"
   done
   shopt -u nullglob
@@ -160,6 +159,98 @@ if [[ "$LIST_ONLY" == "1" ]]; then
   exit 0
 fi
 
+# --- sudo ------------------------------------------------------------------
+# Eight of the setup scripts shell out to sudo, and left alone each one prompts
+# on its own: sudo's timestamp is what is supposed to carry the credential from
+# one to the next, and any run long enough to outlive timestamp_timeout (a Brave
+# build on its own can) starts asking again partway through. Ask once, here,
+# before the first script starts, and hold the credential open for the run.
+#
+# This does not weaken anything. `sudo -v` caches exactly what typing the
+# password at the first script's prompt would have cached, for exactly as long;
+# the refresh below only stops it expiring mid-run, and it is dropped on the way
+# out.
+SUDO_KEEPALIVE_PID=""
+
+# True when a script actually reaches for sudo. Comment lines are dropped first,
+# so a script that only mentions sudo in its prose does not cause a prompt.
+# One awk over the whole file: a `grep -q` closing the pipe early is one of the
+# two ways `set -euo pipefail` bites here (see docs/conventions.md).
+script_uses_sudo() {
+  awk '
+    /^[[:space:]]*#/ { next }
+    /(^|[^[:alnum:]_-])sudo([[:space:]]|$)/ { found = 1 }
+    END { exit !found }
+  ' "$1"
+}
+
+entries_need_sudo() {
+  local entry _order name _desc
+  for entry in "$@"; do
+    IFS=$'\t' read -r _order name _desc <<< "$entry"
+    if script_uses_sudo "$SCRIPT_DIR/$name"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Called at the end of every run, and again from the EXIT trap as a safety net.
+# The explicit call is the one that matters in the TUI: without it the refresh
+# would keep the credential alive while the menu sits idle between runs.
+stop_sudo_keepalive() {
+  [[ -n "$SUDO_KEEPALIVE_PID" ]] || return 0
+  kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+  # The subshell takes the signal and exits at once, so this reaps rather than
+  # blocks. Its `sleep` is orphaned and runs out its remaining seconds, holding
+  # nothing but /dev/null -- which is why the redirection above matters.
+  wait "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+  SUDO_KEEPALIVE_PID=""
+}
+trap stop_sudo_keepalive EXIT
+
+# warm_sudo <entry>... — one prompt for the whole run, refreshed until it ends.
+warm_sudo() {
+  # --dry-run is documented as never needing a password: setup-security-hardening
+  # reports UFW as unavailable rather than asking. Do not break that here.
+  [[ "$DRY_RUN" == "1" ]] && return 0
+  have sudo || return 0
+  entries_need_sudo "$@" || return 0
+
+  if ! sudo -n -v 2>/dev/null; then
+    log "One password for the whole run"
+    if ! sudo -v; then
+      warn "no sudo credential; scripts that need one will ask, or fail"
+      return 0
+    fi
+  fi
+
+  # Do not assume the timestamp took. A machine with timestamp_timeout=0 caches
+  # nothing, and every script would still prompt -- say so rather than let it
+  # look like this did nothing.
+  if ! sudo -n -v 2>/dev/null; then
+    warn "sudo is configured not to cache credentials; each script will prompt"
+    return 0
+  fi
+
+  # Refresh well inside the default 15 minute timeout, and stop the moment the
+  # run does. The parent check keeps a killed setup-all from leaving this behind.
+  #
+  # Both streams go to /dev/null, and that is load-bearing rather than tidiness:
+  # a background job inherits the caller's stdout, and command substitution waits
+  # for every process holding that pipe open, not just the one it started. A
+  # keep-alive still attached to it would hang `out="$(setup-all ...)"` for the
+  # full sleep -- which is exactly how the tests wedged.
+  local parent=$$
+  {
+    while sleep 60; do
+      kill -0 "$parent" 2>/dev/null || exit 0
+      sudo -n -v 2>/dev/null || exit 0
+    done
+  } >/dev/null 2>&1 &
+  SUDO_KEEPALIVE_PID=$!
+}
+
 # --- run -------------------------------------------------------------------
 
 # run_scripts <entry>... — runs each, prints a summary, returns the failure count.
@@ -167,6 +258,8 @@ run_scripts() {
   local -a results=()
   local failures=0 started=$SECONDS
   local entry _order name desc status result
+
+  warm_sudo "$@"
 
   for entry in "$@"; do
     IFS=$'\t' read -r _order name desc <<< "$entry"
@@ -188,6 +281,8 @@ run_scripts() {
       fi
     fi
   done
+
+  stop_sudo_keepalive
 
   printf '\n'
   log "Summary ($((SECONDS - started))s)"

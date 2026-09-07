@@ -5,14 +5,16 @@ into a second full-time firewall project. UFW remains responsible for the
 simple inbound policy established by `setup-security-hardening`; OpenSnitch
 uses nftables only to identify and control outgoing connections.
 
-The setup is intentionally opt-in because its default policy is immediately
-restrictive:
+`setup-all` runs this like every other script, and its default policy is
+immediately restrictive — enforcement starts at once, and a prompt nobody
+answers within 30 seconds applies the default action. Preview it first, and
+hold it back on a machine you are not ready to answer prompts on:
 
 ```bash
 ./bin/setup-opensnitch --dry-run
 ./bin/setup-opensnitch
-# or
-./bin/setup-all --only opensnitch
+# or, to leave it out of a full run
+./bin/setup-all --skip opensnitch
 ```
 
 The package comes from Arch's signed `extra` repository through
@@ -204,7 +206,12 @@ process-wide; it is safe purely because `omarchy-shared-030`/`031` allow the
 mDNS multicast groups with `precedence: true` and are therefore matched first.
 The pair reads as "mDNS multicast, nothing else, stop asking". Written that way
 a deny is a policy; written alone it is a time bomb, because the day someone
-prunes the allows the deny keeps working and nothing explains what broke. Say
+prunes the allows the deny keeps working and nothing explains what broke. On a
+machine that has run
+[setup-no-discovery-services](setup-no-discovery-services.md) all three rules
+describe a daemon that no longer runs; they are left in place, because a rule
+that cannot fire costs nothing and keeping the shared set identical across
+machines is worth more than pruning three dead entries. Say
 so in the description, and give the deny a number that sorts after everything
 it must not shadow. The denies this machine actually runs are listed under
 [The permanent denies on this machine](#the-permanent-denies-on-this-machine).

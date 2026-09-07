@@ -84,6 +84,7 @@ TARGET_USER="${USER:-$(id -un)}"
 SUBUID_FILE="${SUBUID_FILE:-/etc/subuid}"
 SUBGID_FILE="${SUBGID_FILE:-/etc/subgid}"
 UFW_RULES_DIR="${UFW_RULES_DIR:-/etc/ufw}"
+DOCKER_RESOLVED_DROPIN="${DOCKER_RESOLVED_DROPIN:-/etc/systemd/resolved.conf.d/20-docker-dns.conf}"
 
 # --keep-docker installs and configures podman but leaves docker alone.
 REMOVE_DOCKER=1
@@ -101,13 +102,17 @@ Options:
   -n, --dry-run              Show what would change without changing anything.
   -y, --yes                  Do not prompt for confirmation.
       --keep-docker          Set up Podman only; leave Docker installed.
-      --keep-firewall-rules  Leave omarchy's allow-docker-dns ufw rules alone.
+      --keep-firewall-rules  Leave omarchy's docker DNS exposure alone: both the
+                             allow-docker-dns ufw rules and the resolved drop-in
+                             that binds the stub resolver to the docker bridge.
   -h, --help                 Show this help.
 
 Environment:
   DRY_RUN=1                  Same as --dry-run.
   SUBUID_FILE, SUBGID_FILE   Where the subordinate id ranges live.
   UFW_RULES_DIR              Where ufw keeps user.rules. Default: /etc/ufw.
+  DOCKER_RESOLVED_DROPIN     The resolved drop-in that binds the stub resolver
+                             to the docker bridge.
   DOCKER_DATA_DIR            The daemon's data directory to report on removal.
                              Default: /var/lib/docker.
 USAGE
@@ -360,6 +365,23 @@ remove_docker_packages() {
 # containers reach DNS through pasta in the user's own network namespace, so
 # nothing on the host has to be opened. With docker gone the address does not
 # exist and the rules are inbound allowances for nothing.
+#
+# The ufw rules are only half of it. An older Omarchy also wrote
+# /etc/systemd/resolved.conf.d/20-docker-dns.conf:
+#
+#   [Resolve]
+#   DNSStubListenerExtra=172.17.0.1
+#
+# systemd-resolved freebinds that listener, so it stays in `ss -tlpn` long after
+# docker0 is gone -- an address no interface holds is still bound. Deleting the
+# ufw rules leaves it listening for an address that does not exist yet, which is
+# the part that matters: if any interface later acquires one in 172.17.0.0/16 --
+# a VPN, a bridge, a foreign LAN handing out that range -- the stub resolver is
+# reachable on it with no rule in the way.
+#
+# Nothing recreates the file. `grep -r DNSStubListenerExtra /usr/share/omarchy`
+# finds nothing in Omarchy 4, so it is an orphan from an install that predates
+# the version now on the machine, not something an update will write back.
 DOCKER_DNS_HOST=172.17.0.1
 DOCKER_DNS_SOURCES=(172.16.0.0/12 192.168.0.0/16)
 
@@ -420,6 +442,82 @@ remove_firewall_rules() {
   RULES_CACHE=""
 }
 
+# The file's active content, normalised: comments and blank lines dropped, and
+# the space around `=` removed, so a reformatted copy of the same two settings
+# still compares equal. Reads the whole file -- no early exit -- because a
+# reader that closes the pipe early is one of the two ways `set -euo pipefail`
+# bites here (see docs/conventions.md).
+resolved_dropin_body() {
+  awk '
+    /^[[:space:]]*[#;]/ { next }
+    /^[[:space:]]*$/    { next }
+    {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+      sub(/[[:space:]]*=[[:space:]]*/, "=")
+      print
+    }
+  ' "$1"
+}
+
+# True only for the file Omarchy wrote. Anything else in there -- a second key,
+# a different address, an edit of the user's own -- is not ours to delete.
+resolved_dropin_is_omarchys() {
+  local file="$1" body expected
+
+  [[ -r "$file" ]] || return 1
+  body="$(resolved_dropin_body "$file")"
+  expected="$(printf '[Resolve]\nDNSStubListenerExtra=%s' "$DOCKER_DNS_HOST")"
+  [[ "$body" == "$expected" ]]
+}
+
+remove_resolved_dropin() {
+  local file="$DOCKER_RESOLVED_DROPIN" backup
+
+  if [[ "$REMOVE_FIREWALL_RULES" == "0" ]]; then
+    skip "--keep-firewall-rules: leaving $file in place"
+    return 0
+  fi
+  if [[ ! -e "$file" ]]; then
+    skip "$file is already gone"
+    return 0
+  fi
+  if ! resolved_dropin_is_omarchys "$file"; then
+    warn "$file holds settings this script did not write; leaving it alone"
+    warn "review it by hand: it binds the resolver to an address docker0 no longer provides"
+    return 0
+  fi
+
+  log "Unbinding the stub resolver from the docker bridge"
+  if [[ "$DRY_RUN" == "1" ]]; then
+    printf '%s  dry%s would remove %s and restart systemd-resolved\n' \
+      "$C_DIM" "$C_RESET" "$file"
+    return 0
+  fi
+
+  # Failure-tolerant for the same reason the ufw rules are: by this point the
+  # packages are already gone, and a drop-in that will not delete is a leftover
+  # to report, not a reason to abort a migration that has otherwise succeeded.
+  backup="$file.bak.$(date +%Y%m%d%H%M%S)"
+  if ! sudo cp -a -- "$file" "$backup"; then
+    warn "could not back up $file; leaving it in place"
+    return 0
+  fi
+  ok "backed up $file to $backup"
+  if ! sudo rm -f -- "$file"; then
+    warn "could not remove $file; remove it by hand and restart systemd-resolved"
+    return 0
+  fi
+  ok "removed $file"
+
+  # Only after an actual removal. Restarting resolved drops the DNS cache and
+  # briefly stops answering, which is not worth doing on an already-done run.
+  if sudo systemctl restart systemd-resolved; then
+    ok "restarted systemd-resolved"
+  else
+    warn "systemd-resolved did not restart; the listener persists until it does"
+  fi
+}
+
 configure_docker_removal() {
   if [[ "$REMOVE_DOCKER" == "0" ]]; then
     skip "--keep-docker: leaving Docker installed"
@@ -429,6 +527,7 @@ configure_docker_removal() {
   log "Removing Docker"
   remove_docker_packages || return 0
   remove_firewall_rules
+  remove_resolved_dropin
 
   # Only now: podman-docker Conflicts With docker, so this is the first moment
   # pacman will accept it.

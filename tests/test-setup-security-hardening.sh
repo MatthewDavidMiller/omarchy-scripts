@@ -91,7 +91,19 @@ case "$*" in
   *) echo "unexpected ufw call: $*" >&2; exit 1 ;;
 esac'
 
-stub_bin "$STUBS" sysctl 'exit 0'
+# `sysctl -p FILE` just succeeds; `sysctl -n KEY` answers from FAKE_SYSCTL, a
+# key=value file standing in for the live kernel. That is what makes the
+# readback in verify_sysctl_effective a real check rather than a no-op.
+# shellcheck disable=SC2016
+stub_bin "$STUBS" sysctl '
+if [[ "$1" == "-n" ]]; then
+  [[ -n "${FAKE_SYSCTL:-}" && -f "$FAKE_SYSCTL" ]] || exit 1
+  value="$(sed -n "s/^$2=//p" "$FAKE_SYSCTL")"
+  [[ -n "$value" ]] || exit 1
+  printf "%s\n" "$value"
+  exit 0
+fi
+exit 0'
 stub_bin "$STUBS" arch-audit 'exit 0'
 stub_bin "$STUBS" lsblk 'printf "btrfs\ncrypto_LUKS\nvfat\n"'
 stub_bin "$STUBS" ss 'printf "udp UNCONN 0 0 0.0.0.0:5353 0.0.0.0:*\n"'
@@ -114,9 +126,25 @@ make_machine() {
   units="$TEST_TMP/units.$RANDOM"
   ufw_state="$TEST_TMP/ufw-state.$RANDOM"
   ufw_rules="$TEST_TMP/ufw-rules.$RANDOM"
-  mkdir -p "$root/etc/sysctl.d" "$root/etc/sddm.conf.d" \
+  mkdir -p "$root/etc/sysctl.d" "$root/etc/sddm.conf.d" "$root/etc/pam.d" \
+    "$root/etc/security" "$root/etc/default" "$root/etc/ufw" \
+    "$root/etc/limine-entry-tool.d" "$root/var/lib/systemd/coredump" \
     "$pkgdb" "$units" "$home/.local/share/keyrings" \
     "$home/.local/state/omarchy/indicators"
+
+  # Omarchy's own lockout loosening, as install/config/increase-lockout-limit.sh
+  # leaves it: the module argument in the PAM stack, and the config file it also
+  # overrides. The module argument is what the kernel of the check has to prefer.
+  printf 'deny = 10\n' > "$root/etc/security/faillock.conf"
+  cat > "$root/etc/pam.d/system-auth" <<'EOF'
+auth       required   pam_faillock.so      preauth silent deny=10 unlock_time=120
+auth       [default=die] pam_faillock.so   authfail deny=10 unlock_time=120
+EOF
+
+  # ufw's own sysctl override, and the setting that makes ufw apply it.
+  printf 'IPT_SYSCTL=/etc/ufw/sysctl.conf\n' > "$root/etc/default/ufw"
+  printf 'net/ipv4/conf/all/accept_redirects=0\nnet/ipv4/conf/all/log_martians=0\n' \
+    > "$root/etc/ufw/sysctl.conf"
 
   cat > "$root/etc/pacman.conf" <<'EOF'
 [options]
@@ -184,6 +212,14 @@ run_setup() {
       FAKE_UNIT_STATE="$UNITS" \
       FAKE_UFW_STATE="$UFW_STATE" \
       FAKE_UFW_RULES="$UFW_RULES" \
+      FAKE_SYSCTL="${FAKE_SYSCTL:-}" \
+      FAILLOCK_CONF="$ROOT_DIR/etc/security/faillock.conf" \
+      PAM_SYSTEM_AUTH="$ROOT_DIR/etc/pam.d/system-auth" \
+      COREDUMP_DIR="$ROOT_DIR/var/lib/systemd/coredump" \
+      KERNEL_CMDLINE_DIR="$ROOT_DIR/etc/limine-entry-tool.d" \
+      TPM_DEVICE="$ROOT_DIR/dev-tpm0" \
+      UFW_DEFAULTS="$ROOT_DIR/etc/default/ufw" \
+      UFW_SYSCTL="$ROOT_DIR/etc/ufw/sysctl.conf" \
       "$REPO_ROOT/bin/setup-security-hardening" "$@" 2>&1
 }
 
@@ -282,6 +318,25 @@ assert_contains "$sig_out" "already up to date"
 it "applies only the managed sysctl file"
 assert_contains "$(cat "$STUBS/sysctl.log")" "-p $SYSCTL_FILE"
 
+# The four keys that are only a kernel default today. Pinning them is the whole
+# point: an upstream default change has to show up as drift, not as a silent
+# posture downgrade.
+for key in kernel.dmesg_restrict kernel.yama.ptrace_scope \
+           kernel.perf_event_paranoid kernel.unprivileged_bpf_disabled \
+           dev.tty.ldisc_autoload kernel.kexec_load_disabled; do
+  it "pins $key in the installed drop-in"
+  assert_file_contains "$SYSCTL_FILE" "$key"
+done
+
+# Owned by /etc/ufw/sysctl.conf, which ufw applies after boot. Setting it here
+# would be reverted on the next ufw reload.
+it "does not claim log_martians, which ufw arbitrates"
+assert_not_contains "$(grep -vE '^[[:space:]]*#' "$SYSCTL_FILE")" "log_martians"
+
+# Rootless podman is built on user namespaces.
+it "does not restrict user namespaces, which rootless podman needs"
+assert_not_contains "$(grep -vE '^[[:space:]]*#' "$SYSCTL_FILE")" "userns"
+
 it "removes group/world access from an SSH backup"
 assert_eq "600" "$(stat -c '%a' "$SSH_BACKUP")" "SSH backup mode"
 
@@ -305,6 +360,77 @@ assert_contains "$out" "udp 0.0.0.0:5353"
 
 it "does not print stored keyring secret values"
 assert_not_contains "$out" "DO_NOT_PRINT_THIS_SECRET"
+
+it "records that LocalFileSigLevel is Optional by choice"
+assert_contains "$out" "LocalFileSigLevel is Optional by choice"
+
+it "reports the lockout Omarchy loosened, reading the PAM stack's deny="
+assert_contains "$out" "PAM lockout is 10 failed attempts"
+
+it "reports the kernel cmdline drop-in directory it deliberately does not use"
+assert_contains "$out" "takes update-safe drop-ins"
+
+# --- the sysctl readback ---------------------------------------------------
+# A drop-in is not the same thing as the value the kernel ends up with: ufw
+# applies /etc/ufw/sysctl.conf on every reload, after systemd-sysctl ran.
+
+IFS=$'\t' read -r HOME_DIR ROOT_DIR PKGDB UNITS UFW_STATE UFW_RULES <<< "$(make_machine)"
+PACMAN_CONF="$ROOT_DIR/etc/pacman.conf"
+SYSCTL_FILE="$ROOT_DIR/etc/sysctl.d/60-omarchy-security.conf"
+
+FAKE_SYSCTL="$TEST_TMP/live-sysctl.agree"
+{
+  printf 'kernel.kptr_restrict=1\n'
+  printf 'kernel.dmesg_restrict=1\n'
+  printf 'net.ipv4.conf.all.accept_redirects=0\n'
+} > "$FAKE_SYSCTL"
+export FAKE_SYSCTL
+
+out="$(run_setup --yes)"
+
+it "confirms the sysctls that read back as configured"
+assert_contains "$out" "every security sysctl reads back as configured"
+
+# Now the case that matters: a key the drop-in sets and ufw overrides.
+IFS=$'\t' read -r HOME_DIR ROOT_DIR PKGDB UNITS UFW_STATE UFW_RULES <<< "$(make_machine)"
+PACMAN_CONF="$ROOT_DIR/etc/pacman.conf"
+SYSCTL_FILE="$ROOT_DIR/etc/sysctl.d/60-omarchy-security.conf"
+
+FAKE_SYSCTL="$TEST_TMP/live-sysctl.drift"
+{
+  printf 'kernel.kptr_restrict=1\n'
+  printf 'net.ipv4.conf.all.accept_redirects=1\n'
+} > "$FAKE_SYSCTL"
+export FAKE_SYSCTL
+
+out="$(run_setup --yes 2>&1)"
+status=$?
+
+it "warns when a sysctl does not read back as configured"
+assert_contains "$out" "net.ipv4.conf.all.accept_redirects is 1, not 0"
+
+it "names ufw as the arbiter for a key ufw also sets"
+assert_contains "$out" "ufw applies that after boot"
+
+# A contested key is a posture finding, not a broken install. Failing here
+# would make setup-all report the whole script as failed.
+it "does not fail the run over a contested sysctl"
+assert_status 0 "$status"
+
+it "leaves an uncontested key unattributed to ufw"
+printf 'kernel.dmesg_restrict=0\n' > "$FAKE_SYSCTL"
+out="$(run_setup --yes 2>&1)"
+assert_contains "$out" "kernel.dmesg_restrict is 0, not 1"
+
+unset FAKE_SYSCTL
+
+IFS=$'\t' read -r HOME_DIR ROOT_DIR PKGDB UNITS UFW_STATE UFW_RULES <<< "$(make_machine)"
+PACMAN_CONF="$ROOT_DIR/etc/pacman.conf"
+SYSCTL_FILE="$ROOT_DIR/etc/sysctl.d/60-omarchy-security.conf"
+KEYRING_FILE="$HOME_DIR/.local/share/keyrings/Default_keyring.keyring"
+SSH_BACKUP="$HOME_DIR/.ssh/config.bak.20260819224126"
+PRIVATE_KEY="$HOME_DIR/.ssh/private-key"
+out="$(run_setup --yes)"
 
 # --- idempotence -----------------------------------------------------------
 

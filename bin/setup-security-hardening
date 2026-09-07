@@ -26,6 +26,11 @@ SDDM_CONFIG_DIR="${SDDM_CONFIG_DIR:-/etc/sddm.conf.d}"
 STAY_AWAKE_FILE="${STAY_AWAKE_FILE:-$HOME/.local/state/omarchy/indicators/stay-awake}"
 KEYRING_DIR="${KEYRING_DIR:-$HOME/.local/share/keyrings}"
 SSH_DIR="${SSH_DIR:-$HOME/.ssh}"
+FAILLOCK_CONF="${FAILLOCK_CONF:-/etc/security/faillock.conf}"
+PAM_SYSTEM_AUTH="${PAM_SYSTEM_AUTH:-/etc/pam.d/system-auth}"
+COREDUMP_DIR="${COREDUMP_DIR:-/var/lib/systemd/coredump}"
+KERNEL_CMDLINE_DIR="${KERNEL_CMDLINE_DIR:-/etc/limine-entry-tool.d}"
+TPM_DEVICE="${TPM_DEVICE:-/dev/tpm0}"
 OMARCHY_KEY_FINGERPRINT="${OMARCHY_KEY_FINGERPRINT:-40DFB630FF42BCFFB047046CF0134EE680CAC571}"
 OMARCHY_SIGLEVEL='SigLevel = Required DatabaseOptional TrustedOnly'
 SIGLEVEL_ONLY=0
@@ -54,6 +59,13 @@ Environment (primarily for tests):
   SDDM_CONFIG_DIR         SDDM drop-in directory.
   STAY_AWAKE_FILE         Omarchy stay-awake indicator path.
   KEYRING_DIR, SSH_DIR    Credential directory paths.
+  FAILLOCK_CONF           PAM lockout configuration to report on.
+  PAM_SYSTEM_AUTH         PAM stack to read the effective deny= from.
+  COREDUMP_DIR            systemd-coredump storage to report the size of.
+  KERNEL_CMDLINE_DIR      limine-entry-tool kernel cmdline drop-in directory.
+  TPM_DEVICE              TPM character device probed for the Secure Boot note.
+  UFW_DEFAULTS, UFW_SYSCTL
+                          Where ufw's own sysctl override lives.
   OMARCHY_KEY_FINGERPRINT Expected trusted Omarchy signing key fingerprint.
 USAGE
 }
@@ -288,6 +300,80 @@ render_sysctl() {
   cat -- "$SYSCTL_SOURCE" > "$1"
 }
 
+# The drop-in does not own every key it sets. /etc/default/ufw carries
+# IPT_SYSCTL=/etc/ufw/sysctl.conf, and ufw applies that file on every enable and
+# reload -- after systemd-sysctl ran at boot -- so for any key both files name,
+# ufw is what the kernel ends up with. The values agree today, which is exactly
+# why this has to be checked rather than assumed: a future divergence reverts
+# silently, on a machine that reports the baseline as applied.
+#
+# This reports, it never fails. A key ufw is winning is a posture finding, not a
+# broken install, and setup-all treats a non-zero exit as a failed script.
+UFW_DEFAULTS="${UFW_DEFAULTS:-/etc/default/ufw}"
+UFW_SYSCTL="${UFW_SYSCTL:-/etc/ufw/sysctl.conf}"
+
+# The keys the file asks for, in `key value` pairs. Consumes all of its input:
+# a reader that closes the pipe early is one of the two ways `set -euo pipefail`
+# bites in this repository (see docs/conventions.md).
+sysctl_wanted_settings() {
+  awk -F= '
+    /^[[:space:]]*[#;]/ { next }
+    NF < 2              { next }
+    {
+      key = $1
+      value = $2
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+      if (key != "" && value != "") print key, value
+    }
+  ' "$1"
+}
+
+# ufw only arbitrates a key when it is configured to apply its own sysctl file
+# and that file names the key. Both halves are checked, because IPT_SYSCTL can
+# be commented out or repointed.
+ufw_claims_sysctl_key() {
+  local key="$1" path
+
+  path="$(awk -F= '
+    /^[[:space:]]*#/ { next }
+    $1 ~ /^[[:space:]]*IPT_SYSCTL[[:space:]]*$/ {
+      value = $2
+      gsub(/^[[:space:]]*"?|"?[[:space:]]*$/, "", value)
+      found = value
+    }
+    END { if (found != "") print found }
+  ' "$UFW_DEFAULTS" 2>/dev/null || true)"
+
+  [[ -n "$path" && -r "$path" ]] || return 1
+  # ufw writes its keys with slashes rather than dots.
+  grep -Eq "^[[:space:]]*${key//./[./]}[[:space:]]*=" "$path"
+}
+
+verify_sysctl_effective() {
+  local key wanted live drifted=0
+
+  while read -r key wanted; do
+    live="$(sysctl -n "$key" 2>/dev/null || true)"
+    [[ -n "$live" ]] || continue
+    # sysctl prints multi-field values tab-separated; compare on whitespace.
+    [[ "$(printf '%s' "$live" | tr -s '[:space:]' ' ')" == "$wanted" ]] && continue
+
+    drifted=1
+    if ufw_claims_sysctl_key "$key"; then
+      warn "$key is $live, not $wanted: $UFW_SYSCTL sets it and ufw applies that after boot"
+    else
+      warn "$key is $live, not $wanted"
+    fi
+  done < <(sysctl_wanted_settings "$SYSCTL_FILE")
+
+  if [[ "$drifted" == "0" ]]; then
+    ok "every security sysctl reads back as configured"
+  else
+    warn "some security sysctls did not take effect; see $SYSCTL_FILE for which keys are contested"
+  fi
+}
+
 configure_sysctl() {
   local rendered="$WORK_DIR/security-sysctl.conf" changed=0
   log "Applying conservative kernel and network hardening"
@@ -301,6 +387,12 @@ configure_sysctl() {
     run sudo sysctl -p "$SYSCTL_FILE"
   else
     skip "security sysctls already installed"
+  fi
+
+  # Read back from the live kernel, not from the file just written. Under
+  # --dry-run the file may not exist yet, and there is nothing to verify.
+  if [[ "$DRY_RUN" != "1" && -r "$SYSCTL_FILE" ]]; then
+    verify_sysctl_effective
   fi
 }
 
@@ -366,6 +458,56 @@ service_enabled_or_active() {
     || systemctl is-active --quiet "$1" 2>/dev/null
 }
 
+# The effective faillock deny=, which Omarchy sets in two places:
+# install/config/increase-lockout-limit.sh edits the pam_faillock lines in
+# /etc/pam.d/system-auth directly, and etc-overrides/security-faillock.conf
+# replaces /etc/security/faillock.conf. A module argument beats the config
+# file, so the PAM stack is read first.
+effective_faillock_deny() {
+  local deny=""
+
+  # `sed ... | head -n1` would SIGPIPE sed once head has its line, and pipefail
+  # turns that into a failed assignment that kills the script (see
+  # docs/conventions.md). Let awk read the whole file and print once instead.
+  if [[ -r "$PAM_SYSTEM_AUTH" ]]; then
+    deny="$(awk '
+      !found && /pam_faillock\.so/ && match($0, /[[:space:]]deny=[0-9]+/) {
+        found = substr($0, RSTART + 6, RLENGTH - 6)
+      }
+      END { if (found != "") print found }
+    ' "$PAM_SYSTEM_AUTH")"
+  fi
+  if [[ -z "$deny" && -r "$FAILLOCK_CONF" ]]; then
+    deny="$(awk -F= '
+      !found && /^[[:space:]]*deny[[:space:]]*=/ {
+        value = $2
+        gsub(/[^0-9]/, "", value)
+        if (value != "") found = value
+      }
+      END { if (found != "") print found }
+    ' "$FAILLOCK_CONF")"
+  fi
+
+  [[ -n "$deny" ]] || return 1
+  printf '%s' "$deny"
+}
+
+# Secure Boot is worth a different sentence on a machine that is one enrolment
+# away from it than on one that would need its whole boot path rebuilt. A TPM
+# plus a measured UKI means the pieces are already in place.
+secure_boot_is_reachable() {
+  local boot_status
+
+  [[ -e "$TPM_DEVICE" ]] || return 1
+  have bootctl || return 1
+  # Captured, not piped into `grep -q`: grep would close the pipe on its first
+  # match, bootctl would take SIGPIPE, and pipefail would report the whole
+  # pipeline as failed. That is the second trap in docs/conventions.md, and it
+  # is a race, so it reads as an intermittently missing report line.
+  boot_status="$(bootctl status 2>/dev/null || true)"
+  grep -Eq 'Measured UKI:[[:space:]]+yes' <<< "$boot_status"
+}
+
 security_report() {
   local firewall_report groups listener_data="" public_listeners="" service
   log "Security posture (report only)"
@@ -409,6 +551,25 @@ security_report() {
   keyring_never_locks \
     && report_item WARN "the default desktop keyring is configured never to lock"
 
+  # A recorded decision, not an omission: the vetted Brave recipe in this
+  # repository installs a package it built locally, and requiring a signature on
+  # local files would block it. Everything from a repository is still gated by
+  # SigLevel = Required.
+  if grep -Eq '^[[:space:]]*LocalFileSigLevel[[:space:]]*=.*Optional' "$PACMAN_CONF" 2>/dev/null; then
+    report_item INFO "LocalFileSigLevel is Optional by choice, so \`pacman -U\` accepts an unsigned local package"
+  fi
+
+  # Omarchy loosens the console lockout on purpose (install/config/
+  # increase-lockout-limit.sh, and etc-overrides/security-faillock.conf). It
+  # owns both files, so tightening them here would be undone by the next
+  # update. Report the effective value and leave it.
+  local deny
+  if deny="$(effective_faillock_deny)"; then
+    if (( deny > 3 )); then
+      report_item INFO "PAM lockout is $deny failed attempts, loosened from the default of 3 by Omarchy"
+    fi
+  fi
+
   groups=" $(id -nG) "
   [[ "$groups" == *' docker '* ]] \
     && report_item WARN "docker-group membership grants root-equivalent daemon access"
@@ -431,6 +592,18 @@ security_report() {
     service_enabled_or_active "$service" \
       && report_item INFO "$service remains available by choice"
   done
+
+  # fs.suid_dumpable is 2 on Arch so systemd-coredump can capture privileged
+  # crashes, which the crash-diagnosis workflow depends on. The cost is that
+  # dumps of privileged processes sit on disk and can hold anything those
+  # processes had in memory. Report the size; deleting them is the user's call.
+  if [[ -d "$COREDUMP_DIR" ]]; then
+    local dump_size
+    dump_size="$(du -sh "$COREDUMP_DIR" 2>/dev/null | awk '{ print $1 }' || true)"
+    if [[ -n "$dump_size" && "$dump_size" != "0" ]]; then
+      report_item INFO "$COREDUMP_DIR holds $dump_size of core dumps, which may contain secrets from crashed processes"
+    fi
+  fi
 
   if [[ -r /sys/kernel/security/lsm ]] \
       && grep -qw apparmor /sys/kernel/security/lsm; then
@@ -458,9 +631,25 @@ security_report() {
         | sed $'s/\033\[[0-9;]*m//g' \
         | grep -Eq 'UEFI secure boot:[[:space:]]+Enabled'; then
       report_item ok "UEFI Secure Boot is enabled"
+    elif secure_boot_is_reachable; then
+      report_item INFO "UEFI Secure Boot is not enabled, but this machine has a TPM and already boots a measured UKI; sbctl (Arch extra) is the enrolment path"
     else
       report_item INFO "UEFI Secure Boot is not enabled"
     fi
+  fi
+
+  # Kernel parameters have an update-safe home that this repository does not
+  # use. limine-entry-tool reads /etc/limine-entry-tool.d/*.conf and appends
+  # each KERNEL_CMDLINE[default]+= to the command line; Omarchy writes its own
+  # named files there for hardware quirks (install/hardware/intel/fred.sh,
+  # apple/fix-t2.sh, asus/*) and its migrations only ever touch
+  # omarchy-defaults.conf, so a file of another name survives an update.
+  #
+  # Nothing is installed there deliberately: AppArmor, kernel lockdown, and the
+  # allocator hardening flags are all boot-sensitive and out of this profile.
+  # Report that the door exists so the choice stays visible.
+  if [[ -d "$KERNEL_CMDLINE_DIR" ]]; then
+    report_item INFO "kernel cmdline hardening is available but not applied; $KERNEL_CMDLINE_DIR takes update-safe drop-ins"
   fi
 }
 

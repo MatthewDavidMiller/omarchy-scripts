@@ -69,7 +69,9 @@ for path in \
   tests/test-setup-no-aur-updates.sh \
   bin/setup-desktop-cpu-priority docs/setup-desktop-cpu-priority.md \
   tests/test-setup-desktop-cpu-priority.sh \
-  tests/test-export-opensnitch-rules.sh tests/test-opensnitch-rulectl.sh
+  tests/test-export-opensnitch-rules.sh tests/test-opensnitch-rulectl.sh \
+  bin/setup-no-discovery-services docs/setup-no-discovery-services.md \
+  tests/test-setup-no-discovery-services.sh
 do
   it "keeps $path tracked"
   if ignored "$path"; then fail "$path must not be ignored"; else pass; fi

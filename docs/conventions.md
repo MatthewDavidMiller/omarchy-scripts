@@ -30,9 +30,11 @@ means for linting.
   # description: Shown by setup-all --list
   ```
 
-  A disruptive or specialized setup may declare `# default: no`. It remains
-  runnable directly and through `setup-all --only <name>`, but is omitted from
-  ordinary run-everything discovery.
+  There is no opt-in tier: every script in `bin/` is discovered, listed, and
+  run. A setup disruptive enough to want holding back is held back with
+  `setup-all --skip <name>`, where the choice is visible. Say so in the
+  script's own header comment and in its doc page instead — a reader deciding
+  whether to skip it needs to find it first.
 
   `order` defaults to 50. See [setup-all.md](setup-all.md) for the ranges.
   Keep `description` short and comma-free — it is a menu label, and `setup-all`
