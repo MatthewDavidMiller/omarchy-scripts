@@ -1,0 +1,39 @@
+{
+  "action": "allow",
+  "created": "2026-09-07T00:00:00Z",
+  "description": "Rootless container egress to the OCI registries that ansible_playbooks' image review reads. scripts/promote_artifacts.py runs skopeo, cosign and trivy from pinned containers rather than host binaries, so resolving a digest, verifying a signature and scanning an image all reach the registry from inside a container -- attributed to pasta, exactly as 061 and 080-083 are, and never to podman. 083 already covers ghcr.io for trivy's vulnerability database; this rule is what lets the same tools read the images themselves from Docker Hub, public.ecr.aws and quay.io. As with every pasta rule, this grants any rootless container access to these registries, not just this repository's: that is the honest cost of the one shared helper, and keeping it to registry hosts is what bounds it. Scoped to 443 and to named hosts so a review that starts fetching from somewhere else prompts.",
+  "duration": "always",
+  "enabled": true,
+  "name": "087-omarchy-allow-container-egress-to-oci-registries",
+  "operator": {
+    "data": "",
+    "list": [
+      {
+        "data": "^/usr/bin/(passt|pasta)(\\.avx2)?$",
+        "list": null,
+        "operand": "process.path",
+        "sensitive": false,
+        "type": "regexp"
+      },
+      {
+        "data": "^(public\\.ecr\\.aws|d2glxqk2uabbnd\\.cloudfront\\.net|quay\\.io|cdn[0-9]*\\.quay\\.io|ghcr\\.io|pkg-containers\\.githubusercontent\\.com|(registry-1|auth|index)\\.docker\\.io|production\\.(cloudflare|cloudfront)\\.docker\\.com)$",
+        "list": null,
+        "operand": "dest.host",
+        "sensitive": false,
+        "type": "regexp"
+      },
+      {
+        "data": "443",
+        "list": null,
+        "operand": "dest.port",
+        "sensitive": false,
+        "type": "simple"
+      }
+    ],
+    "operand": "list",
+    "sensitive": false,
+    "type": "list"
+  },
+  "precedence": true,
+  "updated": "2026-09-07T00:00:00Z"
+}

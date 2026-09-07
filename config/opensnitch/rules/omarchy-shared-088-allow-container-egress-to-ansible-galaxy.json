@@ -1,0 +1,39 @@
+{
+  "action": "allow",
+  "description": "Rootless container egress to Ansible Galaxy, for the ansible-galaxy collection install step in ansible_playbooks' tools/toolbox/Dockerfile. That repository's gates all run inside a toolbox image which bakes in the collections pinned in collections/requirements.yml, so this is reached during an image build rather than during a playbook run -- pasta again, like every other container rule here, and only while the toolbox is being rebuilt. A rebuild is triggered by any change to the Dockerfile, the Python pins, the collection pins, or the Alpine base digest, so this fires rarely and always at the moment someone is waiting on a gate. Both hosts are required and the second one is not guessable: an artifact request to galaxy.ansible.com answers 302 to a pulp content path on galaxy.ansible.com itself, and only that URL redirects again to the S3 bucket the tarballs actually live in. A rule naming the first host alone passes every probe -- the API answers, a HEAD returns its redirect -- and then hangs the real client with no output at all, because ansible-galaxy prints nothing while a connection is being dropped. The bucket is pinned by name, with the dualstack and plain spellings alternated the way 060 alternates Docker Hub's two CDN names, rather than opening amazonaws.com to every container.",
+  "created": "2026-09-07T00:00:00Z",
+  "duration": "always",
+  "enabled": true,
+  "name": "088-omarchy-allow-container-egress-to-ansible-galaxy",
+  "operator": {
+    "data": "",
+    "list": [
+      {
+        "data": "^/usr/bin/(passt|pasta)(\\.avx2)?$",
+        "list": null,
+        "operand": "process.path",
+        "sensitive": false,
+        "type": "regexp"
+      },
+      {
+        "data": "^(galaxy\\.ansible\\.com|ansible-galaxy-ng\\.s3(\\.dualstack)?\\.us-east-1\\.amazonaws\\.com)$",
+        "list": null,
+        "operand": "dest.host",
+        "sensitive": false,
+        "type": "regexp"
+      },
+      {
+        "data": "443",
+        "list": null,
+        "operand": "dest.port",
+        "sensitive": false,
+        "type": "simple"
+      }
+    ],
+    "operand": "list",
+    "sensitive": false,
+    "type": "list"
+  },
+  "precedence": true,
+  "updated": "2026-09-07T00:00:00Z"
+}

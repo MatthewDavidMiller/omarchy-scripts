@@ -79,7 +79,7 @@ this" and "this repository's own workflow needs it" stays visible:
 | `000`–`039` | System essentials | localhost v4/v6; `systemd-resolved` on 53/853; `systemd-timesyncd` on UDP 123; `NetworkManager` to `ping.archlinux.org:80`; `avahi-daemon` to the mDNS multicast groups on UDP 5353 |
 | `040`–`059` | Scheduled system maintenance | `fwupd` to `fwupd.org`/`cdn.fwupd.org` for LVFS firmware metadata and images |
 | `060`–`079` | This repository's own tooling | `podman`/`docker` to Docker Hub for the `bin/lint` base image; rootless container egress to `dl-cdn.alpinelinux.org`; `curl` to the four hosts `packages/brave` downloads from |
-| `080`–`099` | Other projects' build toolchains, and the tool managers that install them | rootless container egress to the Rust distribution and crate registry, the Python package index, GitHub release assets and the RustSec advisory database, and the registries `trivy` pulls its vulnerability database from; `mise` to its version manifest, GitHub releases, and the sigstore TUF root |
+| `080`–`099` | Other projects' build toolchains, and the tool managers that install them | rootless container egress to the Rust distribution and crate registry, the Python package index, GitHub release assets and the RustSec advisory database, and the registries `trivy` pulls its vulnerability database from; `mise` to its version manifest, GitHub releases, and the sigstore TUF root; `podman` and rootless container egress to the OCI registries `ansible_playbooks` pins its service and review-tool images to, and container egress to Ansible Galaxy for its toolbox build |
 
 The essentials keep login-time local IPC, name resolution, clock
 synchronization, connectivity detection, and `.local` discovery working without
@@ -151,6 +151,37 @@ the named rule says so. Denying that host does not harden mise, it blinds it.
 reusing the `[a-z0-9-]+\.githubusercontent\.com` alternation that `062`, `082`
 and `122` need. If GitHub ever serves an asset from a different subdomain the
 result is a prompt, which is the trade this baseline prefers.
+
+`086`–`088` cover `ansible_playbooks`, which needs the same destinations from
+two different processes, and that split is the whole point of having two rules
+rather than one. `086` is the host's `podman` pulling the service images pinned
+in that repository's lock files. `087` is the *same registries* reached from
+inside a container, because its image review runs `skopeo`, `cosign` and
+`trivy` from pinned containers instead of host binaries — so a digest
+resolution or a scan is pasta traffic, exactly like `061` and `080`–`083`, and
+a rule written only for `podman` covers the pull while leaving the review
+denied. `088` is Ansible Galaxy, reached while the toolbox image builds.
+
+Three things about that set are worth reading before copying it:
+
+- **A registry is two hosts, not one.** Each one answers the manifest itself
+  and redirects the blobs to a CDN, so a rule naming only the registry fails
+  *after* "Copying blob" with the manifest already written — which looks far
+  more like a broken mirror than a policy gap. `ghcr.io` hands off to
+  `pkg-containers.githubusercontent.com`, `quay.io` to its own `cdn` hosts, and
+  `public.ecr.aws` to a CloudFront distribution.
+- **That CloudFront distribution is pinned by name.** `d2glxqk2uabbnd.cloudfront.net`
+  was observed serving the traefik, redis and trivy repositories alike, so it is
+  ECR Public's shared blob distribution rather than a per-repository address. It
+  is named exactly rather than as an alternation over `cloudfront.net`, for the
+  same reason `083` omits `storage.googleapis.com`: that alternation would open
+  every site behind the CDN to `podman`. If AWS moves it, the symptom is a pull
+  that stalls after "Copying blob" and the fix is this one hostname.
+- **The failure mode is silence, not an error.** A denied pull does not report a
+  refusal. The daemon drops the packets, `podman` retries three times and exits
+  on `i/o timeout`, and every layer above it — a `make test-full` run, a
+  container image review — reports a network fault. The first machine to hit
+  this spent its debugging effort on the registry rather than on the firewall.
 
 Something that reaches the network on a timer rather than when you ask it to
 needs a permanent rule or it will prompt when nobody is at the machine.

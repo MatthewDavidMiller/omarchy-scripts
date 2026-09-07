@@ -1,0 +1,39 @@
+{
+  "action": "allow",
+  "created": "2026-09-07T00:00:00Z",
+  "description": "podman and the docker CLI shim pulling the digest-pinned service and tool images that ansible_playbooks holds in artifacts/containers.lock.yml and artifacts/test_images.lock.yml. 060 covers Docker Hub only, so without this every image that repository pins outside Docker Hub prompts: public.ecr.aws for traefik, postgres, redis, nextcloud, semaphore and trivy, ghcr.io for paperless, vaultwarden and cosign, quay.io for skopeo. Each registry answers the manifest itself and then redirects the blobs to a CDN, so the CDN hosts are part of one pull and a rule without them fails halfway with the manifest already written. ghcr.io uses pkg-containers.githubusercontent.com, quay.io its own cdn hosts, and public.ecr.aws one CloudFront distribution -- d2glxqk2uabbnd.cloudfront.net, observed serving the traefik, redis and trivy repositories alike, which is why it is pinned by name rather than as an alternation over cloudfront.net that would open every site behind that CDN. If AWS ever moves it, the symptom is a pull that stalls after 'Copying blob' and the fix is this one hostname. Left out entirely, the symptom is not an error at all: the daemon drops the packets, the pull retries three times and dies on 'i/o timeout', which reads as a network fault rather than a policy gap. Scoped to these registries so a lock file that starts pointing somewhere new still prompts.",
+  "duration": "always",
+  "enabled": true,
+  "name": "086-omarchy-allow-podman-service-image-pulls",
+  "operator": {
+    "data": "",
+    "list": [
+      {
+        "data": "^/usr/bin/(podman|docker)$",
+        "list": null,
+        "operand": "process.path",
+        "sensitive": false,
+        "type": "regexp"
+      },
+      {
+        "data": "^(public\\.ecr\\.aws|d2glxqk2uabbnd\\.cloudfront\\.net|quay\\.io|cdn[0-9]*\\.quay\\.io|ghcr\\.io|pkg-containers\\.githubusercontent\\.com)$",
+        "list": null,
+        "operand": "dest.host",
+        "sensitive": false,
+        "type": "regexp"
+      },
+      {
+        "data": "443",
+        "list": null,
+        "operand": "dest.port",
+        "sensitive": false,
+        "type": "simple"
+      }
+    ],
+    "operand": "list",
+    "sensitive": false,
+    "type": "list"
+  },
+  "precedence": true,
+  "updated": "2026-09-07T00:00:00Z"
+}
