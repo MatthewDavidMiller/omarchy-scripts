@@ -28,6 +28,7 @@ PLYMOUTH_TEXT="#ffffff"
 PLYMOUTH_INSTALLED_LOGO="${PLYMOUTH_INSTALLED_LOGO:-/usr/share/plymouth/themes/omarchy/logo.png}"
 ACTIVATE=1
 FORCE=0
+PLYMOUTH_ONLY=0
 
 usage() {
   cat <<'USAGE'
@@ -37,15 +38,18 @@ Scales assets/cat-wallpaper.png into desktop and Plymouth images, writes them
 to user-owned Omarchy directories, and applies both.
 
 Options:
-  --size WxH      Canvas size (default 3840x2160).
-  --no-activate   Generate both images without applying either one.
-  --force         Re-render even if the existing wallpaper already matches.
-  -n, --dry-run   Show what would change without changing anything.
-  -y, --yes       Accepted for setup-all compatibility.
-  -h, --help      Show this help.
+  --size WxH        Canvas size (default 3840x2160).
+  --no-activate     Generate both images without applying either one.
+  --plymouth-only   Only re-apply the Plymouth unlock image. Used by the
+                    post-update hook, because an omarchy-settings upgrade
+                    restores the packaged logo it owns.
+  --force           Re-render even if the existing wallpaper already matches.
+  -n, --dry-run     Show what would change without changing anything.
+  -y, --yes         Accepted for setup-all compatibility.
+  -h, --help        Show this help.
 
 Environment:
-  DRY_RUN=1       Same as --dry-run.
+  DRY_RUN=1         Same as --dry-run.
 USAGE
 }
 
@@ -53,6 +57,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --size)        SIZE="${2:-}"; shift ;;
     --no-activate) ACTIVATE=0 ;;
+    --plymouth-only) PLYMOUTH_ONLY=1 ;;
     --force)       FORCE=1 ;;
     -n|--dry-run)  DRY_RUN=1 ;;
     -y|--yes)      ASSUME_YES=1 ;;
@@ -63,6 +68,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$SIZE" =~ ^[0-9]+x[0-9]+$ ]] || die "Invalid --size: $SIZE (expected WxH)"
+if [[ "$PLYMOUTH_ONLY" == "1" && "$ACTIVATE" == "0" ]]; then
+  die "--plymouth-only and --no-activate contradict each other"
+fi
 
 require_not_root
 require_cmd omarchy
@@ -83,6 +91,16 @@ target_dir="$HOME/.config/omarchy/backgrounds/$theme_name"
 target="$target_dir/$BACKGROUND_NAME"
 unlock_dir="$HOME/.config/omarchy/plymouth/$theme_name"
 unlock_target="$unlock_dir/$UNLOCK_NAME"
+
+# Both hooks re-assert something that gets rewound. theme-set re-renders into
+# the newly selected theme's background directory; post-update re-applies the
+# Plymouth logo, which an omarchy-settings upgrade restores to the packaged one.
+install_hooks() {
+  if [[ "$PLYMOUTH_ONLY" != "1" ]]; then
+    install_setup_hook theme-set cat-background
+  fi
+  install_setup_hook post-update cat-background
+}
 
 render_wallpaper() {
   local output="$1"
@@ -110,25 +128,6 @@ render_unlock() {
     "PNG32:$output"
 }
 
-if [[ "$DRY_RUN" == "1" ]]; then
-  printf '%s  dry%s would render %s at %s from %s\n' \
-    "$C_DIM" "$C_RESET" "$target" "$SIZE" "$(basename "$SOURCE_IMAGE")"
-  printf '%s  dry%s would render %s at %s from %s\n' \
-    "$C_DIM" "$C_RESET" "$unlock_target" "$UNLOCK_SIZE" "$(basename "$SOURCE_IMAGE")"
-  [[ "$ACTIVATE" == "1" ]] && printf '%s  dry%s omarchy theme bg set %s\n' "$C_DIM" "$C_RESET" "$target"
-  [[ "$ACTIVATE" == "1" ]] && printf '%s  dry%s omarchy plymouth set %s %s %s\n' \
-    "$C_DIM" "$C_RESET" "$BACKGROUND" "$PLYMOUTH_TEXT" "$unlock_target"
-  install_setup_hook theme-set cat-background
-  exit 0
-fi
-
-tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
-
-log "Rendering $theme_name cat wallpaper at $SIZE"
-render_wallpaper "$tmp/$BACKGROUND_NAME"
-render_unlock "$tmp/$UNLOCK_NAME"
-
 install_render() {
   local rendered="$1" destination="$2"
   if [[ "$FORCE" != "1" ]] && [[ -f "$destination" ]] && cmp -s "$rendered" "$destination"; then
@@ -141,6 +140,57 @@ install_render() {
   mv "$rendered" "$destination"
   ok "wrote $destination"
 }
+
+# The packaged Plymouth theme is owned by omarchy-settings, so every upgrade of
+# that package restores the stock logo and the next initramfs build bakes it
+# into the UKI. Compare against what is installed rather than against what we
+# rendered last time: only a real difference is worth a full UKI rebuild.
+apply_plymouth() {
+  if [[ "$FORCE" != "1" ]] && [[ -f "$PLYMOUTH_INSTALLED_LOGO" ]] && cmp -s "$unlock_target" "$PLYMOUTH_INSTALLED_LOGO"; then
+    skip "Plymouth unlock image already up to date"
+    return 0
+  fi
+  log "Setting the Plymouth disk-encryption unlock image"
+  run omarchy plymouth set "$BACKGROUND" "$PLYMOUTH_TEXT" "$unlock_target"
+  ok "updated Plymouth unlock image"
+}
+
+if [[ "$DRY_RUN" == "1" ]]; then
+  if [[ "$PLYMOUTH_ONLY" != "1" ]]; then
+    printf '%s  dry%s would render %s at %s from %s\n' \
+      "$C_DIM" "$C_RESET" "$target" "$SIZE" "$(basename "$SOURCE_IMAGE")"
+  fi
+  printf '%s  dry%s would render %s at %s from %s\n' \
+    "$C_DIM" "$C_RESET" "$unlock_target" "$UNLOCK_SIZE" "$(basename "$SOURCE_IMAGE")"
+  if [[ "$ACTIVATE" == "1" ]]; then
+    if [[ "$PLYMOUTH_ONLY" != "1" ]]; then
+      printf '%s  dry%s omarchy theme bg set %s\n' "$C_DIM" "$C_RESET" "$target"
+    fi
+    printf '%s  dry%s omarchy plymouth set %s %s %s\n' \
+      "$C_DIM" "$C_RESET" "$BACKGROUND" "$PLYMOUTH_TEXT" "$unlock_target"
+  fi
+  install_hooks
+  exit 0
+fi
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+# The post-update path. An update never touches the wallpaper -- that lives
+# under ~/.config -- so re-rendering it, re-setting it, and re-caching the
+# switcher thumbnail would all be work an update does not need.
+if [[ "$PLYMOUTH_ONLY" == "1" ]]; then
+  log "Rendering the $theme_name cat unlock image at $UNLOCK_SIZE"
+  render_unlock "$tmp/$UNLOCK_NAME"
+  install_render "$tmp/$UNLOCK_NAME" "$unlock_target"
+  apply_plymouth
+  install_hooks
+  exit 0
+fi
+
+log "Rendering $theme_name cat wallpaper at $SIZE"
+render_wallpaper "$tmp/$BACKGROUND_NAME"
+render_unlock "$tmp/$UNLOCK_NAME"
 
 install_render "$tmp/$BACKGROUND_NAME" "$target"
 install_render "$tmp/$UNLOCK_NAME" "$unlock_target"
@@ -160,14 +210,8 @@ if [[ "$ACTIVATE" == "1" ]]; then
   run omarchy shell background set "$target"
   ok "refreshed live background"
 
-  if [[ "$FORCE" != "1" ]] && [[ -f "$PLYMOUTH_INSTALLED_LOGO" ]] && cmp -s "$unlock_target" "$PLYMOUTH_INSTALLED_LOGO"; then
-    skip "Plymouth unlock image already up to date"
-  else
-    log "Setting the Plymouth disk-encryption unlock image"
-    run omarchy plymouth set "$BACKGROUND" "$PLYMOUTH_TEXT" "$unlock_target"
-    ok "updated Plymouth unlock image"
-  fi
+  apply_plymouth
 fi
 
 run omarchy theme bg cache || true
-install_setup_hook theme-set cat-background
+install_hooks

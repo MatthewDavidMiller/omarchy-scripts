@@ -53,7 +53,9 @@ for path in \
   config/hooks/post-update.d/no-chromium-extensions \
   config/hooks/post-update.d/no-background-network \
   config/hooks/post-update.d/brave-flags \
+  config/hooks/post-update.d/cat-background \
   config/hooks/theme-set.d/cat-background \
+  config/systemd/resolved.conf.d/99-omarchy-scripts-no-docker-dns.conf \
   config/hooks/pre-refresh-pacman.d/omarchy-siglevel \
   tests/test-omarchy.sh \
   githooks/pre-commit docker/lint.Dockerfile \

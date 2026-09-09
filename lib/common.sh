@@ -66,3 +66,30 @@ write_file() {
   printf '%s\n' "$content" > "$path"
   ok "wrote $path"
 }
+
+# install_root_file <source> <destination> — sudo-install a root-owned file,
+# backing up whatever was there. Returns 0 when it changed something (so the
+# caller can reload the consumer) and 1 when the destination already matched.
+# Respects DRY_RUN.
+install_root_file() {
+  local source="$1" destination="$2" backup
+
+  if [[ -f "$destination" ]] && cmp -s "$source" "$destination"; then
+    skip "$destination already up to date"
+    return 1
+  fi
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    printf '%s  dry%s would write %s\n' "$C_DIM" "$C_RESET" "$destination"
+    return 0
+  fi
+
+  if [[ -f "$destination" ]]; then
+    backup="$destination.bak.$(date +%Y%m%d%H%M%S)"
+    sudo cp -a -- "$destination" "$backup"
+    ok "backed up $destination to $backup"
+  fi
+
+  sudo install -D -m 0644 -- "$source" "$destination"
+  ok "wrote $destination"
+}

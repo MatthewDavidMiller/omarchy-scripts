@@ -95,31 +95,6 @@ trap cleanup EXIT
 
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/omarchy-security.XXXXXX")"
 
-# install_root_file <source> <destination> — compare, back up, and install a
-# root-owned config. Tests point destination at a fixture and stub sudo.
-install_root_file() {
-  local source="$1" destination="$2" backup
-
-  if [[ -f "$destination" ]] && cmp -s "$source" "$destination"; then
-    skip "$destination already up to date"
-    return 1
-  fi
-
-  if [[ "$DRY_RUN" == "1" ]]; then
-    printf '%s  dry%s would write %s\n' "$C_DIM" "$C_RESET" "$destination"
-    return 0
-  fi
-
-  if [[ -f "$destination" ]]; then
-    backup="$destination.bak.$(date +%Y%m%d%H%M%S)"
-    sudo cp -a -- "$destination" "$backup"
-    ok "backed up $destination to $backup"
-  fi
-
-  sudo install -D -m 0644 -- "$source" "$destination"
-  ok "wrote $destination"
-}
-
 # ---------------------------------------------------------------------------
 # 1. Require trusted signatures from the Omarchy package repository
 # ---------------------------------------------------------------------------

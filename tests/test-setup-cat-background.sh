@@ -106,6 +106,9 @@ assert_file_contains "$STUBS/omarchy.log" "plymouth set #77797c #ffffff $UNLOCK_
 it "installs a theme-set hook so a later theme switch re-applies the wallpaper"
 assert_file "$FAKE_HOME/.config/omarchy/hooks/theme-set.d/cat-background"
 
+it "installs a post-update hook so an omarchy-settings upgrade cannot keep the stock logo"
+assert_file "$FAKE_HOME/.config/omarchy/hooks/post-update.d/cat-background"
+
 # --- idempotence -----------------------------------------------------------
 
 before="$(grep -c '^theme bg set' "$STUBS/omarchy.log")"
@@ -138,6 +141,46 @@ assert_eq "1" "$(find "$(dirname "$TARGET")" -name 'pixel-cat.png.bak.*' | wc -l
 
 it "reloads an active wallpaper when its bytes change at the same path"
 assert_eq "$((after + 1))" "$(grep -c '^theme bg set' "$STUBS/omarchy.log")" "bg set calls"
+
+# --- --plymouth-only, the post-update path ---------------------------------
+
+# An omarchy-settings upgrade restores the packaged logo it owns. Stand that up
+# by hand: the rendered unlock image is still current, only the installed one
+# has been reverted.
+printf 'stock-omarchy-logo' > "$PLYMOUTH_INSTALLED_LOGO"
+: > "$STUBS/omarchy.log"
+cat_bg --plymouth-only --yes >/dev/null
+
+it "--plymouth-only re-applies the reverted Plymouth image"
+assert_file_contains "$STUBS/omarchy.log" "plymouth set #77797c #ffffff $UNLOCK_TARGET"
+
+it "--plymouth-only does not touch the wallpaper"
+assert_eq "0" "$(grep -c '^theme bg set' "$STUBS/omarchy.log" || true)" "bg set calls"
+
+it "--plymouth-only does not bounce the live shell background"
+assert_eq "0" "$(grep -c '^shell background' "$STUBS/omarchy.log" || true)" "shell background calls"
+
+it "--plymouth-only does not re-cache the switcher thumbnail"
+assert_eq "0" "$(grep -c '^theme bg cache' "$STUBS/omarchy.log" || true)" "bg cache calls"
+
+it "--plymouth-only keeps the post-update hook installed"
+assert_file "$FAKE_HOME/.config/omarchy/hooks/post-update.d/cat-background"
+
+it "--plymouth-only does not rebuild Plymouth when the installed image matches"
+: > "$STUBS/omarchy.log"
+cat_bg --plymouth-only --yes >/dev/null
+assert_eq "0" "$(grep -c '^plymouth set' "$STUBS/omarchy.log" || true)" "Plymouth set calls"
+
+it "--plymouth-only refuses to combine with --no-activate"
+cat_bg --plymouth-only --no-activate >/dev/null 2>&1
+assert_status 1 $?
+
+it "--dry-run --plymouth-only previews only the Plymouth work"
+dry_plymouth="$(cat_bg --dry-run --plymouth-only --yes)"
+assert_contains "$dry_plymouth" "pixel-cat-unlock.png"
+
+it "--dry-run --plymouth-only does not name the wallpaper"
+assert_not_contains "$dry_plymouth" "theme bg set"
 
 # --- flags -----------------------------------------------------------------
 

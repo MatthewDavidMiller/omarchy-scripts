@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Re-apply the cat Plymouth logo an omarchy-settings upgrade reverts.
+set -euo pipefail
+pointer="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-scripts/repo"
+[[ -f "$pointer" ]] || { printf 'omarchy-scripts: repo pointer missing (%s)\n' "$pointer" >&2; exit 1; }
+root="$(cat -- "$pointer")"
+[[ -x "$root/bin/setup-cat-background" ]] \
+  || { printf 'omarchy-scripts: setup-cat-background missing in %s\n' "$root" >&2; exit 1; }
+exec "$root/bin/setup-cat-background" --plymouth-only --yes

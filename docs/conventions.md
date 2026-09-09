@@ -95,6 +95,7 @@ its `pacman` stub past the pipe buffer on purpose.
 | `require_not_root` | Refuse to run as root |
 | `confirm "prompt"` | Ask, unless `ASSUME_YES=1` |
 | `write_file path <<<content` | Idempotent write with backup |
+| `install_root_file src dest` | Idempotent `sudo install` with backup; returns 1 when already current |
 
 `lib/tui.sh` adds the menu layer used by `setup-all` — `tui_menu`,
 `tui_multiselect`, `tui_confirm`, `tui_title`, `tui_banner`. Each prefers `gum`
@@ -122,15 +123,27 @@ keep generating only what must be computed (key lists, shim contents).
 user `post-update` hooks. It does not run `omarchy refresh`. Refresh commands
 do overwrite shipped files under `~/.config/`.
 
+Package upgrades are the third way a change gets rewound, and the easiest to
+miss: **a file owned by an Omarchy package is restored on every upgrade of that
+package**, wherever on the filesystem it lives. `omarchy-settings` alone owns
+files in `/etc/systemd`, `/etc/sysctl.d`, `/etc/sddm.conf.d`, `/usr/share/sddm`
+and `/usr/share/plymouth`. Editing or deleting one of those is undone by the
+next upgrade, and `grep -r … /usr/share/omarchy` will not warn you, because the
+file is not under `/usr/share/omarchy`. `pacman -Qo <path>` is the check.
+
 - Never edit `/usr/share/omarchy/`.
+- Before changing any file outside `$HOME`, run `pacman -Qo` on it. If a package
+  owns it, override it from a drop-in that sorts later rather than editing or
+  deleting it; if it has no drop-in mechanism, re-assert it from a hook.
 - Prefer drop-ins Omarchy auto-loads (`toggles/hypr`, `environment.d`,
-  `/etc/sysctl.d`, `/usr/local/bin`) over shipped files (`hyprland.lua`,
-  `autostart.lua`, `shell.json` by raw edit, `/etc/pacman.conf`).
+  `/etc/sysctl.d`, `/etc/systemd/resolved.conf.d`, `/usr/local/bin`) over
+  shipped files (`hyprland.lua`, `autostart.lua`, `shell.json` by raw edit,
+  `/etc/pacman.conf`).
 - Prefer the `omarchy` CLI for shell, idle, theme, and browser changes.
 - Shell plugins (`~/.config/omarchy/plugins/`) are for bar/UI components, not
   system config, Hyprland env, or package policy.
-- Hooks re-assert only what migrations or refresh can rewind. They call
-  existing idempotent scripts; they do not run `setup-all`.
+- Hooks re-assert only what migrations, refresh, or a package upgrade can
+  rewind. They call existing idempotent scripts; they do not run `setup-all`.
 
 ## Testing
 

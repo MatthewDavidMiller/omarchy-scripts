@@ -148,12 +148,18 @@ make_ufw_fixture() {
   printf '%s' "$dir"
 }
 
-# The resolved drop-in an older omarchy left behind, byte-for-byte.
+# Omarchy's own resolved drop-in, byte-for-byte. omarchy-settings owns it, so
+# the fixture keeps it in place the way pacman does.
 make_resolved_dropin() {
   local dir="$TEST_TMP/resolved.$RANDOM"
   mkdir -p "$dir"
   printf '[Resolve]\nDNSStubListenerExtra=172.17.0.1\n' > "$dir/20-docker-dns.conf"
   printf '%s' "$dir/20-docker-dns.conf"
+}
+
+# Where the override lands: the same directory, sorted after Omarchy's file.
+override_path() {
+  printf '%s/99-omarchy-scripts-no-docker-dns.conf' "$(dirname "$1")"
 }
 
 # A whole machine: stock omarchy, docker installed and running, no podman.
@@ -184,6 +190,7 @@ podman_setup() {
       SUBUID_FILE="$SUBUID" \
       SUBGID_FILE="$SUBGID" \
       UFW_RULES_DIR="$UFWDIR" DOCKER_RESOLVED_DROPIN="$RESOLVED_DROPIN" \
+      RESOLVED_OVERRIDE="$(override_path "$RESOLVED_DROPIN")" \
       DOCKER_DATA_DIR="$HOME_DIR/var-lib-docker" \
       "$REPO_ROOT/bin/setup-rootless-podman" "$@" 2>&1
 }
@@ -407,59 +414,78 @@ read -r HOME_DIR PKGDB UNITS SUBUID SUBGID UFWDIR RESOLVED_DROPIN <<< "$(make_ma
 
 out="$(podman_setup --yes 2>&1)"
 
-it "removes the drop-in that binds the resolver to the docker bridge"
-assert_no_file "$RESOLVED_DROPIN"
+it "installs an override that clears the docker-bridge listener"
+assert_file_contains "$(override_path "$RESOLVED_DROPIN")" "DNSStubListenerExtra="
 
-it "backs the drop-in up before removing it"
-if compgen -G "$RESOLVED_DROPIN.bak.*" >/dev/null; then
+# systemd reads drop-ins in filename order and the last assignment wins, so the
+# override is only worth anything if its name sorts after Omarchy's.
+it "the override sorts after the drop-in it has to beat"
+if [[ "$(basename "$(override_path "$RESOLVED_DROPIN")")" > "$(basename "$RESOLVED_DROPIN")" ]]; then
   pass
 else
-  fail "no backup of $RESOLVED_DROPIN was made"
+  fail "the override must sort after $(basename "$RESOLVED_DROPIN")"
 fi
+
+# pacman owns Omarchy's file and restores it on every omarchy-settings upgrade,
+# so deleting it only makes pacman -Qkk complain about a file that comes back.
+it "leaves Omarchy's own drop-in where pacman put it"
+assert_file "$RESOLVED_DROPIN"
 
 it "restarts systemd-resolved so the listener actually goes away"
 assert_contains "$out" "restarted systemd-resolved"
 
-it "a second run reports the drop-in as already gone"
+it "a second run reports the override as already up to date"
 out="$(podman_setup --yes 2>&1)"
-assert_contains "$out" "already gone"
+assert_contains "$out" "already up to date"
 
 it "a second run does not restart systemd-resolved again"
 assert_not_contains "$out" "restarted systemd-resolved"
 
-# A file carrying anything else is not ours to delete: an administrator may
-# have added a listener of their own to the same drop-in.
+# An administrator may have added a listener of their own to the same drop-in.
+# The override still clears every one of them, so say so rather than stopping.
 read -r HOME_DIR PKGDB UNITS SUBUID SUBGID UFWDIR RESOLVED_DROPIN <<< "$(make_machine)"
 printf '[Resolve]\nDNSStubListenerExtra=172.17.0.1\nDNSStubListenerExtra=10.9.9.9\n' \
   > "$RESOLVED_DROPIN"
 out="$(podman_setup --yes 2>&1)"
 
-it "leaves a drop-in it did not write alone"
-assert_file "$RESOLVED_DROPIN"
+it "still installs the override over a drop-in it does not recognise"
+assert_file "$(override_path "$RESOLVED_DROPIN")"
 
-it "says why it left the drop-in alone"
-assert_contains "$out" "did not write"
+it "says the unrecognised drop-in is worth a look"
+assert_contains "$out" "did not recognise"
 
-# Reformatting is not modification: the same two settings with different
-# spacing and a comment still compare equal.
+# Reformatting is not modification: the same settings with different spacing
+# and a comment still compare equal, so there is nothing to report.
 read -r HOME_DIR PKGDB UNITS SUBUID SUBGID UFWDIR RESOLVED_DROPIN <<< "$(make_machine)"
 printf '# docker dns\n[Resolve]\nDNSStubListenerExtra = 172.17.0.1\n\n' > "$RESOLVED_DROPIN"
+out="$(podman_setup --yes 2>&1)"
 
-it "removes a reformatted copy of the same two settings"
-podman_setup --yes >/dev/null 2>&1
-assert_no_file "$RESOLVED_DROPIN"
+it "recognises a reformatted copy of the same settings"
+assert_not_contains "$out" "did not recognise"
+
+# The old delete path left these behind. They do not end in .conf, so
+# systemd-resolved ignores them, but they are stale once the override is in.
+read -r HOME_DIR PKGDB UNITS SUBUID SUBGID UFWDIR RESOLVED_DROPIN <<< "$(make_machine)"
+: > "$RESOLVED_DROPIN.bak.20260906215100"
+out="$(podman_setup --yes 2>&1)"
+
+it "reports a backup left by the old removal path"
+assert_contains "$out" "stale backup from the old removal path"
+
+it "does not delete a backup it did not make"
+assert_file "$RESOLVED_DROPIN.bak.20260906215100"
 
 read -r HOME_DIR PKGDB UNITS SUBUID SUBGID UFWDIR RESOLVED_DROPIN <<< "$(make_machine)"
 
-it "--keep-firewall-rules leaves the resolved drop-in in place too"
+it "--keep-firewall-rules installs no override"
 podman_setup --yes --keep-firewall-rules >/dev/null 2>&1
-assert_file "$RESOLVED_DROPIN"
+assert_no_file "$(override_path "$RESOLVED_DROPIN")"
 
 read -r HOME_DIR PKGDB UNITS SUBUID SUBGID UFWDIR RESOLVED_DROPIN <<< "$(make_machine)"
 
-it "--dry-run does not remove the drop-in"
+it "--dry-run writes no override"
 podman_setup --dry-run --yes >/dev/null 2>&1
-assert_file "$RESOLVED_DROPIN"
+assert_no_file "$(override_path "$RESOLVED_DROPIN")"
 
 # --- subordinate id allocation ---------------------------------------------
 

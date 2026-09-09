@@ -85,6 +85,8 @@ SUBUID_FILE="${SUBUID_FILE:-/etc/subuid}"
 SUBGID_FILE="${SUBGID_FILE:-/etc/subgid}"
 UFW_RULES_DIR="${UFW_RULES_DIR:-/etc/ufw}"
 DOCKER_RESOLVED_DROPIN="${DOCKER_RESOLVED_DROPIN:-/etc/systemd/resolved.conf.d/20-docker-dns.conf}"
+RESOLVED_OVERRIDE="${RESOLVED_OVERRIDE:-/etc/systemd/resolved.conf.d/99-omarchy-scripts-no-docker-dns.conf}"
+RESOLVED_OVERRIDE_SOURCE="$SCRIPT_DIR/../config/systemd/resolved.conf.d/99-omarchy-scripts-no-docker-dns.conf"
 
 # --keep-docker installs and configures podman but leaves docker alone.
 REMOVE_DOCKER=1
@@ -103,16 +105,17 @@ Options:
   -y, --yes                  Do not prompt for confirmation.
       --keep-docker          Set up Podman only; leave Docker installed.
       --keep-firewall-rules  Leave omarchy's docker DNS exposure alone: both the
-                             allow-docker-dns ufw rules and the resolved drop-in
-                             that binds the stub resolver to the docker bridge.
+                             allow-docker-dns ufw rules and the override that
+                             unbinds the stub resolver from the docker bridge.
   -h, --help                 Show this help.
 
 Environment:
   DRY_RUN=1                  Same as --dry-run.
   SUBUID_FILE, SUBGID_FILE   Where the subordinate id ranges live.
   UFW_RULES_DIR              Where ufw keeps user.rules. Default: /etc/ufw.
-  DOCKER_RESOLVED_DROPIN     The resolved drop-in that binds the stub resolver
-                             to the docker bridge.
+  DOCKER_RESOLVED_DROPIN     Omarchy's resolved drop-in that binds the stub
+                             resolver to the docker bridge.
+  RESOLVED_OVERRIDE          Where the override that clears it is installed.
   DOCKER_DATA_DIR            The daemon's data directory to report on removal.
                              Default: /var/lib/docker.
 USAGE
@@ -366,7 +369,7 @@ remove_docker_packages() {
 # nothing on the host has to be opened. With docker gone the address does not
 # exist and the rules are inbound allowances for nothing.
 #
-# The ufw rules are only half of it. An older Omarchy also wrote
+# The ufw rules are only half of it. Omarchy also ships
 # /etc/systemd/resolved.conf.d/20-docker-dns.conf:
 #
 #   [Resolve]
@@ -379,9 +382,13 @@ remove_docker_packages() {
 # a VPN, a bridge, a foreign LAN handing out that range -- the stub resolver is
 # reachable on it with no rule in the way.
 #
-# Nothing recreates the file. `grep -r DNSStubListenerExtra /usr/share/omarchy`
-# finds nothing in Omarchy 4, so it is an orphan from an install that predates
-# the version now on the machine, not something an update will write back.
+# Deleting that file does not stick. `pacman -Qo` puts it in omarchy-settings,
+# which ships it straight to /etc, so pacman restores it on every upgrade of
+# that package -- as it did on 2026-09-08 -- and `grep -r DNSStubListenerExtra
+# /usr/share/omarchy` never sees it, because it is not under /usr/share/omarchy.
+# So this leaves Omarchy's file where pacman put it and clears the setting from
+# a later drop-in instead. resolved.conf(5): "If an empty string is assigned,
+# then all previous assignments are cleared."
 DOCKER_DNS_HOST=172.17.0.1
 DOCKER_DNS_SOURCES=(172.16.0.0/12 192.168.0.0/16)
 
@@ -470,46 +477,51 @@ resolved_dropin_is_omarchys() {
   [[ "$body" == "$expected" ]]
 }
 
-remove_resolved_dropin() {
-  local file="$DOCKER_RESOLVED_DROPIN" backup
+# An earlier version of this script deleted Omarchy's drop-in outright and left
+# a timestamped backup beside it. Those backups do not end in .conf, so
+# systemd-resolved ignores them, but they are stale once the override is in and
+# they are the user's to remove.
+report_stale_dropin_backups() {
+  local backup found=0
 
+  for backup in "$DOCKER_RESOLVED_DROPIN".bak.*; do
+    [[ -e "$backup" ]] || continue
+    found=1
+    warn "stale backup from the old removal path: $backup"
+  done
+  if (( found )); then
+    warn "systemd-resolved ignores them; delete them when you are done reading them"
+  fi
+  return 0
+}
+
+install_resolved_override() {
   if [[ "$REMOVE_FIREWALL_RULES" == "0" ]]; then
-    skip "--keep-firewall-rules: leaving $file in place"
+    skip "--keep-firewall-rules: leaving the stub resolver bound to $DOCKER_DNS_HOST"
     return 0
   fi
-  if [[ ! -e "$file" ]]; then
-    skip "$file is already gone"
+  if [[ ! -e "$DOCKER_RESOLVED_DROPIN" ]] && [[ ! -e "$RESOLVED_OVERRIDE" ]]; then
+    skip "nothing binds the stub resolver to $DOCKER_DNS_HOST"
     return 0
   fi
-  if ! resolved_dropin_is_omarchys "$file"; then
-    warn "$file holds settings this script did not write; leaving it alone"
-    warn "review it by hand: it binds the resolver to an address docker0 no longer provides"
-    return 0
+  if [[ -e "$DOCKER_RESOLVED_DROPIN" ]] && ! resolved_dropin_is_omarchys "$DOCKER_RESOLVED_DROPIN"; then
+    warn "$DOCKER_RESOLVED_DROPIN holds settings this script did not recognise"
+    warn "the override still clears DNSStubListenerExtra; review that file by hand"
   fi
 
   log "Unbinding the stub resolver from the docker bridge"
-  if [[ "$DRY_RUN" == "1" ]]; then
-    printf '%s  dry%s would remove %s and restart systemd-resolved\n' \
-      "$C_DIM" "$C_RESET" "$file"
-    return 0
-  fi
+  report_stale_dropin_backups
 
   # Failure-tolerant for the same reason the ufw rules are: by this point the
-  # packages are already gone, and a drop-in that will not delete is a leftover
-  # to report, not a reason to abort a migration that has otherwise succeeded.
-  backup="$file.bak.$(date +%Y%m%d%H%M%S)"
-  if ! sudo cp -a -- "$file" "$backup"; then
-    warn "could not back up $file; leaving it in place"
+  # packages are already gone, and an override that will not install is a
+  # leftover to report, not a reason to abort a migration that has otherwise
+  # succeeded.
+  if ! install_root_file "$RESOLVED_OVERRIDE_SOURCE" "$RESOLVED_OVERRIDE"; then
     return 0
   fi
-  ok "backed up $file to $backup"
-  if ! sudo rm -f -- "$file"; then
-    warn "could not remove $file; remove it by hand and restart systemd-resolved"
-    return 0
-  fi
-  ok "removed $file"
+  [[ "$DRY_RUN" == "1" ]] && return 0
 
-  # Only after an actual removal. Restarting resolved drops the DNS cache and
+  # Only after an actual write. Restarting resolved drops the DNS cache and
   # briefly stops answering, which is not worth doing on an already-done run.
   if sudo systemctl restart systemd-resolved; then
     ok "restarted systemd-resolved"
@@ -527,7 +539,7 @@ configure_docker_removal() {
   log "Removing Docker"
   remove_docker_packages || return 0
   remove_firewall_rules
-  remove_resolved_dropin
+  install_resolved_override
 
   # Only now: podman-docker Conflicts With docker, so this is the first moment
   # pacman will accept it.

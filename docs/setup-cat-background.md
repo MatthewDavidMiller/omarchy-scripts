@@ -58,6 +58,8 @@ and markings remain intact across themes.
    `omarchy plymouth set`, which rebuilds the initramfs using Omarchy's supported
    Plymouth workflow. It skips that rebuild when the installed image is already
    current. `--no-activate` skips both activation steps.
+7. Installs a `theme-set` hook and a `post-update` hook, so neither a theme
+   switch nor an Omarchy update leaves the cat behind.
 
 Rendering is deterministic: `-strip` and excluded PNG date chunks mean the same
 source and canvas size produce the same bytes. That makes step 4 a real
@@ -69,17 +71,41 @@ idempotence check rather than a timestamp comparison.
 | --- | --- |
 | `--size WxH` | Canvas size, default `3840x2160` |
 | `--no-activate` | Render both images without applying either one |
+| `--plymouth-only` | Re-apply just the Plymouth unlock image; what the `post-update` hook runs |
 | `--force` | Re-render even when the existing wallpaper matches |
 | `-n`, `--dry-run` | Print what would happen, change nothing |
 | `-y`, `--yes` | Accepted for `setup-all` compatibility |
 | `-h`, `--help` | Show usage |
 
+## Surviving an update
+
+The wallpaper lives under `~/.config` and an update never touches it. The
+Plymouth image does not: `omarchy plymouth set` publishes into
+`/usr/share/plymouth/themes/omarchy/`, and `pacman -Qo` puts that directory in
+`omarchy-settings`. Every upgrade of that package restores the packaged logo,
+and the `90-mkinitcpio-install.hook` that runs later in the same transaction —
+usually because the kernel was upgraded too — bakes the stock logo into
+`/boot/EFI/Linux/omarchy_linux.efi`. That is why the cat used to disappear from
+the boot splash after an update.
+
+So the setup installs a `post-update` hook that runs
+`setup-cat-background --plymouth-only`. `omarchy update` runs `post-update`
+hooks after packages and migrations and before it offers a reboot, so the UKI is
+rebuilt with the cat in it before the machine next boots.
+
+`--plymouth-only` renders and installs just the `800x450` unlock image, compares
+it against `/usr/share/plymouth/themes/omarchy/logo.png`, and calls
+`omarchy plymouth set` only when the two differ — one `limine-mkinitcpio` run,
+and only when it is actually needed. It leaves the wallpaper, the live shell
+background, and the switcher thumbnail cache alone, because an update does not
+disturb any of them.
+
 ## Switching themes
 
 The wallpaper is stored per-theme so it participates in each theme's background
 cycle, but the same full-color artwork is used everywhere. The setup installs a
-`theme-set` hook that re-runs this script after `omarchy theme set`, so changing
-theme does not require a manual re-run.
+`theme-set` hook that re-runs this script in full after `omarchy theme set`, so
+changing theme does not require a manual re-run.
 
 ## Removal
 
