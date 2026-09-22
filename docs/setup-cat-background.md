@@ -84,9 +84,10 @@ Plymouth image does not: `omarchy plymouth set` publishes into
 `/usr/share/plymouth/themes/omarchy/`, and `pacman -Qo` puts that directory in
 `omarchy-settings`. Every upgrade of that package restores the packaged logo,
 and the `90-mkinitcpio-install.hook` that runs later in the same transaction —
-usually because the kernel was upgraded too — bakes the stock logo into
-`/boot/EFI/Linux/omarchy_linux.efi`. That is why the cat used to disappear from
-the boot splash after an update.
+usually because the kernel was upgraded too — bakes the stock logo into each
+kernel's `/boot/EFI/Linux/omarchy_<kernel>.efi`; since Omarchy 4.0.4 the default
+boot entry is `omarchy_linux-omarchy.efi`. That is why the cat used to disappear
+from the boot splash after an update.
 
 So the setup installs a `post-update` hook that runs
 `setup-cat-background --plymouth-only`. `omarchy update` runs `post-update`
@@ -96,9 +97,9 @@ rebuilt with the cat in it before the machine next boots.
 `--plymouth-only` renders and installs just the `800x450` unlock image, compares
 it against `/usr/share/plymouth/themes/omarchy/logo.png`, and calls
 `omarchy plymouth set` only when the two differ — one `limine-mkinitcpio` run,
-and only when it is actually needed. It leaves the wallpaper, the live shell
-background, and the switcher thumbnail cache alone, because an update does not
-disturb any of them.
+which rebuilds the image of every installed kernel, and only when it is actually
+needed. It leaves the wallpaper, the live shell background, and the switcher
+thumbnail cache alone, because an update does not disturb any of them.
 
 ## Switching themes
 

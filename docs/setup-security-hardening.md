@@ -176,12 +176,13 @@ Two of those are worded to say how far away the missing control is:
 - **Kernel command line.** `limine-entry-tool` reads
   `/etc/limine-entry-tool.d/*.conf` and appends each `KERNEL_CMDLINE[default]+=`
   to the command line. Omarchy writes its own named files there for hardware
-  quirks (`install/hardware/intel/fred.sh`, `apple/fix-t2.sh`, `asus/*`) and its
-  migrations only ever touch `omarchy-defaults.conf`, so a drop-in of another
-  name survives an update. Nothing is installed there deliberately — AppArmor,
-  kernel lockdown, and the allocator hardening flags are all boot-sensitive and
-  outside this profile — but the report names the directory so the option stays
-  visible.
+  quirks (`install/hardware/intel/fred.sh`, `apple/fix-t2.sh`, `asus/*`). Its
+  migrations rewrite `omarchy-defaults.conf` and, since 4.0.4, the `BOOT_ORDER`
+  line of `/etc/default/limine`, but never another drop-in, so a drop-in of
+  another name survives an update. Nothing is installed there deliberately —
+  AppArmor, kernel lockdown, and the allocator hardening flags are all
+  boot-sensitive and outside this profile — but the report names the directory
+  so the option stays visible.
 
 The keyring check reads only the `[keyring]` metadata block. Stored credential
 entries and secret values are never read or printed.
