@@ -13,10 +13,10 @@
 #
 #   curl -sf --connect-timeout 30 --retry 3 --retry-delay 3 ... aur.archlinux.org
 #
-# What that probe costs depends on the OpenSnitch verdict of the moment. A drop
-# costs 30 + 3 + 30 + 3 + 30 + 3 + 30 ~= 129s of retry budget before the update
-# continues; a process-wide `allow curl` answered at some prompt lets it
-# through and the AUR step runs for real. Either way it is a question the
+# OpenSnitch monitors rather than blocks, so by default the probe gets through
+# and the AUR step runs for real; anything that does drop it costs
+# 30 + 3 + 30 + 3 + 30 + 3 + 30 ~= 129s of retry budget before the update
+# continues. Either way it is a question the
 # package-source policy already settled.
 #
 # The fix is a set of shims in /usr/local/bin, a directory pacman never writes

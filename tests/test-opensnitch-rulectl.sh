@@ -56,6 +56,32 @@ else
   fail "expected help listing all commands, exit 0" "exit $status" "${out:0:300}"
 fi
 
+# Prompts that arrive while the tool holds the socket follow the monitoring
+# setup: allow-once by default, deny-once on request, never saved.
+prompt_answer() {
+  # -B: loading the extensionless script would otherwise drop a .pyc into bin/.
+  python -B - "$RULECTL" "$@" <<'PY'
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("rulectl", sys.argv[1])
+spec = importlib.util.spec_from_loader("rulectl", loader)
+rulectl = importlib.util.module_from_spec(spec)
+loader.exec_module(rulectl)
+args = rulectl.build_parser().parse_args(sys.argv[2:] + ["list"])
+rule = rulectl.UIService(args.deny_prompts).AskRule(
+    rulectl.ui_pb2.Connection(process_path="/usr/bin/true"), None)
+print(rule.action, rule.duration)
+PY
+}
+
+it "answers prompts during the window with allow-once by default"
+assert_eq "allow once" "$(prompt_answer)"
+
+it "--deny-prompts answers them with deny-once"
+assert_eq "deny once" "$(prompt_answer --deny-prompts)"
+
+it "still accepts the old --allow-prompts flag"
+assert_eq "allow once" "$(prompt_answer --allow-prompts)"
+
 it "a missing subcommand is an error, not a socket connection"
 out="$("$RULECTL" 2>&1)"; status=$?
 assert_status 2 "$status"

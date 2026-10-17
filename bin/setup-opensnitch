@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# setup-opensnitch — install a maintainable outbound application firewall.
+# setup-opensnitch — install a low-maintenance outbound connection monitor.
 #
 # order: 95
-# description: Deny-by-default outbound application firewall
+# description: Outbound connection monitor (allow and log)
 #
 set -euo pipefail
 
@@ -21,6 +21,7 @@ AUTOSTART_FILE="${OPEN_SNITCH_AUTOSTART_FILE:-$HOME/.config/hypr/autostart.lua}"
 HYPR_TOGGLE_NAME="omarchy-scripts-opensnitch"
 HYPR_TOGGLE_SOURCE="$OMARCHY_SCRIPTS_ROOT/config/hypr/opensnitch-autostart.lua"
 UI_LAUNCHER="${OPEN_SNITCH_UI_LAUNCHER:-$HOME/.local/bin/opensnitch-ui-secure}"
+GUI_EVENTS_DB="${OPEN_SNITCH_EVENTS_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/opensnitch/events.sqlite3}"
 RUNTIME_ROOT="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 RUNTIME_DIR="$RUNTIME_ROOT/opensnitch"
 SOCKET_PATH="$RUNTIME_DIR/osui.sock"
@@ -32,12 +33,9 @@ usage() {
 Usage: setup-opensnitch [options]
 
 Installs OpenSnitch from Arch Extra, imports this repository's shared rules,
-and enables deny-by-default outbound application control. UFW remains the
-inbound firewall.
-
-Enforcement starts immediately and unanswered prompts apply the default action,
-so hold it back with `setup-all --skip opensnitch` on a machine you are not
-ready to answer prompts on.
+and enables allow-by-default outbound connection monitoring: a new process's
+first connection pops up for 3 seconds and is then allowed and logged. Only
+explicit deny rules block. UFW remains the inbound firewall.
 
 Options:
   -n, --dry-run   Show what would change without changing anything.
@@ -53,6 +51,7 @@ Environment (primarily for tests):
                                older in-file marker block.
   OMARCHY_HYPR_TOGGLES_DIR     Where the OpenSnitch autostart Lua is installed.
   OPEN_SNITCH_UI_LAUNCHER      Secure GUI launcher path.
+  OPEN_SNITCH_EVENTS_DB        Persistent GUI connection-history database.
   OPEN_SNITCH_SKIP_LIVE_UI     Set to 1 to configure without launching the GUI.
 USAGE
 }
@@ -134,18 +133,20 @@ for key in ("Server", "FwOptions", "Rules"):
         raise SystemExit(f"unsupported OpenSnitch config: missing object {key}")
 
 config["Server"]["Address"] = socket
-config["DefaultAction"] = "deny"
+config["DefaultAction"] = "allow"
 config["InterceptUnknown"] = False
 config["ProcMonitorMethod"] = "ebpf"
 config["Firewall"] = "nftables"
 config["Rules"]["EnableChecksums"] = True
 
-# OpenSnitch 1.7 uses QueueBypass; newer schemas use ActionOnOverflow. Only
-# modify keys understood by the installed package.
+# Fail open: this is a monitor, so a stalled or overflowing queue should cost
+# log entries, not the session's network. OpenSnitch 1.7 uses QueueBypass;
+# newer schemas use ActionOnOverflow. Only modify keys understood by the
+# installed package.
 if "QueueBypass" in config["FwOptions"]:
-    config["FwOptions"]["QueueBypass"] = False
+    config["FwOptions"]["QueueBypass"] = True
 if "ActionOnOverflow" in config["FwOptions"]:
-    config["FwOptions"]["ActionOnOverflow"] = "drop"
+    config["FwOptions"]["ActionOnOverflow"] = "accept"
 
 with open(destination, "w", encoding="utf-8") as handle:
     json.dump(config, handle, indent=2, sort_keys=True)
@@ -156,50 +157,91 @@ PY
 # default_duration is a *combo box index*, not a duration. OpenSnitch 1.7.2
 # maps it in dialogs/prompt/_utils.py:get_duration(): 0 once, 1 30s, 2 5m,
 # 3 15m, 4 30m, 5 1h, 6 12h, 7 until restart, anything else always. Index 7 is
-# what we want. Upstream's own Config.DEFAULT_DURATION_IDX is 6 with the
-# comment "until restart", which is wrong, and following it left this machine
-# turning every unanswered prompt into a twelve-hour rule. Twelve hours is long
-# enough for a timed-out deny to outlive the session that caused it and shadow
-# a permanent allow, which is exactly how the Bitwarden rule appeared broken.
-# Re-check this mapping against the installed package before changing it.
+# what we want: a timed-out prompt's rule lives in the daemon's memory until
+# restart and is never written to the rules directory. Upstream's own
+# Config.DEFAULT_DURATION_IDX is 6 with the comment "until restart", which is
+# wrong, and following it left this machine turning every unanswered prompt
+# into a twelve-hour rule file. Re-check this mapping against the installed
+# package before changing it.
 GUI_DURATION_UNTIL_RESTART=7
+# default_action is also an index: 0 deny, 1 allow, 2 reject (Config.ACTION_*_IDX).
+GUI_ACTION_ALLOW=1
+# Seconds the prompt stays up before applying the default action. Long enough
+# to read and click Deny, short enough not to be a chore.
+GUI_PROMPT_TIMEOUT=3
+
+# Every [section] key=value this setup owns in the GUI settings. Anything else
+# in the file, including window geometry and other preferences, is preserved.
+# database/type 1 is a file, so the Events history survives a GUI restart.
+gui_managed_settings() {
+  cat <<EOF
+global|default_action|$GUI_ACTION_ALLOW
+global|default_duration|$GUI_DURATION_UNTIL_RESTART
+global|default_timeout|$GUI_PROMPT_TIMEOUT
+global|server_address|$SOCKET_ADDRESS
+database|type|1
+database|file|$GUI_EVENTS_DB
+database|purge_oldest|true
+database|max_days|30
+EOF
+}
 
 render_gui_settings() {
-  local output="$1" input="$GUI_SETTINGS"
+  local output="$1" input="$GUI_SETTINGS" spec="$WORK_DIR/gui-settings.spec"
   [[ -f "$input" ]] || input=/dev/null
-  awk -v socket="$SOCKET_ADDRESS" -v duration_idx="$GUI_DURATION_UNTIL_RESTART" '
-    function emit_missing() {
-      if (!action) print "default_action=0"
-      if (!duration) print "default_duration=" duration_idx
-      if (!address) print "server_address=" socket
-    }
-    /^\[.*\]$/ {
-      if (global) emit_missing()
-      global = ($0 == "[global]")
-      if (global) { found=1; action=duration=address=0 }
-      print; next
-    }
-    global && /^default_action=/   { print "default_action=0"; action=1; next }
-    global && /^default_duration=/ { print "default_duration=" duration_idx; duration=1; next }
-    global && /^server_address=/   { print "server_address=" socket; address=1; next }
-    { print }
-    END {
-      if (global) emit_missing()
-      if (!found) {
-        if (NR) print ""
-        print "[global]"
-        print "default_action=0"
-        print "default_duration=" duration_idx
-        print "server_address=" socket
+  gui_managed_settings > "$spec"
+  awk -F'|' '
+    # Blank lines are held back so a missing key lands inside its section
+    # rather than after the separator before the next one.
+    function flush_blanks() { for (; blanks > 0; blanks--) print "" }
+    function emit_missing(section,   i, k) {
+      for (i = 1; i <= nkeys[section]; i++) {
+        k = keys[section, i]
+        if (!done[section, k]) print k "=" value[section, k]
       }
     }
-  ' "$input" > "$output"
+    FNR == NR {
+      if (!(($1) in nkeys)) order[++nsections] = $1
+      keys[$1, ++nkeys[$1]] = $2
+      value[$1, $2] = substr($0, length($1) + length($2) + 3)
+      next
+    }
+    /^\[.*\]$/ {
+      if (current in nkeys) emit_missing(current)
+      flush_blanks()
+      current = substr($0, 2, length($0) - 2)
+      seen[current] = 1
+      print; out = 1; next
+    }
+    /^$/ { blanks++; next }
+    { flush_blanks() }
+    (current in nkeys) {
+      eq = index($0, "=")
+      k = eq ? substr($0, 1, eq - 1) : ""
+      if (k != "" && ((current, k) in value)) {
+        print k "=" value[current, k]; done[current, k] = 1; out = 1; next
+      }
+    }
+    { print; out = 1 }
+    END {
+      if (current in nkeys) emit_missing(current)
+      flush_blanks()
+      for (i = 1; i <= nsections; i++) {
+        if (order[i] in seen) continue
+        if (out) print ""
+        print "[" order[i] "]"; out = 1
+        emit_missing(order[i])
+      }
+    }
+  ' "$spec" "$input" > "$output"
 }
 
 write_user_configuration() {
   local launcher rendered="$WORK_DIR/settings.conf"
   render_gui_settings "$rendered"
   write_file "$GUI_SETTINGS" < "$rendered"
+  # The GUI's SQLite creates the database file but not its directory.
+  [[ "$DRY_RUN" == "1" ]] || install -d -m 0700 -- "$(dirname -- "$GUI_EVENTS_DB")"
 
   launcher="$(cat <<'EOF'
 #!/usr/bin/env bash
@@ -364,7 +406,7 @@ start_services() {
       || die "OpenSnitch UI did not create $SOCKET_PATH"
     ok "OpenSnitch UI is listening on its private runtime socket"
   else
-    warn "no live Hyprland session; the UI and enforcement will start at next login/boot"
+    warn "no live Hyprland session; the UI and monitoring will start at next login/boot"
   fi
 
   if [[ "$gui_ready" == "1" || "${OPEN_SNITCH_SKIP_LIVE_UI:-0}" == "1" ]]; then
@@ -377,7 +419,7 @@ start_services() {
       systemctl is-active --quiet opensnitchd.service \
         || die "opensnitchd.service failed to start"
     fi
-    ok "OpenSnitch outbound enforcement is active"
+    ok "OpenSnitch outbound monitoring is active"
   else
     skip "daemon not started without a live UI; it remains enabled for boot"
   fi
@@ -388,7 +430,7 @@ main() {
   verify_package_source
   install_package
 
-  log "Configuring deny-by-default outbound control"
+  log "Configuring allow-and-log outbound monitoring"
   stop_existing_ui
   write_user_configuration
   validate_hyprland

@@ -240,11 +240,12 @@ class UIService(ui_pb2_grpc.UIServicer):
 
     def AskRule(self, request, context):
         # A prompt arriving while we hold the socket has no GUI to display it.
-        # Answer with the daemon's own default -- deny, for this connection
-        # only -- so nothing is silently made permanent behind the user's back.
+        # Answer the way the monitoring setup does -- allow, unless asked to
+        # deny -- for this connection only, so nothing is silently made
+        # permanent behind the user's back.
         self.prompted.append(request)
         return ui_pb2.Rule(
-            name="rulectl-deny-once",
+            name="rulectl-deny-once" if self._deny_prompts else "rulectl-allow-once",
             enabled=True,
             action="deny" if self._deny_prompts else "allow",
             duration="once",
@@ -639,7 +640,7 @@ def format_connection(connection) -> list[str]:
 
 
 def cmd_watch(service: UIService, args) -> None:
-    answer = "allow" if args.allow_prompts else "deny"
+    answer = "deny" if args.deny_prompts else "allow"
     log(
         f"Watching for {args.seconds:.0f}s. Exercise the application now. "
         f"Anything with no matching rule is answered {answer}-once and not saved."
@@ -749,11 +750,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--allow-prompts",
+        "--deny-prompts",
         action="store_true",
-        help="answer prompts arriving during the window with allow-once "
-        "instead of deny-once (nothing is made permanent either way)",
+        help="answer prompts arriving during the window with deny-once "
+        "instead of allow-once (nothing is made permanent either way)",
     )
+    # Allow-once used to be opt-in; it is now the default, and the old flag is
+    # accepted so existing invocations keep working.
+    parser.add_argument("--allow-prompts", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("-n", "--dry-run", action="store_true")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -860,7 +864,7 @@ def main() -> None:
         return
 
     socket_path = pathlib.Path(args.socket)
-    with SocketSession(socket_path, args.launcher, not args.allow_prompts) as service:
+    with SocketSession(socket_path, args.launcher, args.deny_prompts) as service:
         args.handler(service, args)
         if service.prompted and args.command != "watch":
             paths = sorted({request.process_path for request in service.prompted})

@@ -47,7 +47,7 @@ would test the mock.
 | `tests/test-setup-no-background-network.sh` | Omarchy polling widgets, VS Code/RPi settings, exact OpenSnitch deny cleanup, and the post-update hook |
 | `tests/test-setup-no-aur-updates.sh` | Shim install and content, helper removal, Hyprland PATH toggle, legacy require-line migration, and idempotence |
 | `tests/test-setup-no-localsend.sh` | ufw rule deletion against fixture rules files, and package removal |
-| `tests/test-setup-opensnitch.sh` | package provenance, fail-closed configuration, shared rules, hypr toggle autostart, and service state |
+| `tests/test-setup-opensnitch.sh` | package provenance, fail-open monitoring configuration, shared rules, hypr toggle autostart, and service state |
 | `tests/test-export-opensnitch-rules.sh` | rule eligibility, portability checks, stable export, and dry-run safety |
 | `tests/test-setup-cat-background.sh` | The approved generated cat asset, deterministic rendering, live refresh, theme-set hook, and idempotence |
 | `tests/test-tui.sh` | `lib/tui.sh` fallback menu parsing |

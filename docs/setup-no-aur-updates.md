@@ -46,17 +46,17 @@ curl -sf --connect-timeout 30 --retry 3 --retry-delay 3 -A "omarchy-update" \
   "https://aur.archlinux.org/rpc/?v=5&type=info&arg=base" >/dev/null
 ```
 
-What that costs depends on the [OpenSnitch](setup-opensnitch.md) verdict of the
-moment, and neither outcome is wanted:
+Neither possible outcome is wanted:
 
-- **Dropped.** OpenSnitch is deny-by-default and drops rather than refuses, so
-  curl waits out its whole retry budget — `30s connect + 3s + 30s + 3s + 30s +
-  3s + 30s ≈ 129 seconds` — before the update prints "AUR is unavailable (so
-  skipping updates)" and carries on. The correct outcome, reached the slowest
-  possible way, once per update.
-- **Allowed.** A process-wide `allow /usr/bin/curl` answered at some prompt
-  outranks the narrower rules, the probe succeeds, and the update goes on to
-  run an AUR helper this machine deliberately does not have.
+- **Allowed.** [OpenSnitch](setup-opensnitch.md) now monitors rather than
+  blocks, so by default the probe succeeds and the update goes on to run an AUR
+  helper this machine deliberately does not have.
+- **Dropped.** If anything does drop the probe — an explicit deny, or any
+  firewall that drops rather than refuses — curl waits out its whole retry
+  budget — `30s connect + 3s + 30s + 3s + 30s + 3s + 30s ≈ 129 seconds` —
+  before the update prints "AUR is unavailable (so skipping updates)" and
+  carries on. The correct outcome, reached the slowest possible way, once per
+  update.
 
 Either way it is a question the
 [package-source policy](conventions.md#package-sources) settled long ago:
@@ -165,9 +165,9 @@ does not:
   stays as it is. Note it is not a second line of defence for this: it matches
   `process.path` `^/usr/bin/(yay|paru)$`, so it never sees the probe, which is
   `curl`. Nothing at the network layer denies `curl` reaching
-  `aur.archlinux.org`, and a process-wide `allow /usr/bin/curl` answered at a
-  prompt would outrank `191` anyway, since curated denies are deliberately
-  `precedence: false`. PATH is the only thing stopping the probe, which is why
+  `aur.archlinux.org` — OpenSnitch's default action is `allow` — and an allow
+  with `precedence: true` would outrank `191` anyway, since curated denies are
+  deliberately `precedence: false`. PATH is the only thing stopping the probe, which is why
   the precedence check above is not optional.
 - **Affect `pacman` or `omarchy pkg add`.** Repository packages install exactly
   as before.

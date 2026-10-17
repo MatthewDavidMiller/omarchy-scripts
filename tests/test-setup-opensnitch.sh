@@ -53,11 +53,11 @@ make_fixture() {
   cat > "$root/etc/opensnitchd/default-config.json" <<'JSON'
 {
   "Server": {"Address": "unix:///tmp/osui.sock", "LogFile": "/var/log/opensnitchd.log"},
-  "DefaultAction": "allow",
+  "DefaultAction": "deny",
   "InterceptUnknown": true,
   "ProcMonitorMethod": "proc",
   "Firewall": "iptables",
-  "FwOptions": {"QueueBypass": true, "ActionOnOverflow": "accept", "MonitorInterval": "15s"},
+  "FwOptions": {"QueueBypass": false, "ActionOnOverflow": "drop", "MonitorInterval": "15s"},
   "Rules": {"Path": "/etc/opensnitchd/rules", "EnableChecksums": false},
   "Stats": {"Workers": 6}
 }
@@ -109,18 +109,18 @@ assert_status 0 "$setup_status"
 it "installs opensnitch through omarchy pkg add"
 assert_file_contains "$STUBS/omarchy.log" "pkg add opensnitch"
 
-it "sets daemon enforcement to deny"
-assert_eq "deny" "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["DefaultAction"])' "$ROOT_FIXTURE/etc/opensnitchd/default-config.json")"
+it "sets the daemon default action to allow"
+assert_eq "allow" "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["DefaultAction"])' "$ROOT_FIXTURE/etc/opensnitchd/default-config.json")"
 
 it "uses nftables and eBPF with unknown traffic dropped"
 daemon_values="$(python -c 'import json,sys; c=json.load(open(sys.argv[1])); print(c["Firewall"], c["ProcMonitorMethod"], c["InterceptUnknown"])' "$ROOT_FIXTURE/etc/opensnitchd/default-config.json")"
 assert_eq "nftables ebpf False" "$daemon_values"
 
-it "turns queue bypass off for fail-closed behavior"
-assert_eq "False" "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["FwOptions"]["QueueBypass"])' "$ROOT_FIXTURE/etc/opensnitchd/default-config.json")"
+it "turns queue bypass on so monitoring fails open"
+assert_eq "True" "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["FwOptions"]["QueueBypass"])' "$ROOT_FIXTURE/etc/opensnitchd/default-config.json")"
 
-it "uses drop for newer overflow schemas"
-assert_eq "drop" "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["FwOptions"]["ActionOnOverflow"])' "$ROOT_FIXTURE/etc/opensnitchd/default-config.json")"
+it "uses accept for newer overflow schemas"
+assert_eq "accept" "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["FwOptions"]["ActionOnOverflow"])' "$ROOT_FIXTURE/etc/opensnitchd/default-config.json")"
 
 it "preserves unrelated package configuration"
 assert_eq "6" "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["Stats"]["Workers"])' "$ROOT_FIXTURE/etc/opensnitchd/default-config.json")"
@@ -128,8 +128,15 @@ assert_eq "6" "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))[
 it "uses the private per-user UI socket in daemon and GUI settings"
 assert_contains "$(cat "$ROOT_FIXTURE/etc/opensnitchd/default-config.json" "$HOME_FIXTURE/.config/opensnitch/settings.conf")" "$HOME_FIXTURE/run/opensnitch/osui.sock"
 
-it "keeps GUI prompts deny-by-default with temporary decisions"
-assert_contains "$(cat "$HOME_FIXTURE/.config/opensnitch/settings.conf")" $'default_action=0\ndefault_duration=7'
+it "makes GUI prompts allow after a short timeout, with temporary decisions"
+assert_contains "$(cat "$HOME_FIXTURE/.config/opensnitch/settings.conf")" $'default_action=1\ndefault_duration=7\ndefault_timeout=3'
+
+it "keeps the GUI connection history in a persistent database"
+assert_contains "$(cat "$HOME_FIXTURE/.config/opensnitch/settings.conf")" \
+  $'[database]\ntype=1\nfile='"$HOME_FIXTURE"$'/.local/share/opensnitch/events.sqlite3\npurge_oldest=true\nmax_days=30'
+
+it "creates the directory for the connection history database"
+assert_eq "directory" "$([[ -d "$HOME_FIXTURE/.local/share/opensnitch" ]] && echo directory)"
 
 it "adds the Omarchy-native GUI autostart toggle"
 assert_file_contains "$HOME_FIXTURE/.local/state/omarchy/toggles/hypr/omarchy-scripts-opensnitch.lua" \
@@ -228,8 +235,44 @@ it "rejects opensnitch from a non-Extra package source"
 FAKE_OPEN_SNITCH_REPO=community run_setup "$BAD_HOME" "$BAD_ROOT" >/dev/null 2>&1
 assert_status 1 $?
 
+# --- existing GUI settings --------------------------------------------------
+
+SETTINGS_HOME="$(make_fake_home)"
+SETTINGS_ROOT="$TEST_TMP/settings-root"
+make_fixture "$SETTINGS_ROOT"
+mkdir -p "$SETTINGS_HOME/.config/opensnitch"
+cat > "$SETTINGS_HOME/.config/opensnitch/settings.conf" <<'INI'
+[global]
+default_action=0
+default_timeout=30
+theme=dark
+
+[database]
+type=0
+file=file::memory:
+jrnl_wal=false
+
+[statsDialog]
+geometry=@ByteArray(abc)
+INI
+run_setup "$SETTINGS_HOME" "$SETTINGS_ROOT" >/dev/null
+settings_status=$?
+settings="$(cat "$SETTINGS_HOME/.config/opensnitch/settings.conf")"
+
+it "completes against existing GUI settings"
+assert_status 0 "$settings_status"
+
+it "rewrites managed keys in place and adds missing ones inside their section"
+assert_contains "$settings" $'[global]\ndefault_action=1\ndefault_timeout=3\ntheme=dark\ndefault_duration=7\nserver_address='
+
+it "switches an in-memory history database to a file"
+assert_contains "$settings" $'[database]\ntype=1\nfile='"$SETTINGS_HOME"$'/.local/share/opensnitch/events.sqlite3\njrnl_wal=false\npurge_oldest=true\nmax_days=30\n\n[statsDialog]'
+
+it "preserves GUI settings it does not manage"
+assert_contains "$settings" $'[statsDialog]\ngeometry=@ByteArray(abc)'
+
 it "help text is available without touching the system"
-assert_contains "$("$REPO_ROOT/bin/setup-opensnitch" --help)" "deny-by-default"
+assert_contains "$("$REPO_ROOT/bin/setup-opensnitch" --help)" "allow-by-default"
 
 it "rejects unknown arguments"
 "$REPO_ROOT/bin/setup-opensnitch" --not-an-option >/dev/null 2>&1

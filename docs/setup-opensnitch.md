@@ -1,20 +1,22 @@
-# OpenSnitch outbound access control
+# OpenSnitch outbound connection monitoring
 
-OpenSnitch adds per-application outbound policy without turning the machine
-into a second full-time firewall project. UFW remains responsible for the
-simple inbound policy established by `setup-security-hardening`; OpenSnitch
-uses nftables only to identify and control outgoing connections.
+OpenSnitch shows which application is talking to what, without turning a dev
+machine into a second full-time firewall project. It runs here as a
+**monitor**: unknown connections are allowed, recorded, and announced; only a
+rule someone wrote deliberately as a `deny` blocks anything. UFW remains
+responsible for the simple inbound policy established by
+`setup-security-hardening`; OpenSnitch uses nftables only to see outgoing
+connections.
 
-`setup-all` runs this like every other script, and its default policy is
-immediately restrictive — enforcement starts at once, and a prompt nobody
-answers within 30 seconds applies the default action. Preview it first, and
-hold it back on a machine you are not ready to answer prompts on:
+It used to be deny-by-default. That needed constant upkeep — every new tool
+prompted, an unanswered prompt became a deny, and a denied registry pull or
+toolchain download surfaced as an unexplained `i/o timeout` several layers up.
+On a development machine the cost outweighed the protection, so the default
+action is now `allow`.
 
 ```bash
 ./bin/setup-opensnitch --dry-run
 ./bin/setup-opensnitch
-# or, to leave it out of a full run
-./bin/setup-all --skip opensnitch
 ```
 
 The package comes from Arch's signed `extra` repository through
@@ -22,41 +24,49 @@ The package comes from Arch's signed `extra` repository through
 [official Arch package](https://archlinux.org/packages/extra/x86_64/opensnitch/)
 contains the daemon, UI, systemd unit, and eBPF objects in one package.
 
-## Security model
+## Monitoring model
 
 The daemon is configured with:
 
-- default action `deny` and unknown-process interception disabled, so an
-  unidentified connection is dropped rather than generating an unhelpful
-  permanent exception;
+- default action `allow`, so a connection no rule matches goes through;
 - the eBPF process monitor and nftables firewall backend;
-- queue bypass disabled (or overflow action `drop` on newer supported schemas),
-  keeping enforcement fail-closed if userspace cannot consume queued traffic;
+- queue bypass enabled (or overflow action `accept` on newer supported
+  schemas). That is fail-open on purpose: if userspace cannot keep up, the cost
+  is some unlogged connections, not the session's network;
 - checksum collection enabled for high-value local rules, without making
   checksums part of the portable baseline;
 - a UI socket under `/run/user/<uid>/opensnitch/`, mode `0700`, rather than the
   shared `/tmp` namespace.
 
-The UI also defaults to deny. New answers last only until restart unless you
-deliberately choose `always`; this prevents one troubleshooting click from
-becoming an unnoticed permanent permission. That setting is stored as a combo
-box *index*, not a duration — `default_duration=7` is "until restart", and
-index `6`, which upstream's own `DEFAULT_DURATION_IDX` labels "until restart",
-is really `12h`. The distinction matters more than it looks: the prompt also
-has a 30 second timeout that applies the default action unattended, so with
-index 6 every prompt nobody was there to answer became a twelve-hour rule. OpenSnitch documents how the GUI
-policy temporarily overrides the daemon policy while connected in its
+The UI keeps its connection pop-up, because seeing a new process reach the
+network is the point. It defaults to **allow** and times out after **3
+seconds** (`default_action=1`, `default_timeout=3`), so ignoring it is the
+normal case and costs nothing; click **Deny** when something looks wrong. The
+answer is per process (`default_target=0`) and lasts until restart
+(`default_duration=7`), so each process pops up once per boot and every later
+connection it makes is still recorded. OpenSnitch documents how the GUI policy
+temporarily overrides the daemon policy while connected in its
 [configuration guide](https://github.com/evilsocket/opensnitch/wiki/Configurations).
 
-That index also decides whether a mis-click survives a reboot, which is the
-part that is easy to miss. Under index `6` the daemon **wrote temporary rules
-to `/etc/opensnitchd/rules`**: this machine's log shows an
-`allow-12h-list-....json` file appearing seconds after each "Added new rule"
-line, root-owned and `0600`. Under index `7` it does not — every "Added new
-rule" since the setting changed has no matching "Ruleset changed due to", and
-the rules live in the daemon's memory until it restarts. So the difference
-between the two indices is not twelve hours versus one login. It is whether an
-unanswered prompt leaves a durable file behind.
+`default_duration` is a combo box *index*, not a duration, and index `6` —
+which upstream's own `DEFAULT_DURATION_IDX` labels "until restart" — is really
+`12h`. The difference matters beyond the length: under index `6` the daemon
+**wrote each timed-out answer to `/etc/opensnitchd/rules`** as a root-owned
+`allow-12h-....json`, while under index `7` answers live only in the daemon's
+memory. Index `7` is what keeps a busy boot from leaving a pile of rule files
+behind.
+
+Where to look:
+
+| What | Where |
+| --- | --- |
+| Every connection, allowed or denied, with process and command line | the UI's Events tab, kept in `~/.local/share/opensnitch/events.sqlite3` for 30 days |
+| Processes that first reached the network since boot | `./bin/opensnitch-rulectl list --temporary` |
+| Live decisions and the exact fields a rule would match | `./bin/opensnitch-rulectl watch -s 60` |
+
+What still blocks: only explicit `deny` rules — on this machine the four in
+[The permanent denies on this machine](#the-permanent-denies-on-this-machine)
+— and a pop-up you answer with Deny, which lasts until restart.
 
 The setup adds `opensnitch-ui-secure` as a Hyprland toggle drop-in
 (`~/.local/state/omarchy/toggles/hypr/omarchy-scripts-opensnitch.lua`). That
@@ -70,8 +80,10 @@ not cut off the current session without a UI.
 
 ## Portable baseline
 
-Files in `config/opensnitch/rules/` are imported before enforcement. They are
-grouped into bands so the difference between "the desktop does not work without
+Files in `config/opensnitch/rules/` are imported before the daemon starts. With
+an `allow` default they no longer decide whether traffic flows; they mark it as
+*expected*, so it never pops up and the pop-ups that remain are genuinely new.
+They are grouped into bands so the difference between "the desktop does not work without
 this" and "this repository's own workflow needs it" stays visible:
 
 | Band | What belongs in it | Current rules |
@@ -96,9 +108,9 @@ an ephemeral port. If a peer on your network cannot see this host's services,
 that is the rule to widen — by adding the peer's subnet, not by allowing
 `avahi-daemon` everywhere.
 
-Without the NetworkManager rule the connectivity check fails closed and every
-network is reported as "limited", which is a confusing first symptom of a
-correctly working firewall rather than a broken one.
+Under the old deny default, a missing NetworkManager rule made every network
+report as "limited". Now it would only mean a pop-up at each boot, but the rule
+stays as documentation of what the desktop needs.
 
 Two of the tooling rules are worth reading before you copy them:
 
@@ -132,10 +144,10 @@ Two consequences are worth stating plainly. A rule naming `github.com` alone
 would allow the request and deny the payload, because GitHub redirects release
 assets to `*.githubusercontent.com`; that alternation is load-bearing rather
 than defensive. And `083` deliberately omits `storage.googleapis.com`, which
-trivy's preferred `mirror.gcr.io` may redirect to: allowing it would open every
-Google Cloud Storage bucket to every container, and the `ghcr.io` fallback
-already completes the scan. A stall on the mirror is a prompt worth answering
-by hand rather than a hole worth opening permanently.
+trivy's preferred `mirror.gcr.io` may redirect to: marking it expected would
+hide every Google Cloud Storage bucket any container reaches. Under the allow
+default the redirect goes through anyway; leaving it out just means it still
+pops up, and a container reaching an arbitrary bucket is worth seeing.
 
 `084` and `085` cover `mise`, which is a different shape of dependency: not a
 project's toolchain but the thing that installs everything else, including the
@@ -175,16 +187,17 @@ Three things about that set are worth reading before copying it:
   ECR Public's shared blob distribution rather than a per-repository address. It
   is named exactly rather than as an alternation over `cloudfront.net`, for the
   same reason `083` omits `storage.googleapis.com`: that alternation would open
-  every site behind the CDN to `podman`. If AWS moves it, the symptom is a pull
-  that stalls after "Copying blob" and the fix is this one hostname.
-- **The failure mode is silence, not an error.** A denied pull does not report a
-  refusal. The daemon drops the packets, `podman` retries three times and exits
-  on `i/o timeout`, and every layer above it — a `make test-full` run, a
-  container image review — reports a network fault. The first machine to hit
-  this spent its debugging effort on the registry rather than on the firewall.
+  every site behind the CDN to `podman`. If AWS moves it, the symptom is a pop-up
+  for the new CDN host on every pull, and the fix is this one hostname.
+- **A denied pull fails silently, not with an error.** If one is ever denied,
+  the daemon drops the packets, `podman` retries three times and exits on
+  `i/o timeout`, and every layer above it — a `make test-full` run, a
+  container image review — reports a network fault. Look at the firewall
+  before the registry.
 
 Something that reaches the network on a timer rather than when you ask it to
-needs a permanent rule or it will prompt when nobody is at the machine.
+is worth a permanent rule, so its pop-up does not appear when nobody is at the
+machine.
 `setup-security-hardening` enables `arch-audit.timer`, which fires overnight
 against `security.archlinux.org`; that rule is machine-local here only because
 its counterpart, `pacman`, has to name host-specific mirrors.
@@ -248,8 +261,7 @@ it must not shadow. The denies this machine actually runs are listed under
 [The permanent denies on this machine](#the-permanent-denies-on-this-machine).
 
 Two other things reach the network on a schedule rather than when you ask them
-to, so both need permanent rules or they will prompt at an hour when nobody is
-watching:
+to, so both get permanent rules to keep them out of the pop-ups:
 
 - `pacman`, to whichever hosts `/etc/pacman.conf` and
   `/etc/pacman.d/mirrorlist` actually name — on this machine
@@ -262,11 +274,10 @@ watching:
 
 ### Promoting a temporary rule
 
-A rule answered at a prompt is a decision made under time pressure, with a
-30 second clock running, by someone who wanted to get on with something else.
-Left alone it evaporates at the next reboot and the same prompt comes back, so
-the machine keeps re-deciding rather than deciding once. Two commands close
-that loop:
+A pop-up answer lasts until restart, so the same process pops up again after
+every reboot. When it is traffic you expect, promote it to a curated rule once
+and it stops appearing — or, for a Deny you clicked on purpose, keeps blocking.
+Two commands close that loop:
 
 ```bash
 ./bin/opensnitch-rulectl list --temporary   # what a reboot is about to lose
@@ -337,13 +348,11 @@ anyone having to edit the deny.
 
   Narrowing a *deny* this way is worth a sentence, because the instinct is
   that a deny should be as broad as possible so it cannot be slipped past.
-  That instinct is wrong here, and the reason is the default action: nothing
-  allows Bitwarden to this host — `160` is scoped to the vault host, `170`
-  requires Cursor's own `process.command` — so if this match ever stops
-  fitting, the connection meets the daemon's `deny` default and prompts. A
-  narrow deny that misses does not become an allow. What it does buy is that
-  the rule denies the application named in it rather than every Electron app
-  on the machine.
+  With an `allow` default that instinct has a point: if this match ever stops
+  fitting, the breach check pops up and, left alone, is allowed after three
+  seconds. The match is narrow anyway, because the broad alternative denies
+  every Electron application on the machine. If Bitwarden's process layout
+  changes, re-check it with `opensnitch-rulectl watch -f bitwarden`.
 
   `electron[0-9]+` rather than the literal `electron39` the prompt produced,
   so an Electron major bump does not change what this matches.
@@ -424,12 +433,10 @@ the same `curl` connection: with both at `precedence: false` the connection was
 denied twelve times out of twelve; setting `precedence: true` on the allow
 flipped it to allowed ten times out of ten.
 
-That turns the prompt timeout into a policy bug. A prompt nobody answers
-applies the default action — deny — and saves it as a temporary rule. From
-that moment a permanent, deliberate, non-precedence `allow` is dead until the
-temporary rule expires, and nothing in the UI shows the allow as inactive. This
-machine collected a `deny-12h-simple-usr-lib-electron39-electron` that way more
-than once.
+Under the old deny default that turned the prompt timeout into a policy bug: an
+unanswered prompt saved a temporary deny, which silently killed a deliberate
+non-precedence `allow` until it expired. Prompts now time out to allow, but a
+Deny you click is still a temporary deny with the same effect.
 
 So every curated `allow` in `000`–`170` carries `precedence: true`. The rules
 that deliberately do not are the denies in `190`–`193`: `190` must lose to
@@ -471,12 +478,14 @@ Only one process can hold the socket, so the tool stops the GUI, serves the
 socket itself, and starts the GUI again — roughly ninety seconds, most of it
 waiting for the daemon's reconnect backoff. During that window:
 
-- **Enforcement continues.** Rules are evaluated by the daemon, not the UI, so
-  every permanent rule keeps working and the session keeps its network.
+- **Rules keep applying.** Rules are evaluated by the daemon, not the UI, so
+  every permanent rule — including the denies — keeps working and the session
+  keeps its network.
 - **Prompts have nowhere to go.** A connection matching no rule is answered
-  `deny` for that one connection and not saved, so the window cannot leave a
-  permanent decision behind. `--allow-prompts` inverts the answer; it is still
-  once-only. Either way `watch` reports what asked.
+  `allow` for that one connection and not saved, matching the monitoring
+  default, so the window cannot leave a decision behind. `--deny-prompts`
+  inverts the answer for tracing a denial; it is still once-only. Either way
+  `watch` reports what asked.
 - **`--dry-run` does not take the socket at all**, because stopping the GUI is
   itself a change.
 
@@ -573,15 +582,17 @@ GUI-created file outside that namespace is ever pruned.
 
 ```bash
 systemctl status opensnitchd.service
-grep -E 'DefaultAction|ProcMonitorMethod|Firewall' /etc/opensnitchd/default-config.json
+grep -E 'DefaultAction|QueueBypass|ProcMonitorMethod|Firewall' /etc/opensnitchd/default-config.json
+grep -E '^(default_action|default_timeout|default_duration|type|file)=' ~/.config/opensnitch/settings.conf
 ls -l /run/user/"$(id -u)"/opensnitch/osui.sock
 ./bin/opensnitch-rulectl list
 ./bin/opensnitch-rulectl list --temporary
 sudo nft list ruleset | grep -i opensnitch
 ```
 
-If an application is unexpectedly blocked, grant the narrowest temporary rule
-first, and promote it to `always` — with `opensnitch-rulectl promote`, see
+If an application is unexpectedly blocked, it is matching an explicit deny or
+a Deny clicked at a pop-up. Find which with `opensnitch-rulectl list`, and for
+a durable exception promote a narrow allow to `always` — with `opensnitch-rulectl promote`, see
 [Promoting a temporary rule](#promoting-a-temporary-rule) — only after the
 application works and the match fields are understood. Find the match fields with
 
@@ -625,10 +636,10 @@ pkill -x opensnitch-ui
 ~/.local/bin/opensnitch-ui-secure &
 ```
 
-While the UI is down there is no one to answer prompts, so a new connection
-gets the default action — `deny` — with no dialog. Keep the gap short.
+While the UI is down a new connection gets the default action — `allow` — with
+no dialog and no Events entry, so it goes unrecorded. Keep the gap short.
 
-To pause enforcement without deleting rules:
+To stop monitoring without deleting rules:
 
 ```bash
 sudo systemctl stop opensnitchd.service

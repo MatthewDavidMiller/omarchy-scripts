@@ -59,7 +59,7 @@ touching the system.
 | `bin/setup-desktop-cpu-priority` | Keep the desktop ahead of container builds for CPU | [docs/setup-desktop-cpu-priority.md](docs/setup-desktop-cpu-priority.md) |
 | `bin/setup-no-discovery-services` | Disable the CUPS and Avahi discovery daemons | [docs/setup-no-discovery-services.md](docs/setup-no-discovery-services.md) |
 | `bin/setup-security-hardening` | Enforce a safe package, firewall, kernel, and credential-file baseline | [docs/setup-security-hardening.md](docs/setup-security-hardening.md) |
-| `bin/setup-opensnitch` | Opt-in deny-by-default outbound application firewall | [docs/setup-opensnitch.md](docs/setup-opensnitch.md) |
+| `bin/setup-opensnitch` | Outbound connection monitor: allow by default, log, and announce new connections | [docs/setup-opensnitch.md](docs/setup-opensnitch.md) |
 | `bin/export-opensnitch-rules` | Export reviewed permanent allows for reuse across machines | [docs/setup-opensnitch.md](docs/setup-opensnitch.md) |
 | `bin/opensnitch-rulectl` | Read, apply, delete and trace OpenSnitch rules without root | [docs/setup-opensnitch.md](docs/setup-opensnitch.md) |
 | `bin/lint` | shellcheck in a container — no host tooling to install | [docs/lint.md](docs/lint.md) |
@@ -69,10 +69,9 @@ Images, pinned by digest — and **small**, so a lint run costs seconds rather
 than minutes. The engine that runs them is Podman or Docker, whichever answers.
 
 Scripts are discovered automatically — a new `bin/setup-*` joins `setup-all`
-just by existing, and all of them run. Two are more disruptive than the rest:
-`setup-opensnitch` brings up a deny-by-default outbound firewall, and
-`setup-no-discovery-services` turns off printing. Hold either back with
-`setup-all --skip opensnitch`.
+just by existing, and all of them run. One is more disruptive than the rest:
+`setup-no-discovery-services` turns off printing. Hold it back with
+`setup-all --skip no-discovery-services`.
 
 ## Development
 
