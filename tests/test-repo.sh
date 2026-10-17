@@ -73,7 +73,10 @@ for path in \
   tests/test-setup-desktop-cpu-priority.sh \
   tests/test-export-opensnitch-rules.sh tests/test-opensnitch-rulectl.sh \
   bin/setup-no-discovery-services docs/setup-no-discovery-services.md \
-  tests/test-setup-no-discovery-services.sh
+  tests/test-setup-no-discovery-services.sh \
+  bin/setup-wireguard docs/setup-wireguard.md tests/test-setup-wireguard.sh \
+  config/omarchy/plugins/omarchy-scripts.wireguard/manifest.json \
+  config/omarchy/plugins/omarchy-scripts.wireguard/Widget.qml
 do
   it "keeps $path tracked"
   if ignored "$path"; then fail "$path must not be ignored"; else pass; fi

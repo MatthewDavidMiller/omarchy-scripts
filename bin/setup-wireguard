@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+#
+# setup-wireguard — WireGuard client through NetworkManager, toggled from the bar.
+#
+# order: 62
+# description: Install WireGuard and add a bar toggle for an NM tunnel
+#
+# Omarchy runs NetworkManager with systemd-resolved, and NetworkManager speaks
+# WireGuard natively: an imported tunnel gets its DNS pushed into resolved and
+# shows up next to every other connection. That is why this does not use
+# wg-quick, which would need a resolvconf shim and a root systemd unit per
+# tunnel. wireguard-tools comes from Arch's signed extra repository; it adds
+# the `wg` command for inspecting a running tunnel.
+#
+# The tunnel is imported with autoconnect off. It is switched on and off from a
+# bar widget (config/omarchy/plugins/omarchy-scripts.wireguard), which calls
+# `nmcli connection up|down`. NetworkManager's polkit policy lets the active
+# desktop session do that without a password; only the one-time import needs
+# sudo, because it writes a system connection holding the private key.
+#
+# Update safety: the package updates with the system, the connection lives in
+# /etc/NetworkManager/system-connections, and the widget in the user-owned
+# ~/.config/omarchy/plugins. `omarchy refresh shell` can reset the bar layout
+# in shell.json; re-running this script puts the widget back. No hook needed.
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+# shellcheck source=../lib/omarchy.sh
+source "$SCRIPT_DIR/../lib/omarchy.sh"
+
+PACKAGE=wireguard-tools
+PLUGIN_ID=omarchy-scripts.wireguard
+PLUGIN_SRC="$OMARCHY_SCRIPTS_ROOT/config/omarchy/plugins/$PLUGIN_ID"
+PLUGIN_DIR="${OMARCHY_PLUGINS_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins}/$PLUGIN_ID"
+
+CONFIG=""
+
+usage() {
+  cat <<'USAGE'
+Usage: setup-wireguard [options]
+
+Installs wireguard-tools from Arch's official repositories, imports a WireGuard
+client config into NetworkManager with autoconnect off, and adds a bar widget
+that brings the tunnel up or down on click.
+
+Without --config it asks for the path to a .conf, but only while no WireGuard
+connection exists yet and only on a terminal; leave the answer blank to skip.
+The connection is named after the file, so wg0.conf becomes "wg0".
+
+Options:
+  -c, --config PATH  WireGuard client config to import.
+  -n, --dry-run      Show what would change without changing anything.
+  -y, --yes          Accepted for setup-all compatibility.
+  -h, --help         Show this help.
+
+Environment:
+  DRY_RUN=1          Same as --dry-run.
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -c|--config)
+      [[ $# -ge 2 ]] || { usage >&2; die "--config needs a path"; }
+      CONFIG="$2"
+      shift
+      ;;
+    -n|--dry-run) DRY_RUN=1 ;;
+    -y|--yes)     ASSUME_YES=1 ;;
+    -h|--help)    usage; exit 0 ;;
+    *)            usage >&2; die "Unknown argument: $1" ;;
+  esac
+  shift
+done
+
+require_not_root
+require_cmd omarchy nmcli
+
+# --- 1. package ------------------------------------------------------------
+
+if omarchy pkg present "$PACKAGE"; then
+  skip "$PACKAGE already installed"
+else
+  log "Installing $PACKAGE"
+  run omarchy pkg add "$PACKAGE"
+  if [[ "$DRY_RUN" != "1" ]]; then
+    omarchy pkg present "$PACKAGE" || die "$PACKAGE was not registered as installed"
+    ok "$PACKAGE installed"
+  fi
+fi
+
+# --- 2. tunnel -------------------------------------------------------------
+
+# wireguard_connections — names of NetworkManager's WireGuard profiles, one per
+# line. nmcli -t backslash-escapes ':' and '\' inside a name.
+wireguard_connections() {
+  nmcli -t -f NAME,TYPE connection show | awk '
+    {
+      line = $0
+      gsub(/\\\\/, "\001", line)
+      gsub(/\\:/, "\002", line)
+      n = split(line, f, ":")
+      if (n == 2 && f[2] == "wireguard") {
+        gsub(/\001/, "\\", f[1])
+        gsub(/\002/, ":", f[1])
+        print f[1]
+      }
+    }'
+}
+
+connection_active() {
+  nmcli -t -f NAME connection show --active | grep -qxF -- "$1"
+}
+
+import_tunnel() {
+  local path="$1" name existing
+
+  # A typed answer arrives with a literal '~'; the shell never expanded it.
+  # shellcheck disable=SC2088
+  if [[ "$path" == "~/"* ]]; then
+    path="$HOME/${path#"~/"}"
+  fi
+  [[ -f "$path" && -r "$path" ]] || die "Cannot read WireGuard config: $path"
+  grep -q '^[[:space:]]*\[Interface\]' "$path" \
+    || die "$path has no [Interface] section; is it a WireGuard config?"
+  grep -q '^[[:space:]]*PrivateKey[[:space:]]*=' "$path" \
+    || die "$path has no PrivateKey; a client config needs one"
+
+  name="$(basename -- "$path")"
+  [[ "$name" == *.conf ]] || die "$path must end in .conf; NetworkManager will not import it otherwise"
+  name="${name%.conf}"
+  [[ "$name" =~ ^[A-Za-z0-9_=+.-]{1,15}$ ]] \
+    || die "\"$name\" is not a valid interface name (1-15 of A-Z a-z 0-9 _=+.-); rename the file, e.g. to wg0.conf"
+
+  existing="$(wireguard_connections)"
+  if grep -qxF -- "$name" <<< "$existing"; then
+    skip "WireGuard connection $name already imported"
+    return 0
+  fi
+
+  log "Importing $path into NetworkManager as $name"
+  run sudo nmcli connection import type wireguard file "$path"
+  run sudo nmcli connection modify "$name" connection.autoconnect no
+  # The import can activate the tunnel straight away. Leave it off: the bar
+  # widget is the switch.
+  if [[ "$DRY_RUN" != "1" ]] && connection_active "$name"; then
+    run nmcli connection down id "$name" >/dev/null
+  fi
+  ok "imported $name with autoconnect off"
+  warn "$path holds the tunnel's private key; NetworkManager has its own root-only copy now, so delete or move the original"
+}
+
+if [[ -n "$CONFIG" ]]; then
+  import_tunnel "$CONFIG"
+elif [[ -n "$(wireguard_connections)" ]]; then
+  skip "WireGuard connection already present: $(wireguard_connections | paste -sd, -)"
+elif [[ -t 0 ]]; then
+  answer=""
+  read -e -r -p "Path to a WireGuard client .conf (blank to skip): " answer || true
+  if [[ -n "$answer" ]]; then
+    import_tunnel "$answer"
+  else
+    skip "no WireGuard config given; re-run with --config PATH to import one"
+  fi
+else
+  skip "no WireGuard connection and no terminal to ask on; re-run with --config PATH"
+fi
+
+# --- 3. bar widget ---------------------------------------------------------
+
+plugin_changed=0
+for src in "$PLUGIN_SRC"/*; do
+  dest="$PLUGIN_DIR/$(basename -- "$src")"
+  if [[ ! -f "$dest" ]] || ! cmp -s "$src" "$dest"; then
+    plugin_changed=1
+  fi
+  write_file "$dest" < "$src"
+done
+
+if [[ "$DRY_RUN" == "1" ]]; then
+  printf '%s  dry%s would enable bar widget %s\n' "$C_DIM" "$C_RESET" "$PLUGIN_ID"
+  exit 0
+fi
+
+shell_down() {
+  warn "omarchy-shell is not answering; run this again from the desktop session to add the bar widget"
+  exit 0
+}
+
+# Rescan before listing, so a freshly copied plugin is discovered by the time
+# it is enabled.
+if [[ "$plugin_changed" == "1" ]]; then
+  omarchy-shell shell rescanPlugins >/dev/null 2>&1 || shell_down
+fi
+plugins="$(omarchy plugin list --json 2>/dev/null)" || shell_down
+
+if grep -qE "\"id\":\"${PLUGIN_ID//./\\.}\"[^}]*\"enabled\":true" <<< "$plugins"; then
+  skip "bar widget $PLUGIN_ID already enabled"
+else
+  omarchy plugin enable "$PLUGIN_ID" --section right >/dev/null
+  ok "bar widget $PLUGIN_ID enabled; click it to bring the tunnel up or down"
+fi

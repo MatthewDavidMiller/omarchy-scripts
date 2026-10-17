@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "id": "omarchy-scripts.wireguard",
+  "name": "WireGuard",
+  "version": "1.0.0",
+  "author": "omarchy-scripts",
+  "license": "MIT",
+  "description": "Shows whether a NetworkManager WireGuard tunnel is up and toggles it on click.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Widget.qml"
+  },
+  "barWidget": {
+    "displayName": "WireGuard",
+    "description": "Click to bring a WireGuard tunnel up or down.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "connection": ""
+    },
+    "schema": [
+      {
+        "key": "connection",
+        "type": "string",
+        "label": "Connection",
+        "description": "NetworkManager connection to toggle. Leave empty to use the first WireGuard connection."
+      }
+    ]
+  }
+}
