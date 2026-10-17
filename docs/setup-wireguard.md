@@ -71,6 +71,31 @@ bar settings, or in its entry in `~/.config/omarchy/shell.json`:
 
 The widget hides itself when NetworkManager has no WireGuard connection.
 
+### Details on right-click
+
+NetworkManager reports a WireGuard connection as activated as soon as the
+interface exists, whether or not the peer ever answers, so a lit padlock does
+not prove the tunnel works. Right-click the widget for a popup that does:
+
+- **Status.** A WireGuard interface only counts received bytes for packets
+  that authenticated, so any received traffic means a handshake completed
+  ("Connected"). If nothing arrives within 15 seconds of opening the popup, it
+  says "No reply from peer". The usual causes are a wrong endpoint, a wrong
+  key, or a firewall dropping the UDP port. `wg show` would give the exact
+  handshake time, but it needs root.
+- **Endpoint, address, DNS** from the NetworkManager profile, and the received
+  and sent byte counters with the time of the last packet from the peer.
+- **Turn on/off**, the same as a left click.
+- **Test** sends one uncached DNS query through the tunnel
+  (`resolvectl query --cache=no -i <device>`). WireGuard has to handshake to
+  carry it, and the popup reports "Peer answered" if received bytes grow within
+  six seconds. It uses DNS rather than ping because ICMP is often blocked
+  behind a tunnel. It needs the profile to have a DNS server.
+
+These checks run only while the popup is open: the counters every two seconds,
+nothing in the background. With the popup closed, the widget does only the
+five-second on/off poll.
+
 From a terminal, the same switch is:
 
 ```bash

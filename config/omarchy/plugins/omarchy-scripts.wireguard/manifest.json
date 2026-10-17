@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "omarchy-scripts.wireguard",
   "name": "WireGuard",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "omarchy-scripts",
   "license": "MIT",
-  "description": "Shows whether a NetworkManager WireGuard tunnel is up and toggles it on click.",
+  "description": "Shows whether a NetworkManager WireGuard tunnel is up, toggles it on click, and shows whether the peer is answering on right-click.",
   "kinds": [
     "bar-widget"
   ],
@@ -14,7 +14,7 @@
   },
   "barWidget": {
     "displayName": "WireGuard",
-    "description": "Click to bring a WireGuard tunnel up or down.",
+    "description": "Click to bring a WireGuard tunnel up or down; right-click for handshake, endpoint and traffic details.",
     "category": "Network",
     "allowMultiple": false,
     "defaultSection": "right",
