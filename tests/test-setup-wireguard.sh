@@ -45,6 +45,8 @@ esac'
 stub_bin "$STUBS" sudo 'exec "$@"'
 # shellcheck disable=SC2016
 stub_bin "$STUBS" omarchy-shell '[[ "${SHELL_DOWN:-0}" != 1 ]]'
+# shellcheck disable=SC2016
+stub_bin "$STUBS" omarchy-restart-shell '[[ "${RESTART_FAIL:-0}" != 1 ]]'
 
 wg_setup() {
   local home="$1"; shift
@@ -153,6 +155,31 @@ assert_contains "$out2" "wg0 already imported"
 
 it "second run reports the widget as already enabled"
 assert_contains "$out2" "already enabled"
+
+it "first and second runs do not restart the shell"
+assert_no_file "$STUBS/omarchy-restart-shell.log"
+
+# --- updated widget --------------------------------------------------------
+
+printf '// stale\n' > "$FAKE_HOME/.config/omarchy/plugins/$PLUGIN_ID/Widget.qml"
+out3="$(wg_setup "$FAKE_HOME" --yes)"
+
+it "an updated widget restarts the shell so the new code loads"
+assert_eq "1" "$(count "" "$STUBS/omarchy-restart-shell.log")" "restart calls"
+
+it "says the shell was restarted"
+assert_contains "$out3" "restarted omarchy-shell"
+
+printf '// stale\n' > "$FAKE_HOME/.config/omarchy/plugins/$PLUGIN_ID/Widget.qml"
+out4="$(env RESTART_FAIL=1 HOME="$FAKE_HOME" PATH="$STUBS:$PATH" \
+  "$REPO_ROOT/bin/setup-wireguard" --yes </dev/null 2>&1)"
+status=$?
+
+it "a failed restart is a warning, not a failure"
+assert_status 0 "$status"
+
+it "says how to restart by hand"
+assert_contains "$out4" "run omarchy-restart-shell"
 
 it "a run without --config skips when a WireGuard connection exists"
 assert_contains "$(wg_setup "$FAKE_HOME" --yes)" "WireGuard connection already present: wg0"

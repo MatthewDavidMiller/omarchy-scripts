@@ -199,6 +199,15 @@ plugins="$(omarchy plugin list --json 2>/dev/null)" || shell_down
 
 if grep -qE "\"id\":\"${PLUGIN_ID//./\\.}\"[^}]*\"enabled\":true" <<< "$plugins"; then
   skip "bar widget $PLUGIN_ID already enabled"
+  # The shell's live plugin reload keeps running the compiled copy of a widget
+  # it already loaded, so an update only shows after a full restart.
+  if [[ "$plugin_changed" == "1" ]]; then
+    if omarchy-restart-shell >/dev/null 2>&1; then
+      ok "restarted omarchy-shell to load the updated widget"
+    else
+      warn "could not restart omarchy-shell (is the session locked?); run omarchy-restart-shell to load the updated widget"
+    fi
+  fi
 else
   omarchy plugin enable "$PLUGIN_ID" --section right >/dev/null
   ok "bar widget $PLUGIN_ID enabled; click it to bring the tunnel up or down"

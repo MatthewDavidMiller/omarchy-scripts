@@ -45,8 +45,13 @@ transfer counters.
 3. Copies the `omarchy-scripts.wireguard` shell plugin from
    `config/omarchy/plugins/` to `~/.config/omarchy/plugins/`, rescans plugins
    when the files changed, and enables the widget on the right of the bar if
-   it is not already enabled. If `omarchy-shell` is not running — over SSH,
-   say — it warns and leaves that step for a re-run from the desktop.
+   it is not already enabled. When an already-enabled widget's files changed,
+   it restarts the shell with `omarchy-restart-shell`: the shell's live plugin
+   reload keeps running the copy it compiled earlier, so an update would
+   otherwise not show. If the restart fails (it refuses while the session is
+   locked), it warns and you can run `omarchy-restart-shell` yourself. If
+   `omarchy-shell` is not running — over SSH, say — it warns and leaves the
+   widget step for a re-run from the desktop.
 
 The private key is copied into
 `/etc/NetworkManager/system-connections/<name>.nmconnection`, which is root
