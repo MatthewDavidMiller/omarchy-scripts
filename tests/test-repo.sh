@@ -75,6 +75,8 @@ for path in \
   bin/setup-no-discovery-services docs/setup-no-discovery-services.md \
   tests/test-setup-no-discovery-services.sh \
   bin/setup-wireguard docs/setup-wireguard.md tests/test-setup-wireguard.sh \
+  bin/setup-ventoy docs/setup-ventoy.md tests/test-setup-ventoy.sh \
+  packages/ventoy/PKGBUILD packages/ventoy/ventoy-launcher packages/ventoy/ventoy.desktop \
   config/omarchy/plugins/omarchy-scripts.wireguard/manifest.json \
   config/omarchy/plugins/omarchy-scripts.wireguard/Widget.qml
 do

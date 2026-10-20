@@ -49,6 +49,7 @@ touching the system.
 | `bin/setup-no-idle` | Stop the screensaver and idle auto-lock from firing | [docs/setup-no-idle.md](docs/setup-no-idle.md) |
 | `bin/setup-brave` | Build vetted Brave package and make it the default browser | [docs/setup-brave.md](docs/setup-brave.md) |
 | `bin/setup-rpi-imager` | Install Raspberry Pi Imager from Arch Extra | [docs/setup-rpi-imager.md](docs/setup-rpi-imager.md) |
+| `bin/setup-ventoy` | Build vetted Ventoy package from its pinned first-party release | [docs/setup-ventoy.md](docs/setup-ventoy.md) |
 | `bin/setup-wireguard` | WireGuard client through NetworkManager, toggled from the bar | [docs/setup-wireguard.md](docs/setup-wireguard.md) |
 | `bin/setup-cat-background` | Set a pixel-art cat desktop and disk-unlock background | [docs/setup-cat-background.md](docs/setup-cat-background.md) |
 | `bin/setup-no-chromium-extensions` | Remove Omarchy's bundled Chromium extensions | [docs/setup-no-chromium-extensions.md](docs/setup-no-chromium-extensions.md) |

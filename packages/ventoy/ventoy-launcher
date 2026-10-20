@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Entry point for both /usr/bin/ventoy (CLI) and /usr/bin/ventoy-gui, chosen
+# by the name it was invoked as. Ventoy's scripts expect to run from an
+# unpacked release directory and write scratch files into it, so the CLI runs
+# from a private work directory of symlinks and /opt/ventoy stays exactly as
+# pacman installed it.
+set -euo pipefail
+
+VENTOY_ROOT=/opt/ventoy
+
+case "${0##*/}" in
+  ventoy-gui)
+    # VentoyGUI re-executes itself through pkexec and picks a toolkit by
+    # desktop; GTK3 is the only toolkit build this package ships.
+    cd "$VENTOY_ROOT"
+    exec ./VentoyGUI.x86_64 --gtk3 "$@"
+    ;;
+  ventoy)
+    if [[ "$EUID" -ne 0 ]]; then
+      printf 'ventoy writes to raw disks and must run as root, e.g.\n' >&2
+      printf '  sudo ventoy -i /dev/sdX\n' >&2
+      exit 1
+    fi
+    work="$(mktemp -d /tmp/ventoy.XXXXXX)"
+    trap 'umount "$work/tmp_mnt" 2>/dev/null || true; rm -rf "$work"' EXIT
+    for entry in "$VENTOY_ROOT"/*; do
+      ln -s "$entry" "$work/${entry##*/}"
+    done
+    cd "$work"
+    ./Ventoy2Disk.sh "$@"
+    ;;
+  *)
+    printf 'Unknown Ventoy entry point: %s\n' "${0##*/}" >&2
+    exit 1
+    ;;
+esac

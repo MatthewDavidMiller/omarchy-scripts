@@ -1,0 +1,64 @@
+# Maintained in this repository; deliberately not sourced from the AUR.
+# Ventoy publishes SHA-256 sums but no signatures, so the release version and
+# digest are pinned here. On every bump, cross-check the new digest against the
+# release notes, the release's sha256.txt, and GitHub's asset digest.
+pkgname=ventoy-local
+pkgver=1.1.18
+pkgrel=1
+pkgdesc='Ventoy bootable USB tool repackaged from the pinned first-party release'
+arch=('x86_64')
+url='https://www.ventoy.net/'
+license=('GPL-3.0-or-later')
+depends=(
+  'bash' 'coreutils' 'device-mapper' 'dosfstools' 'e2fsprogs' 'gawk' 'glib2'
+  'grep' 'gtk3' 'json-glib' 'parted' 'polkit' 'sed' 'systemd' 'util-linux'
+  'which'
+)
+optdepends=('ntfs-3g: non-destructive install onto an NTFS disk')
+provides=('ventoy')
+conflicts=('ventoy' 'ventoy-bin')
+options=('!debug' '!strip')
+
+_tarball="ventoy-${pkgver}-linux.tar.gz"
+source=(
+  "${_tarball}::https://github.com/ventoy/Ventoy/releases/download/v${pkgver}/${_tarball}"
+  'ventoy-launcher'
+  'ventoy.desktop'
+)
+sha256sums=(
+  'd86ff9de63d94c8b8f1f6b14d23c55af4b88e8207bf2893890892a6a97b1ad54'
+  '1a67265c4f0a6398435a5b1e6049c28461814d52bcfbf6afedb95078b0cde06a'
+  '9f2267223ad719ae9445391554e46c466d8b610eec99e192703662aba75eca09'
+)
+
+package() {
+  local root="$pkgdir/opt/ventoy" tools file
+  mkdir -p "$pkgdir/opt"
+  cp -a "$srcdir/ventoy-${pkgver}" "$root"
+  tools="$root/tool/x86_64"
+
+  # Only the x86_64 CLI and GTK3 GUI are packaged. The web UI and Plugson
+  # servers, the other architectures, and the GTK2/Qt5 GUI builds are not.
+  rm -rf "$root"/tool/{aarch64,i386,mips64el} "$root/WebUI" \
+    "$root/tool/plugson.tar.xz"
+  rm -f "$root"/VentoyGUI.{aarch64,i386,mips64el} \
+    "$root/VentoyWeb.sh" "$root/VentoyPlugson.sh" \
+    "$tools"/{V2DServer,Plugson}.xz "$tools"/Ventoy2Disk.{gtk2,qt5}
+
+  # Ventoy2Disk.sh unpacks these on first run and may swap in the static
+  # mkexfatfs. Doing both here leaves nothing for it to change under /opt.
+  for file in "$tools"/*.xz; do
+    xz -dc "$file" > "${file%.xz}"
+    rm "$file"
+  done
+  rm "$tools/mkexfatfs_static"
+  chmod 755 "$tools"/*
+
+  # Both front ends append to ./log.txt; send that out of /opt.
+  ln -s /var/log/ventoy.log "$root/log.txt"
+
+  install -Dm755 "$srcdir/ventoy-launcher" "$pkgdir/usr/bin/ventoy"
+  ln -s ventoy "$pkgdir/usr/bin/ventoy-gui"
+  install -Dm644 "$srcdir/ventoy.desktop" \
+    "$pkgdir/usr/share/applications/ventoy.desktop"
+}

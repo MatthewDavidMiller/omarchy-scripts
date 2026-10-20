@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+#
+# setup-ventoy — build vetted Ventoy package from its pinned first-party release.
+#
+# order: 60
+# description: Build vetted Ventoy package from its pinned first-party release
+#
+# Ventoy is not in the official Arch or Omarchy repositories, so this builds
+# the repository-owned recipe in packages/ventoy. Upstream signs nothing; the
+# recipe pins the release version and its SHA-256, which makepkg verifies
+# before packaging. It does not use the AUR or an AUR helper.
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=../lib/common.sh
+source "$REPO_ROOT/lib/common.sh"
+
+PACKAGE_DIR="${VENTOY_PACKAGE_DIR:-$REPO_ROOT/packages/ventoy}"
+PACKAGE_NAME="ventoy-local"
+RECIPE_FILES=(PKGBUILD ventoy-launcher ventoy.desktop)
+
+usage() {
+  cat <<'USAGE'
+Usage: setup-ventoy [options]
+
+Builds this repository's Ventoy package recipe from the pinned first-party
+release, verifies its pinned SHA-256, and installs it with pacman. Installs
+the `ventoy` CLI (run with sudo) and the `ventoy-gui` GTK app. No AUR
+package, recipe, repository, or helper is used.
+
+Options:
+  -n, --dry-run   Show what would change without changing anything.
+  -y, --yes       Accepted for setup-all compatibility.
+  -h, --help      Show this help.
+
+Environment:
+  DRY_RUN=1       Same as --dry-run.
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--dry-run) DRY_RUN=1 ;;
+    -y|--yes)     ASSUME_YES=1 ;;
+    -h|--help)    usage; exit 0 ;;
+    *)            usage >&2; die "Unknown argument: $1" ;;
+  esac
+  shift
+done
+
+require_not_root
+require_cmd pacman makepkg
+[[ "$(uname -m)" == "x86_64" ]] \
+  || die "The vetted Ventoy package currently supports x86_64 only"
+for file in "${RECIPE_FILES[@]}"; do
+  [[ -f "$PACKAGE_DIR/$file" ]] \
+    || die "Ventoy package recipe is incomplete: $PACKAGE_DIR/$file is missing"
+done
+
+for conflicting_package in ventoy ventoy-bin; do
+  # pacman resolves -Q targets through provides= entries, and our package
+  # provides ventoy. Only a package actually named this is a conflict.
+  resolved_package="$(pacman -Q "$conflicting_package" 2>/dev/null \
+    | awk 'NR == 1 { print $1 }' || true)"
+  if [[ "$resolved_package" == "$conflicting_package" ]]; then
+    die "Remove conflicting package $conflicting_package before installing the vetted build"
+  fi
+done
+
+# shellcheck disable=SC1091,SC2154  # pkgver/pkgrel come from the PKGBUILD
+package_version="$(
+  source "$PACKAGE_DIR/PKGBUILD"
+  printf '%s-%s' "$pkgver" "$pkgrel"
+)"
+installed_version="$(pacman -Q "$PACKAGE_NAME" 2>/dev/null | awk '{print $2}' || true)"
+
+if [[ "$installed_version" == "$package_version" ]]; then
+  skip "Ventoy $package_version is already installed"
+  exit 0
+fi
+
+build_dir="$(mktemp -d "${TMPDIR:-/tmp}/omarchy-ventoy.XXXXXX")"
+trap 'rm -rf "$build_dir"' EXIT
+for file in "${RECIPE_FILES[@]}"; do
+  cp "$PACKAGE_DIR/$file" "$build_dir/"
+done
+
+log "Building vetted Ventoy $package_version from its pinned first-party release"
+if [[ "$DRY_RUN" == "1" ]]; then
+  printf '%s  dry%s makepkg --syncdeps --install --cleanbuild --noconfirm --needed (%s)\n' \
+    "$C_DIM" "$C_RESET" "$build_dir/PKGBUILD"
+  exit 0
+fi
+(
+  cd "$build_dir"
+  makepkg --syncdeps --install --cleanbuild --noconfirm --needed
+)
+
+[[ "$(pacman -Q "$PACKAGE_NAME" 2>/dev/null | awk '{print $2}')" == "$package_version" ]] \
+  || die "$PACKAGE_NAME $package_version was not registered as installed"
+
+ok "Vetted Ventoy installed: sudo ventoy -i /dev/sdX, or launch ventoy-gui"

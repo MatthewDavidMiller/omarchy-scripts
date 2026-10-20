@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Ventoy
+Comment=Create a bootable USB drive for ISO images
+Exec=ventoy-gui
+Icon=drive-removable-media
+Terminal=false
+Categories=System;Utility;
