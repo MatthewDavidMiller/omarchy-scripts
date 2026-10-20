@@ -96,6 +96,7 @@ its `pacman` stub past the pipe buffer on purpose.
 | `confirm "prompt"` | Ask, unless `ASSUME_YES=1` |
 | `write_file path <<<content` | Idempotent write with backup |
 | `install_root_file src dest` | Idempotent `sudo install` with backup; returns 1 when already current |
+| `makepkg_install dir` | Build a recipe as the user, then install it with one `sudo pacman -U` |
 
 `lib/tui.sh` adds the menu layer used by `setup-all` — `tui_menu`,
 `tui_multiselect`, `tui_confirm`, `tui_title`, `tui_banner`. Each prefers `gum`

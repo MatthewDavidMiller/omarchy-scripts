@@ -119,15 +119,7 @@ package_version="$latest_version-1"
 
 if [[ "$installed_version" != "$package_version" ]]; then
   log "Building vetted Brave $package_version from its signed first-party stable RPM"
-  if [[ "$DRY_RUN" == "1" ]]; then
-    printf '%s  dry%s makepkg --syncdeps --install --cleanbuild --noconfirm --needed (%s)\n' \
-      "$C_DIM" "$C_RESET" "$build_dir/PKGBUILD"
-  else
-    (
-      cd "$build_dir"
-      makepkg --syncdeps --install --cleanbuild --noconfirm --needed
-    )
-  fi
+  makepkg_install "$build_dir"
 else
   skip "Latest stable Brave $package_version is already installed"
 fi

@@ -24,16 +24,21 @@ case "$*" in
     [[ -f "${FAKE_PKG_DB:?}" ]] || exit 1
     printf "brave-browser-local %s\n" "$(cat "$FAKE_PKG_DB")"
     ;;
+  "-U --needed --noconfirm "*.pkg.tar.zst)
+    [[ -f "${*: -1}" ]] || exit 45
+    [[ "${INSTALL_NOOP:-0}" == 1 ]] || cat "${*: -1}" > "${FAKE_PKG_DB:?}"
+    ;;
   *) echo "unexpected: $*" >&2; exit 1 ;;
 esac'
 
+# The "package" a build produces holds the version pacman -U registers.
 # shellcheck disable=SC2016
 stub_bin "$STUBS" makepkg '
 [[ "${MAKEPKG_FAIL:-0}" != 1 ]] || exit 42
 [[ -f PKGBUILD && -f brave-launcher ]] || exit 44
-if [[ "${MAKEPKG_NOOP:-0}" != 1 ]]; then
-  printf "1.93.138-1\n" > "${FAKE_PKG_DB:?}"
-fi'
+package="$PWD/brave-browser-local-x86_64.pkg.tar.zst"
+if [[ "$1" == --packagelist ]]; then printf "%s\n" "$package"; exit 0; fi
+printf "1.93.138-1\n" > "$package"'
 
 stub_bin "$STUBS" sudo 'exec "$@"'
 
@@ -113,8 +118,14 @@ POLICY_ONE="$(policy_fixture one)"
 DB_ONE="$TEST_TMP/package-one"
 out="$(brave_setup "$HOME_ONE" "$POLICY_ONE" "$DB_ONE" --yes)"
 
-it "builds the repository-owned package with makepkg"
-assert_file_contains "$STUBS/makepkg.log" "--syncdeps --install --cleanbuild --noconfirm --needed"
+it "builds the repository-owned package with makepkg, without root"
+assert_file_contains "$STUBS/makepkg.log" "--cleanbuild --nodeps --noconfirm"
+
+it "does not let makepkg call pacman itself, which prompts for sudo every time"
+assert_not_contains "$(cat "$STUBS/makepkg.log")" "--install"
+
+it "installs the built package through one sudo pacman -U"
+assert_eq "1" "$(grep -c '^pacman -U' "$STUBS/sudo.log")" "sudo pacman calls"
 
 it "installs the resolved latest stable package version"
 assert_eq "1.93.138-1" "$(cat "$DB_ONE")" "package version"
@@ -198,9 +209,11 @@ assert_contains "$loose_out" "Taking $LOOSE_POLICY back"
 
 # The real machine needs root:root, which an unprivileged test cannot produce.
 # Record what the script asks sudo for, and confirm it refuses to report
-# success while the directory is still owned by the invoking user.
+# success while the directory is still owned by the invoking user. The package
+# install still goes through, so the run gets as far as the policy check.
 RECORD_STUBS="$TEST_TMP/record-stubs"
-stub_bin "$RECORD_STUBS" sudo ''
+# shellcheck disable=SC2016
+stub_bin "$RECORD_STUBS" sudo '[[ "$1" != pacman ]] || exec "$@"'
 for command in omarchy makepkg pacman; do
   ln -s "$STUBS/$command" "$RECORD_STUBS/$command"
 done
@@ -290,10 +303,10 @@ noop_out="$(env HOME="$NOOP_HOME" PATH="$STUBS:$PATH" \
   BRAVE_POLICY_PARENTS="$(policy_parents "$(policy_fixture noop)")" \
   BRAVE_PREPARE_LATEST="$STUBS/prepare-latest" \
   FAKE_PKG_DB="$TEST_TMP/noop-package" \
-  MAKEPKG_NOOP=1 "$REPO_ROOT/bin/setup-brave" --yes 2>&1)"
+  INSTALL_NOOP=1 "$REPO_ROOT/bin/setup-brave" --yes 2>&1)"
 status=$?
 
-it "fails if makepkg did not register the package"
+it "fails if pacman did not register the package"
 assert_status 1 "$status"
 
 it "explains a failed package verification"

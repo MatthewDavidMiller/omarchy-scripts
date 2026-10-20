@@ -15,15 +15,22 @@ case "$*" in
     printf "ventoy-local %s\n" "$(cat "$FAKE_PKG_DB")"
     ;;
   "-Q ventoy-bin") exit 1 ;;
+  "-U --needed --noconfirm "*.pkg.tar.zst)
+    [[ -f "${*: -1}" ]] || exit 45
+    [[ "${INSTALL_NOOP:-0}" == 1 ]] || cat "${*: -1}" > "${FAKE_PKG_DB:?}"
+    ;;
   *) echo "unexpected: $*" >&2; exit 1 ;;
 esac'
 
+# The "package" a build produces holds the version pacman -U registers.
 # shellcheck disable=SC2016
 stub_bin "$STUBS" makepkg '
 [[ -f PKGBUILD && -f ventoy-launcher && -f ventoy.desktop ]] || exit 44
-if [[ "${MAKEPKG_NOOP:-0}" != 1 ]]; then
-  (source PKGBUILD; printf "%s-%s\n" "$pkgver" "$pkgrel") > "${FAKE_PKG_DB:?}"
-fi'
+package="$PWD/ventoy-local-x86_64.pkg.tar.zst"
+if [[ "$1" == --packagelist ]]; then printf "%s\n" "$package"; exit 0; fi
+(source PKGBUILD; printf "%s-%s\n" "$pkgver" "$pkgrel") > "$package"'
+
+stub_bin "$STUBS" sudo 'exec "$@"'
 
 # shellcheck disable=SC1090,SC2154  # the variables come from the PKGBUILD
 expected_version="$(source "$PKGBUILD"; printf '%s-%s' "$pkgver" "$pkgrel")"
@@ -52,8 +59,17 @@ assert_contains "$out" "Ventoy $expected_version from its pinned first-party rel
 DB_ONE="$TEST_TMP/package-one"
 out="$(ventoy_setup "$DB_ONE" --yes)"
 
-it "builds the repository-owned package with makepkg"
-assert_file_contains "$STUBS/makepkg.log" "--syncdeps --install --cleanbuild --noconfirm --needed"
+it "builds the repository-owned package with makepkg, without root"
+assert_file_contains "$STUBS/makepkg.log" "--cleanbuild --nodeps --noconfirm"
+
+it "does not let makepkg call pacman itself, which prompts for sudo every time"
+assert_not_contains "$(cat "$STUBS/makepkg.log")" "--install"
+
+it "installs the built package with a single sudo call"
+assert_eq "1" "$(grep -c . "$STUBS/sudo.log")" "sudo calls"
+
+it "installs the built package through pacman -U"
+assert_file_contains "$STUBS/sudo.log" "pacman -U --needed --noconfirm"
 
 it "installs the pinned package version"
 assert_eq "$expected_version" "$(cat "$DB_ONE")" "package version"
@@ -79,7 +95,9 @@ case "$*" in
   "-Q ventoy-bin") printf "ventoy-bin 1.1.10-1\n" ;;
   *) exit 1 ;;
 esac'
-ln -s "$STUBS/makepkg" "$CONFLICT_STUBS/makepkg"
+for command in makepkg sudo; do
+  ln -s "$STUBS/$command" "$CONFLICT_STUBS/$command"
+done
 conflict_out="$(env PATH="$CONFLICT_STUBS:$PATH" FAKE_PKG_DB="$TEST_TMP/conflict-package" \
   "$REPO_ROOT/bin/setup-ventoy" --yes 2>&1)"
 status=$?
@@ -90,11 +108,11 @@ assert_status 1 "$status"
 it "names the conflicting package"
 assert_contains "$conflict_out" "Remove conflicting package ventoy-bin"
 
-noop_out="$(env PATH="$STUBS:$PATH" FAKE_PKG_DB="$TEST_TMP/noop-package" MAKEPKG_NOOP=1 \
+noop_out="$(env PATH="$STUBS:$PATH" FAKE_PKG_DB="$TEST_TMP/noop-package" INSTALL_NOOP=1 \
   "$REPO_ROOT/bin/setup-ventoy" --yes 2>&1)"
 status=$?
 
-it "fails if makepkg did not register the package"
+it "fails if pacman did not register the package"
 assert_status 1 "$status"
 
 it "says the package was not registered"

@@ -51,7 +51,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 require_not_root
-require_cmd pacman makepkg
+require_cmd pacman makepkg sudo
 [[ "$(uname -m)" == "x86_64" ]] \
   || die "The vetted Ventoy package currently supports x86_64 only"
 for file in "${RECIPE_FILES[@]}"; do
@@ -88,15 +88,8 @@ for file in "${RECIPE_FILES[@]}"; do
 done
 
 log "Building vetted Ventoy $package_version from its pinned first-party release"
-if [[ "$DRY_RUN" == "1" ]]; then
-  printf '%s  dry%s makepkg --syncdeps --install --cleanbuild --noconfirm --needed (%s)\n' \
-    "$C_DIM" "$C_RESET" "$build_dir/PKGBUILD"
-  exit 0
-fi
-(
-  cd "$build_dir"
-  makepkg --syncdeps --install --cleanbuild --noconfirm --needed
-)
+makepkg_install "$build_dir"
+[[ "$DRY_RUN" == "1" ]] && exit 0
 
 [[ "$(pacman -Q "$PACKAGE_NAME" 2>/dev/null | awk '{print $2}')" == "$package_version" ]] \
   || die "$PACKAGE_NAME $package_version was not registered as installed"

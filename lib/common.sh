@@ -93,3 +93,26 @@ install_root_file() {
   sudo install -D -m 0644 -- "$source" "$destination"
   ok "wrote $destination"
 }
+
+# makepkg_install <dir> — build the PKGBUILD in <dir> as the invoking user, then
+# install it with one `sudo pacman -U`, which pulls its dependencies from the
+# repositories as well. makepkg's own --syncdeps/--install would run pacman
+# through `sudo -k`, which ignores the cached credential and prompts for every
+# call, setup-all's one-password run included. Respects DRY_RUN.
+makepkg_install() {
+  local dir="$1"
+  local -a packages
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    printf '%s  dry%s makepkg --cleanbuild --nodeps --noconfirm (%s)\n' \
+      "$C_DIM" "$C_RESET" "$dir/PKGBUILD"
+    printf '%s  dry%s sudo pacman -U --needed --noconfirm <built package>\n' \
+      "$C_DIM" "$C_RESET"
+    return 0
+  fi
+
+  (cd "$dir" && makepkg --cleanbuild --nodeps --noconfirm) || return
+  mapfile -t packages < <(cd "$dir" && makepkg --packagelist)
+  [[ ${#packages[@]} -gt 0 ]] || die "makepkg listed no package for $dir/PKGBUILD"
+  sudo pacman -U --needed --noconfirm "${packages[@]}"
+}
