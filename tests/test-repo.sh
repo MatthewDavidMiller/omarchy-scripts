@@ -76,6 +76,8 @@ for path in \
   tests/test-setup-no-discovery-services.sh \
   bin/setup-wireguard docs/setup-wireguard.md tests/test-setup-wireguard.sh \
   bin/setup-ventoy docs/setup-ventoy.md tests/test-setup-ventoy.sh \
+  bin/setup-no-lid-sleep docs/setup-no-lid-sleep.md tests/test-setup-no-lid-sleep.sh \
+  config/systemd/logind.conf.d/90-omarchy-scripts-lid-ignore.conf \
   packages/ventoy/PKGBUILD packages/ventoy/ventoy-launcher packages/ventoy/ventoy.desktop \
   config/omarchy/plugins/omarchy-scripts.wireguard/manifest.json \
   config/omarchy/plugins/omarchy-scripts.wireguard/Widget.qml

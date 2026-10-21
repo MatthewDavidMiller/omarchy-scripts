@@ -62,7 +62,9 @@ Only *idle* triggers go away. These still lock the screen:
 
 - `Super + Ctrl + L` (`omarchy-system-lock`) — on demand.
 - Suspend, via `omarchy system sleep monitor`, which locks before sleeping.
-- Closing the lid, via `omarchy system lid close`.
+- Closing the lid, via `omarchy system lid close`. Whether the lid also
+  *suspends* is logind's call; [setup-no-lid-sleep](setup-no-lid-sleep.md)
+  turns that off.
 
 Suspend itself is unaffected too. Stay-awake is a shell-level flag, not a
 sleep inhibitor: on a laptop, systemd may still suspend the machine on battery,

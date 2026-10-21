@@ -47,6 +47,7 @@ touching the system.
 | `bin/setup-all` | Menu + runner for every script below, in order | [docs/setup-all.md](docs/setup-all.md) |
 | `bin/setup-ssh-agent` | Persistent socket-activated ssh-agent, unlocked once per login | [docs/setup-ssh-agent.md](docs/setup-ssh-agent.md) |
 | `bin/setup-no-idle` | Stop the screensaver and idle auto-lock from firing | [docs/setup-no-idle.md](docs/setup-no-idle.md) |
+| `bin/setup-no-lid-sleep` | Stop the lid from suspending, hibernating, or powering off | [docs/setup-no-lid-sleep.md](docs/setup-no-lid-sleep.md) |
 | `bin/setup-brave` | Build vetted Brave package and make it the default browser | [docs/setup-brave.md](docs/setup-brave.md) |
 | `bin/setup-rpi-imager` | Install Raspberry Pi Imager from Arch Extra | [docs/setup-rpi-imager.md](docs/setup-rpi-imager.md) |
 | `bin/setup-ventoy` | Build vetted Ventoy package from its pinned first-party release | [docs/setup-ventoy.md](docs/setup-ventoy.md) |

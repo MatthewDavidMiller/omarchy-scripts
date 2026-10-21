@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+#
+# setup-no-lid-sleep — closing the laptop lid no longer sleeps the machine.
+#
+# order: 32
+# description: Never suspend or hibernate or power off on lid close
+#
+# Two things react to the lid on Omarchy. Hyprland's `switch:on:Lid Switch`
+# binding runs omarchy-system-lid-close, which locks the session and hands the
+# displays to clamshell mode; it never suspends. The power action is logind's:
+# HandleLidSwitch defaults to suspend, and HandleLidSwitchExternalPower to the
+# same. Omarchy ships logind drop-ins for the power key and the inhibit delay,
+# but none for the lid, so the stock systemd behaviour is what you get.
+#
+# This installs a later-sorting logind drop-in setting all three lid actions to
+# ignore, then reloads logind. Reload, never restart: restarting
+# systemd-logind tears down the running graphical session.
+#
+# The lid still locks the session when undocked. That is a screen lock, not a
+# power state, and keeping it means a closed laptop in a bag is not an
+# unlocked one.
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../lib/common.sh
+source "$SCRIPT_DIR/../lib/common.sh"
+
+# Overridable so the tests can point at a fixture instead of the real system.
+LOGIND_DROPIN="${LOGIND_DROPIN:-/etc/systemd/logind.conf.d/90-omarchy-scripts-lid-ignore.conf}"
+LOGIND_DROPIN_SOURCE="$SCRIPT_DIR/../config/systemd/logind.conf.d/90-omarchy-scripts-lid-ignore.conf"
+
+LID_PROPERTIES=(HandleLidSwitch HandleLidSwitchExternalPower HandleLidSwitchDocked)
+
+# --allow-lid-sleep puts the stock systemd lid behaviour back.
+REVERT=0
+
+usage() {
+  cat <<'USAGE'
+Usage: setup-no-lid-sleep [options]
+
+Stops closing the laptop lid from suspending, hibernating, or powering off the
+machine, on battery, on external power, and docked.
+
+Options:
+  -n, --dry-run           Show what would change without changing anything.
+  -y, --yes               Do not prompt for confirmation.
+      --allow-lid-sleep   Reverse: closing the lid suspends again.
+  -h, --help              Show this help.
+
+Environment:
+  DRY_RUN=1               Same as --dry-run.
+  LOGIND_DROPIN           Where the logind drop-in is installed.
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n|--dry-run)         DRY_RUN=1 ;;
+    -y|--yes)             ASSUME_YES=1 ;;
+    --allow-lid-sleep)    REVERT=1 ;;
+    -h|--help)            usage; exit 0 ;;
+    *)                    usage >&2; die "Unknown argument: $1" ;;
+  esac
+  shift
+done
+
+require_not_root
+require_cmd systemctl busctl
+
+# lid_action <property> — what the running logind will do, not what the files
+# say: a drop-in only counts once logind has reloaded it. Empty when logind is
+# unreachable or the property is unset (ExternalPower then inherits).
+lid_action() {
+  busctl get-property org.freedesktop.login1 /org/freedesktop/login1 \
+    org.freedesktop.login1.Manager "$1" 2>/dev/null \
+    | awk '{ gsub(/"/, "", $2); print $2 }' || true
+}
+
+lid_ignored() {
+  local property
+  for property in "${LID_PROPERTIES[@]}"; do
+    [[ "$(lid_action "$property")" == "ignore" ]] || return 1
+  done
+}
+
+reload_logind() {
+  if run sudo systemctl reload systemd-logind; then
+    [[ "$DRY_RUN" == "1" ]] || ok "reloaded systemd-logind"
+  else
+    warn "systemd-logind did not reload; the lid setting applies after a reboot"
+  fi
+}
+
+configure_lid() {
+  if [[ "$REVERT" == "1" ]]; then
+    log "Restoring the stock lid behaviour"
+    if [[ ! -f "$LOGIND_DROPIN" ]]; then
+      skip "no lid override installed"
+      return 0
+    fi
+    run sudo rm -f -- "$LOGIND_DROPIN"
+    [[ "$DRY_RUN" == "1" ]] || ok "removed $LOGIND_DROPIN"
+    reload_logind
+    return 0
+  fi
+
+  log "Ignoring the laptop lid"
+  if install_root_file "$LOGIND_DROPIN_SOURCE" "$LOGIND_DROPIN"; then
+    reload_logind
+  elif lid_ignored; then
+    skip "logind already ignores the lid"
+  else
+    # The file is current but logind never picked it up — a reload that
+    # failed last time, say. Retry rather than report success.
+    reload_logind
+  fi
+}
+
+summary() {
+  log "Done"
+  [[ "$DRY_RUN" == "1" ]] && return 0
+
+  if [[ "$REVERT" == "1" ]]; then
+    cat <<'EOF'
+
+Closing the lid suspends again (systemd's default), except while docked.
+EOF
+  elif lid_ignored; then
+    cat <<'EOF'
+
+Closing the lid no longer suspends, hibernates, or powers off. It still locks
+the session when no external monitor is connected, and still switches to the
+external display when one is.
+
+Reverse it with:
+  ./bin/setup-no-lid-sleep --allow-lid-sleep
+EOF
+  else
+    warn "logind does not report ignore for every lid action yet; reboot to apply"
+  fi
+
+  local property
+  printf '\n'
+  log "Current state"
+  for property in "${LID_PROPERTIES[@]}"; do
+    printf '  %-29s %s\n' "$property:" "$(lid_action "$property" | sed 's/^$/(inherits HandleLidSwitch)/')"
+  done
+}
+
+main() {
+  configure_lid
+  summary
+}
+
+main "$@"
